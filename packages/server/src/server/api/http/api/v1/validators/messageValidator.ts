@@ -8,6 +8,8 @@ import { isEmpty } from "@server/helpers/utils";
 import { FileSystem } from "@server/fileSystem";
 import { MessageInterface } from "@server/api/interfaces/messageInterface";
 import { validateWhereClauses, WhereClauseError } from "@server/databases/imessage/helpers/whereClauseValidator";
+import { isMinSequoia } from "@server/env";
+import { hasTextFormatting, validateTextFormatting } from "@server/utils/TextFormattingUtils";
 
 import { ValidateChatGuid, ValidateInput } from "./index";
 import { BadRequest } from "../responses/errors";
@@ -85,11 +87,12 @@ export class MessageValidator {
         subject: "string",
         selectedMessageGuid: "string",
         partIndex: "numeric|min:0",
-        ddScan: "boolean"
+        ddScan: "boolean",
+        textFormatting: "array"
     };
 
     static async validateText(ctx: RouterContext, next: Next) {
-        const { tempGuid, method, effectId, subject, selectedMessageGuid, message, ddScan } = ValidateInput(
+        const { tempGuid, method, effectId, subject, selectedMessageGuid, message, ddScan, textFormatting } = ValidateInput(
             ctx.request.body,
             MessageValidator.sendTextRules
         );
@@ -100,7 +103,7 @@ export class MessageValidator {
 
         // If we have an effectId, subject, reply, or attributedBody
         // let's imply we want to use the Private API
-        if (effectId || subject || selectedMessageGuid || ddScan || ctx.request.body.attributedBody) {
+        if (effectId || subject || selectedMessageGuid || ddScan || ctx.request.body.attributedBody || hasTextFormatting(textFormatting)) {
             saniMethod = "private-api";
         }
 
@@ -115,6 +118,22 @@ export class MessageValidator {
 
         if (saniMethod === "private-api" && isEmpty(message) && isEmpty(subject)) {
             throw new BadRequest({ error: `A 'message' or 'subject' is required when sending via the Private API` });
+        }
+
+        if (hasTextFormatting(textFormatting)) {
+            if (ctx.request.body.attributedBody) {
+                throw new BadRequest({ error: "Use either textFormatting or attributedBody, not both" });
+            }
+
+            if (!isMinSequoia) {
+                throw new BadRequest({ error: "Text formatting is only supported on macOS Sequoia (15) and newer" });
+            }
+
+            try {
+                validateTextFormatting(textFormatting, message);
+            } catch (ex: any) {
+                throw new BadRequest({ error: ex?.message ?? "Invalid textFormatting payload" });
+            }
         }
 
         // Inject the method (we have to force it to thing it's anything)
