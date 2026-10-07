@@ -9,6 +9,8 @@ import { AlertsInterface } from "@server/api/interfaces/alertsInterface";
 import { isEmpty, isTruthyBool } from "@server/helpers/utils";
 import { BadRequest, ServerError } from "../responses/errors";
 import { parseWithQuery } from "../utils";
+import { isMinHighSierra } from "@server/env";
+import { supportsChatStateSnapshot } from "@server/databases/imessage/snapshot/ChatStateSnapshot";
 
 export class ServerRouter {
     static async getInfo(ctx: RouterContext, _: Next) {
@@ -16,6 +18,13 @@ export class ServerRouter {
     }
 
     static async getChatStateSnapshot(ctx: RouterContext, _: Next) {
+        if (!supportsChatStateSnapshot(isMinHighSierra)) {
+            throw new BadRequest({
+                message: "Chat-state snapshots require macOS High Sierra or later!",
+                error: "UNSUPPORTED_MACOS_VERSION"
+            });
+        }
+
         try {
             const result = await Server().getChatStateSnapshot();
             return new Success(ctx, { data: result }).send();
