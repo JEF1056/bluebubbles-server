@@ -9,8 +9,9 @@ import { AlertsInterface } from "@server/api/interfaces/alertsInterface";
 import { isEmpty, isTruthyBool } from "@server/helpers/utils";
 import { BadRequest, ServerError } from "../responses/errors";
 import { parseWithQuery } from "../utils";
-import { isMinHighSierra } from "@server/env";
+import { isMinHighSierra, isMinVentura } from "@server/env";
 import { supportsChatStateSnapshot } from "@server/databases/imessage/snapshot/ChatStateSnapshot";
+import { supportsRecoverableMessages } from "@server/databases/imessage/snapshot/RecoverableMessageSnapshot";
 
 export class ServerRouter {
     static async getInfo(ctx: RouterContext, _: Next) {
@@ -31,6 +32,25 @@ export class ServerRouter {
         } catch (ex: any) {
             throw new ServerError({
                 message: "Failed to build chat state snapshot!",
+                error: ex?.message ?? ex.toString()
+            });
+        }
+    }
+
+    static async getRecoverableMessageSnapshot(ctx: RouterContext, _: Next) {
+        if (!supportsRecoverableMessages(isMinVentura)) {
+            throw new BadRequest({
+                message: "Recently Deleted requires macOS Ventura or later!",
+                error: "UNSUPPORTED_MACOS_VERSION"
+            });
+        }
+
+        try {
+            const result = await Server().getRecoverableMessageSnapshot();
+            return new Success(ctx, { data: result }).send();
+        } catch (ex: any) {
+            throw new ServerError({
+                message: "Failed to build recoverable message snapshot!",
                 error: ex?.message ?? ex.toString()
             });
         }

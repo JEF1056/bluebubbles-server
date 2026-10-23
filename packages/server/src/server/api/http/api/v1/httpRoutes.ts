@@ -154,6 +154,11 @@ export class HttpRoutes {
                     },
                     {
                         method: HttpMethod.GET,
+                        path: "recoverable-messages/snapshot",
+                        controller: ServerRouter.getRecoverableMessageSnapshot
+                    },
+                    {
+                        method: HttpMethod.GET,
                         path: "logs",
                         controller: ServerRouter.getLogs
                     },
