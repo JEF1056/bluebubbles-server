@@ -16,7 +16,7 @@ import {
 import { isMinMonterey } from "@server/env";
 import { Attachment } from "@server/databases/imessage/entity/Attachment";
 
-import { startMessages } from "../api/apple/scripts";
+import { requestFindMyAutomation, requestSystemEventsAutomation, startMessages } from "../api/apple/scripts";
 import {
     AudioMetadata,
     AudioMetadataKeys,
@@ -653,6 +653,24 @@ export class FileSystem {
         return FileSystem.execFileCommand("/usr/bin/osascript", args);
     }
 
+    static async requestFindMyAutomationPermissions() {
+        const requests = [
+            { name: "System Events", script: requestSystemEventsAutomation() },
+            { name: "Find My", script: requestFindMyAutomation() }
+        ];
+
+        for (const request of requests) {
+            try {
+                await FileSystem.executeAppleScript(request.script);
+                Server().logger.debug(`Requested ${request.name} Automation permission`);
+            } catch (ex: any) {
+                Server().logger.warn(
+                    `Unable to request ${request.name} Automation permission! CLI Error: ${ex?.message ?? String(ex)}`
+                );
+            }
+        }
+    }
+
     /**
      * Makes sure that Messages is running
      */
@@ -945,7 +963,7 @@ export class FileSystem {
             }
         } catch (ex) {
             Server().log("Failed to sync time with time servers!", "debug");
-            Server().log(ex, 'debug');
+            Server().log(ex, "debug");
         }
 
         return null;
