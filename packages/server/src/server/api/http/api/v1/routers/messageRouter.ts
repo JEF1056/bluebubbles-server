@@ -237,7 +237,7 @@ export class MessageRouter {
     static async sendText(ctx: RouterContext, _: Next) {
         let {
             tempGuid, message, attributedBody, textFormatting, method, chatGuid,
-            effectId, subject, selectedMessageGuid, partIndex, ddScan
+            effectId, subject, selectedMessageGuid, partIndex, ddScan, richLink
         } = ctx?.request?.body ?? {};
 
         // Add to send cache
@@ -256,7 +256,8 @@ export class MessageRouter {
                 selectedMessageGuid,
                 tempGuid,
                 partIndex,
-                ddScan
+                ddScan,
+                richLink
             });
 
             // Remove from cache

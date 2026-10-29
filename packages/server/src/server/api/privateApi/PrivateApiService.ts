@@ -42,6 +42,10 @@ export class PrivateApiService extends Loggable {
 
     clientsByProcessIdentifier: Record<string, Socket> = {};
 
+    // Actions each helper process said it supports when it connected. Helpers that predate
+    // this don't send any, so an action missing here means "ask for it and it will be ignored".
+    capabilities: Record<string, string[]> = {};
+
     socketRestartCount = 0;
 
     isRestarting = false;
@@ -173,7 +177,12 @@ export class PrivateApiService extends Loggable {
 
         if (processIdentifier) {
             delete this.clientsByProcessIdentifier[processIdentifier];
+            delete this.capabilities[processIdentifier];
         }
+    }
+
+    supportsAction(action: string): boolean {
+        return Object.values(this.capabilities).some(actions => actions.includes(action));
     }
 
     async configureServer(): Promise<void> {
