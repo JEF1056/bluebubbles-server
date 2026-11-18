@@ -297,7 +297,7 @@ export class IPCService extends Loggable {
             let isGroup = false;
             counts.forEach((item: any) => {
                 if (!currentTop || item.message_count > currentTopCount) {
-                    const guid = item.chat_guid.replace("iMessage", "").replace(";+;", "").replace(";-;", "");
+                    const guid = item.chat_guid.replace(/^[^;]+;[+-];/, "");
                     currentTopCount = item.message_count;
                     isGroup = (item.group_name ?? "").length > 0;
                     currentTop = isGroup ? item.group_name : guid;

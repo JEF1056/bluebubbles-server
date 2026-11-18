@@ -289,6 +289,23 @@ export class ChatRouter {
         return new FileStream(ctx, FileSystem.getRealPath(icon.filePath), icon.getMimeType() ?? "image/jfif").send();
     }
 
+    static async getBackground(ctx: RouterContext, _: Next): Promise<void> {
+        const { guid } = ctx.params;
+
+        const [chats, __] = await Server().iMessageRepo.getChats({ chatGuid: guid, withParticipants: false });
+        if (isEmpty(chats)) throw new NotFound({ error: "Chat does not exist!" });
+
+        const bg = await ChatInterface.getBackground(chats[0]);
+        if (!bg) {
+            throw new NotFound({
+                message: "The requested resource was not found",
+                error: "Unable to find background for the selected chat"
+            });
+        }
+
+        return new FileStream(ctx, FileSystem.getRealPath(bg.filePath), bg.mimeType).send();
+    }
+
     static async setGroupChatIcon(ctx: RouterContext, _: Next) {
         const { files } = ctx.request;
         const { guid } = ctx.params;
@@ -366,5 +383,41 @@ export class ChatRouter {
 
         await ChatInterface.shareContactInfo(chats[0].guid);
         return new Success(ctx, { message: 'Successfully shared contact info!' }).send();
+    }
+
+    static async getPinned(ctx: RouterContext, _: Next) {
+        const pinnedChatGuids = await ChatInterface.getPinnedChats(true);
+        return new Success(ctx, {
+            message: "Successfully fetched pinned chats!",
+            data: { pinnedChatGuids }
+        }).send();
+    }
+
+    static async pinChat(ctx: RouterContext, _: Next) {
+        const { guid: chatGuid } = ctx?.params ?? {};
+        const rawPinned = ctx?.request?.body?.pinned;
+        const pinned = rawPinned != null ? isTruthyBool(rawPinned) : true;
+
+        const [chats, __] = await Server().iMessageRepo.getChats({ chatGuid, withParticipants: false });
+        if (isEmpty(chats)) throw new NotFound({ error: "Chat does not exist!" });
+
+        const pinnedChatGuids = await ChatInterface.setPinned(chats[0].guid, pinned);
+        return new Success(ctx, {
+            message: pinned ? "Successfully pinned chat!" : "Successfully unpinned chat!",
+            data: { pinnedChatGuids }
+        }).send();
+    }
+
+    static async unpinChat(ctx: RouterContext, _: Next) {
+        const { guid: chatGuid } = ctx?.params ?? {};
+
+        const [chats, __] = await Server().iMessageRepo.getChats({ chatGuid, withParticipants: false });
+        if (isEmpty(chats)) throw new NotFound({ error: "Chat does not exist!" });
+
+        const pinnedChatGuids = await ChatInterface.setPinned(chats[0].guid, false);
+        return new Success(ctx, {
+            message: "Successfully unpinned chat!",
+            data: { pinnedChatGuids }
+        }).send();
     }
 }

@@ -1,7 +1,7 @@
 import { Next } from "koa";
 import { RouterContext } from "koa-router";
 import { Success } from "../responses/success";
-import { ServerError } from "../responses/errors";
+import { BadRequest, ServerError } from "../responses/errors";
 import { FindMyInterface } from "@server/api/interfaces/findMyInterface";
 import { FindMyFriendLocation } from "@server/api/lib/findmy/types";
 import { NEW_FINDMY_LOCATION } from "@server/events";
@@ -21,7 +21,14 @@ export class FindMyRouter {
 
     static async refreshDevices(ctx: RouterContext, _: Next) {
         try {
-            const locations = await FindMyInterface.refreshDevices();
+            const body = (ctx.request?.body ?? {}) as { deviceId?: unknown; force?: unknown };
+            const deviceId =
+                typeof body.deviceId === "string" && body.deviceId.trim().length > 0
+                    ? body.deviceId.trim()
+                    : undefined;
+            const force = typeof body.force === "boolean" ? body.force : undefined;
+            const options = deviceId !== undefined || force !== undefined ? { deviceId, force } : undefined;
+            const locations = await FindMyInterface.refreshDevices(options);
             return new Success(ctx, {
                 message: "Successfully refreshed Find My device locations!",
                 data: locations
@@ -36,8 +43,21 @@ export class FindMyRouter {
 
     static async refreshFriends(ctx: RouterContext, _: Next) {
         try {
-            const friendLocations = await FindMyInterface.refreshFriends();
-            await FindMyRouter.emitFriendLocationUpdates(friendLocations);
+            const body = (ctx.request?.body ?? {}) as { handle?: unknown; force?: unknown; live?: unknown };
+            const handle =
+                typeof body.handle === "string" && body.handle.trim().length > 0 ? body.handle.trim() : undefined;
+            const force = typeof body.force === "boolean" ? body.force : undefined;
+            const live = typeof body.live === "boolean" ? body.live : undefined;
+            const options =
+                handle !== undefined || force !== undefined || live !== undefined
+                    ? { handle, force, live }
+                    : undefined;
+            const friendLocations = await FindMyInterface.refreshFriends(true, options);
+            const locationsToEmit =
+                handle !== undefined
+                    ? friendLocations.filter(loc => loc.handle?.toLowerCase() === handle.toLowerCase())
+                    : friendLocations;
+            await FindMyRouter.emitFriendLocationUpdates(locationsToEmit);
             return new Success(ctx, {
                 message: "Successfully refreshed Find My friends locations!",
                 data: friendLocations
@@ -72,6 +92,48 @@ export class FindMyRouter {
         } catch (ex: any) {
             throw new ServerError({
                 message: "Failed to fetch Find My friends locations!",
+                error: ex?.message ?? ex.toString()
+            });
+        }
+    }
+
+    static async startLiveFriend(ctx: RouterContext, _: Next) {
+        const body = (ctx.request?.body ?? {}) as { handle?: unknown };
+        const handle = typeof body.handle === "string" ? body.handle.trim() : "";
+        if (handle.length === 0) {
+            throw new BadRequest({ error: "A friend handle is required to start Find My live location!" });
+        }
+
+        try {
+            const result = await FindMyInterface.startLiveLocation(handle);
+            if (result.locations.length > 0) {
+                await FindMyRouter.emitFriendLocationUpdates(result.locations);
+            }
+            return new Success(ctx, {
+                message: "Successfully started Find My live location!",
+                data: result
+            }).send();
+        } catch (ex: any) {
+            throw new ServerError({
+                message: "Failed to start Find My live location!",
+                error: ex?.message ?? ex.toString()
+            });
+        }
+    }
+
+    static async stopLiveFriend(ctx: RouterContext, _: Next) {
+        try {
+            const body = (ctx.request?.body ?? {}) as { handle?: unknown };
+            const handle =
+                typeof body.handle === "string" && body.handle.trim().length > 0 ? body.handle.trim() : undefined;
+            const result = await FindMyInterface.stopLiveLocation(handle);
+            return new Success(ctx, {
+                message: "Successfully stopped Find My live location!",
+                data: result
+            }).send();
+        } catch (ex: any) {
+            throw new ServerError({
+                message: "Failed to stop Find My live location!",
                 error: ex?.message ?? ex.toString()
             });
         }

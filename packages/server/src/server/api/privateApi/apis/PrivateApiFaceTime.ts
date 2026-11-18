@@ -19,6 +19,23 @@ export class PrivateApiFaceTime extends PrivateApiAction {
         return this.sendApiMessage(action, { callUUID: uuid });
     }
 
+    async declineCall(uuid: string): Promise<TransactionResult> {
+        const action = "decline-call";
+        const request = new TransactionPromise(TransactionType.OTHER);
+        return this.sendApiMessage(action, { callUUID: uuid }, request);
+    }
+
+    async startCall(addresses: string[], video = true, isTelephony = false): Promise<TransactionResult> {
+        const action = "start-call";
+        const request = new TransactionPromise(TransactionType.OTHER);
+        return this.sendApiMessage(action, { addresses, video, isTelephony }, request);
+    }
+
+    async setMuted(uuid: string, muted: boolean): Promise<TransactionResult> {
+        const action = "set-muted";
+        return this.sendApiMessage(action, { callUUID: uuid, muted });
+    }
+
     async generateLink(uuid: string = null): Promise<TransactionResult> {
         const action = "generate-link";
         const request = new TransactionPromise(TransactionType.OTHER);

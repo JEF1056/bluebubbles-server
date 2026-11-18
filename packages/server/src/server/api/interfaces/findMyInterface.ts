@@ -2,6 +2,7 @@ import { Server } from "@server";
 import path from "path";
 import fs from "fs";
 import { FileSystem } from "@server/fileSystem";
+import { NEW_FINDMY_DEVICE } from "@server/events";
 import { isMinBigSur, isMinSequoia, isMinSonoma } from "@server/env";
 import { waitMs } from "@server/helpers/utils";
 import { quitFindMyFriends, startFindMyFriends, showFindMyFriends, hideFindMyFriends } from "../apple/scripts";
@@ -13,6 +14,7 @@ import {
     FindMyItem
 } from "@server/api/lib/findmy/types";
 import {
+    hasFindMyDeviceLocationChanged,
     normalizeFindMyDevices,
     normalizeFindMyFriendLocations,
     transformFindMyItemToDevice
@@ -21,11 +23,45 @@ import {
     resolveFindMyDevicesPrivateApiTarget,
     resolveFindMyFriendsPrivateApiTarget
 } from "@server/api/lib/findmy/privateApiSupport";
+import type {
+    RefreshFindMyDevicesOptions,
+    RefreshFindMyFriendsOptions
+} from "@server/api/privateApi/apis/PrivateApiFindMy";
 
 const FIND_MY_DEVICES_HELPER_CONNECTION_TIMEOUT_MS = 10_000;
 const FIND_MY_DEVICES_HELPER_CONNECTION_POLL_MS = 100;
+const FIND_MY_LIVE_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+
+export interface StartFindMyLiveOptions {
+    idleTimeoutMs?: number;
+}
 
 export class FindMyInterface {
+    private static lastPreSequoiaDevicesById = new Map<string, FindMyDevice>();
+    private static activeLiveFriendHandle: string | null = null;
+    private static liveFriendIdleTimer: NodeJS.Timeout | null = null;
+
+    private static async emitChangedDevices(
+        previousDevices: FindMyDevice[],
+        nextDevices: FindMyDevice[]
+    ): Promise<void> {
+        const previousById = new Map<string, FindMyDevice>();
+        for (const device of previousDevices) {
+            const identifier = device.identifier ?? device.id;
+            if (identifier) {
+                previousById.set(identifier, device);
+            }
+        }
+
+        for (const device of nextDevices) {
+            const identifier = device.identifier ?? device.id;
+            const previousDevice = identifier ? previousById.get(identifier) : undefined;
+            if (hasFindMyDeviceLocationChanged(previousDevice, device)) {
+                await Server().emitMessage?.(NEW_FINDMY_DEVICE, device, "normal", false, true);
+            }
+        }
+    }
+
     static async getFriends(): Promise<FindMyFriendLocation[]> {
         return normalizeFindMyFriendLocations(Server().findMyFriendsCache.getAll());
     }
@@ -80,16 +116,29 @@ export class FindMyInterface {
         }
     }
 
-    static async refreshDevices(): Promise<Array<FindMyDevice> | null> {
+    static async refreshDevices(options?: RefreshFindMyDevicesOptions): Promise<Array<FindMyDevice> | null> {
         if (isMinSequoia) {
-            return this.refreshDevicesThroughPrivateApi();
+            return this.refreshDevicesThroughPrivateApi(options);
         }
 
         await this.refreshUsingFindMyApp();
-        return this.getDevices();
+        const devices = await this.getDevices();
+        if (Array.isArray(devices)) {
+            await this.emitChangedDevices(Array.from(this.lastPreSequoiaDevicesById.values()), devices);
+            this.lastPreSequoiaDevicesById.clear();
+            for (const device of devices) {
+                const identifier = device.identifier ?? device.id;
+                if (identifier) {
+                    this.lastPreSequoiaDevicesById.set(identifier, device);
+                }
+            }
+        }
+        return devices;
     }
 
-    private static async refreshDevicesThroughPrivateApi(): Promise<FindMyDevice[]> {
+    private static async refreshDevicesThroughPrivateApi(
+        options?: RefreshFindMyDevicesOptions
+    ): Promise<FindMyDevice[]> {
         const privateApiEnabled = Boolean(Server().repo.getConfig("enable_private_api"));
         if (!privateApiEnabled) {
             throw new Error("Find My Devices on macOS 15 or later requires the Private API");
@@ -111,7 +160,15 @@ export class FindMyInterface {
             throw new Error("The Find My Devices helper did not connect before the refresh timeout");
         }
 
-        const result = await Server().privateApi.findmy.refreshDevices();
+        const hasDeviceOptions =
+            (typeof options?.deviceId === "string" && options.deviceId.trim().length > 0) ||
+            typeof options?.force === "boolean";
+        const result = hasDeviceOptions
+            ? await Server().privateApi.findmy.refreshDevices({
+                  ...(options?.deviceId?.trim() ? { deviceId: options.deviceId.trim() } : {}),
+                  ...(typeof options?.force === "boolean" ? { force: options.force } : {})
+              })
+            : await Server().privateApi.findmy.refreshDevices();
         const refreshResponse = result?.data as FindMyDevicesRefreshResponse | undefined;
         if (!Array.isArray(refreshResponse?.devices)) {
             throw new Error("The Find My Devices helper returned an invalid response");
@@ -137,6 +194,7 @@ export class FindMyInterface {
             throw new Error("The Find My Devices helper returned duplicate device identifiers");
         }
 
+        const previousDevices = Server().findMyDevicesCache.getAll();
         if (refreshResponse.partial) {
             Server().findMyDevicesCache.updateAll(devices);
             Server().logger.warn(
@@ -145,6 +203,8 @@ export class FindMyInterface {
         } else {
             Server().findMyDevicesCache.replaceAll(devices);
         }
+
+        await this.emitChangedDevices(previousDevices, devices);
 
         const devicesWithLocations = devices.filter(device => device.location != null).length;
         Server().logger.debug(
@@ -167,14 +227,28 @@ export class FindMyInterface {
         return Server().privateApi.hasClient(processIdentifier);
     }
 
-    static async refreshFriends(allowFindMyAppFallback = true): Promise<FindMyFriendLocation[]> {
+    static async refreshFriends(
+        allowFindMyAppFallback = true,
+        options?: RefreshFindMyFriendsOptions
+    ): Promise<FindMyFriendLocation[]> {
         const privateApiEnabled = Boolean(Server().repo.getConfig("enable_private_api"));
         const privateApiTarget = resolveFindMyFriendsPrivateApiTarget({ isMinBigSur, isMinSonoma, isMinSequoia });
         const privateApiHelperAvailable = privateApiTarget != null && Server().privateApi.hasClient(privateApiTarget);
         let receivedUsableHelperResponse = false;
         if (privateApiEnabled && privateApiTarget != null && privateApiHelperAvailable) {
             try {
-                const result = await Server().privateApi.findmy.refreshFriends();
+                const trimmedHandle = typeof options?.handle === "string" ? options.handle.trim() : "";
+                const hasFriendOptions =
+                    trimmedHandle.length > 0 ||
+                    typeof options?.force === "boolean" ||
+                    typeof options?.live === "boolean";
+                const result = hasFriendOptions
+                    ? await Server().privateApi.findmy.refreshFriends({
+                          ...(trimmedHandle.length > 0 ? { handle: trimmedHandle } : {}),
+                          ...(typeof options?.force === "boolean" ? { force: options.force } : {}),
+                          ...(typeof options?.live === "boolean" ? { live: options.live } : {})
+                      })
+                    : await Server().privateApi.findmy.refreshFriends();
                 const refreshResponse = result?.data as FindMyFriendsRefreshResponse | undefined;
                 if (Array.isArray(refreshResponse?.locations)) {
                     const refreshedLocations = normalizeFindMyFriendLocations(refreshResponse.locations);
@@ -185,7 +259,7 @@ export class FindMyInterface {
                         !responseContainsOnlyInvalidLocations && (!responseIsPartial || refreshedLocations.length > 0);
 
                     if (!responseContainsOnlyInvalidLocations) {
-                        if (responseIsPartial) {
+                        if (responseIsPartial || trimmedHandle.length > 0) {
                             Server().findMyFriendsCache.updateAll(refreshedLocations);
                         } else {
                             Server().findMyFriendsCache.replaceAll(refreshedLocations);
@@ -220,6 +294,97 @@ export class FindMyInterface {
         }
 
         return normalizeFindMyFriendLocations(Server().findMyFriendsCache.getAll());
+    }
+
+    private static clearLiveIdleTimer(): void {
+        if (this.liveFriendIdleTimer != null) {
+            clearTimeout(this.liveFriendIdleTimer);
+            this.liveFriendIdleTimer = null;
+        }
+    }
+
+    static async startLiveLocation(
+        handle: string,
+        options?: StartFindMyLiveOptions
+    ): Promise<{ handle: string; live: boolean; locations: FindMyFriendLocation[] }> {
+        const trimmedHandle = handle.trim();
+        if (trimmedHandle.length === 0) {
+            throw new Error("A friend handle is required to start Find My live location");
+        }
+
+        const privateApiEnabled = Boolean(Server().repo.getConfig("enable_private_api"));
+        const privateApiTarget = resolveFindMyFriendsPrivateApiTarget({ isMinBigSur, isMinSonoma, isMinSequoia });
+        const privateApiHelperAvailable = privateApiTarget != null && Server().privateApi.hasClient(privateApiTarget);
+        if (!privateApiEnabled || privateApiTarget == null || !privateApiHelperAvailable) {
+            throw new Error("Find My Friends Private API helper is not connected");
+        }
+
+        const result = await Server().privateApi.findmy.startLiveLocation(trimmedHandle);
+        const responseData = result?.data as FindMyFriendsRefreshResponse | undefined;
+        let updatedLocations: FindMyFriendLocation[] = [];
+        if (Array.isArray(responseData?.locations)) {
+            const normalized = normalizeFindMyFriendLocations(responseData.locations);
+            if (normalized.length > 0) {
+                updatedLocations = Server().findMyFriendsCache.updateAll(normalized);
+            }
+        }
+
+        if (updatedLocations.length === 0) {
+            const cached = Server().findMyFriendsCache.getAll().filter(
+                loc => loc.handle?.toLowerCase() === trimmedHandle.toLowerCase()
+            );
+            updatedLocations = normalizeFindMyFriendLocations(cached);
+        }
+
+        this.activeLiveFriendHandle = trimmedHandle;
+        this.clearLiveIdleTimer();
+        const idleTimeoutMs = options?.idleTimeoutMs ?? FIND_MY_LIVE_IDLE_TIMEOUT_MS;
+        if (idleTimeoutMs > 0) {
+            this.liveFriendIdleTimer = setTimeout(() => {
+                void this.stopLiveLocation(trimmedHandle).catch((error: any) => {
+                    Server().logger.debug(
+                        `Auto-stop Find My live location failed: ${error?.message ?? String(error)}`
+                    );
+                });
+            }, idleTimeoutMs);
+            this.liveFriendIdleTimer.unref?.();
+        }
+
+        return {
+            handle: trimmedHandle,
+            live: true,
+            locations: updatedLocations
+        };
+    }
+
+    static async stopLiveLocation(handle?: string): Promise<{ handle: string | null; stopped: boolean }> {
+        const trimmedHandle = typeof handle === "string" && handle.trim().length > 0 ? handle.trim() : undefined;
+        const matchesActive =
+            trimmedHandle == null ||
+            this.activeLiveFriendHandle == null ||
+            this.activeLiveFriendHandle.toLowerCase() === trimmedHandle.toLowerCase();
+        const previousHandle = this.activeLiveFriendHandle;
+        if (matchesActive) {
+            this.clearLiveIdleTimer();
+            this.activeLiveFriendHandle = null;
+        }
+
+        const privateApiEnabled = Boolean(Server().repo.getConfig("enable_private_api"));
+        const privateApiTarget = resolveFindMyFriendsPrivateApiTarget({ isMinBigSur, isMinSonoma, isMinSequoia });
+        const privateApiHelperAvailable = privateApiTarget != null && Server().privateApi.hasClient(privateApiTarget);
+        if (!privateApiEnabled || privateApiTarget == null || !privateApiHelperAvailable) {
+            return {
+                handle: trimmedHandle ?? previousHandle ?? null,
+                stopped: false
+            };
+        }
+
+        const result = await Server().privateApi.findmy.stopLiveLocation(trimmedHandle);
+        const responseData = result?.data as { stopped?: unknown } | undefined;
+        return {
+            handle: trimmedHandle ?? previousHandle ?? null,
+            stopped: typeof responseData?.stopped === "boolean" ? responseData.stopped : true
+        };
     }
 
     static async refreshUsingFindMyApp() {

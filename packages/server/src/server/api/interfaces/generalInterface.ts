@@ -6,6 +6,7 @@ import { ServerMetadataResponse } from "@server/types";
 import { Device } from "@server/databases/server/entity";
 import { UpdateResult } from "@server/api/http/types";
 import { FileSystem } from "@server/fileSystem";
+import { isMinMonterey } from "@server/env";
 
 const osVersion = macosVersion();
 
@@ -22,7 +23,8 @@ export class GeneralInterface {
             detected_imessage: await Server().iMessageRepo.getiMessageAccount(),
             macos_time_sync: await FileSystem.getTimeSync(),
             local_ipv4s: FileSystem.getLocalIps("IPv4"),
-            local_ipv6s: FileSystem.getLocalIps("IPv6")
+            local_ipv6s: FileSystem.getLocalIps("IPv6"),
+            supportsFaceTimeCalls: isMinMonterey
         };
     }
 

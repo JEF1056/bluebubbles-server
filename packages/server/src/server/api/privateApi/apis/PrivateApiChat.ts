@@ -21,7 +21,7 @@ export class PrivateApiChat extends PrivateApiAction {
     }: {
         addresses: string[];
         message: string;
-        service?: "iMessage" | "SMS";
+        service?: "iMessage" | "SMS" | "RCS";
         attributedBody?: Record<string, any> | null;
         effectId?: string;
         subject?: string;
@@ -139,5 +139,22 @@ export class PrivateApiChat extends PrivateApiAction {
         this.throwForNoMissingFields(action, [guid]);
         const request = new TransactionPromise(TransactionType.CHAT);
         return this.sendApiMessage(action, { chatGuid: guid }, request);
+    }
+
+    async getPinnedChats(): Promise<TransactionResult> {
+        const action = "get-pinned-chats";
+        const request = new TransactionPromise(TransactionType.CHAT);
+        return this.sendApiMessage(action, {}, request);
+    }
+
+    async updatePinnedChat(chatGuid: string, pinned?: boolean): Promise<TransactionResult> {
+        const action = "update-chat-pinned";
+        this.throwForNoMissingFields(action, [chatGuid]);
+        const request = new TransactionPromise(TransactionType.CHAT);
+        const data: NodeJS.Dict<any> = { chatGuid };
+        if (typeof pinned === "boolean") {
+            data.pinned = pinned;
+        }
+        return this.sendApiMessage(action, data, request);
     }
 }

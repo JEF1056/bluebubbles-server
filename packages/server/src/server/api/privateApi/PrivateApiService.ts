@@ -21,6 +21,7 @@ import { PrivateApiFaceTimeStatusHandler } from "./eventHandlers/PrivateApiFaceT
 import { PrivateApiCloud } from "./apis/PrivateApiCloud";
 import { PrivateApiFaceTime } from "./apis/PrivateApiFaceTime";
 import { PrivateApiFindMyEventHandler } from "./eventHandlers/PrivateApiFindMyEventHandler";
+import { PrivateApiPinnedChatsEventHandler } from "./eventHandlers/PrivateApiPinnedChatsEventHandler";
 import { Socket } from "../types";
 import { v4 } from "uuid";
 import { Loggable } from "../../lib/logging/Loggable";
@@ -110,7 +111,8 @@ export class PrivateApiService extends Loggable {
             new PrivateApiPingEventHandler(),
             new PrivateApiAddressEventHandler(),
             new PrivateApiFaceTimeStatusHandler(),
-            new PrivateApiFindMyEventHandler()
+            new PrivateApiFindMyEventHandler(),
+            new PrivateApiPinnedChatsEventHandler()
         ];
     }
 

@@ -161,7 +161,8 @@ export class MessageSerializer {
             associatedMessageType: message.associatedMessageType,
             expressiveSendStyleId: message.expressiveSendStyleId,
             threadOriginatorGuid: message.threadOriginatorGuid,
-            hasPayloadData: !!message.payloadData
+            hasPayloadData: !!message.payloadData,
+            service: message.service
         };
 
         // Non-essentials

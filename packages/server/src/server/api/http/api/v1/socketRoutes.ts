@@ -41,6 +41,7 @@ import { ChatSerializer } from "@server/api/serializers/ChatSerializer";
 import { HandleSerializer } from "@server/api/serializers/HandleSerializer";
 import { AttachmentSerializer } from "@server/api/serializers/AttachmentSerializer";
 import { MacOsInterface } from "@server/api/interfaces/macosInterface";
+import { FaceTimeAudioBridge } from "@server/api/lib/facetime/FaceTimeAudioBridge";
 import { getLogger } from "@server/lib/logging/Loggable";
 import { ProxyServices } from "@server/databases/server/constants";
 
@@ -835,8 +836,8 @@ export class SocketRoutes {
             }
 
             const service = params?.service ?? "iMessage";
-            if (!["iMessage", "SMS"].includes(service)) {
-                return response(cb, "error", createBadRequestResponse("Service must be one of: iMessage, SMS"));
+            if (!["iMessage", "SMS", "RCS"].includes(service)) {
+                return response(cb, "error", createBadRequestResponse("Service must be one of: iMessage, SMS, RCS"));
             }
 
             let chatGuid;
@@ -1213,7 +1214,36 @@ export class SocketRoutes {
             return response(cb, "save-vcf", createSuccessResponse(await GeneralInterface.checkForUpdate()));
         });
 
+        socket.on("ft-bridge-offer", async (params): Promise<void> => {
+            try {
+                await FaceTimeAudioBridge.getInstance().handleOffer(socket, params);
+            } catch (ex: any) {
+                log.debug(`ft-bridge-offer failed: ${ex?.message ?? ex}`);
+            }
+        });
+
+        socket.on("ft-bridge-answer", async (params): Promise<void> => {
+            try {
+                await FaceTimeAudioBridge.getInstance().handleAnswer(socket, params);
+            } catch (ex: any) {
+                log.debug(`ft-bridge-answer failed: ${ex?.message ?? ex}`);
+            }
+        });
+
+        socket.on("ft-bridge-ice", async (params): Promise<void> => {
+            await FaceTimeAudioBridge.getInstance().handleIce(params);
+        });
+
+        socket.on("ft-bridge-mute", (params): void => {
+            FaceTimeAudioBridge.getInstance().handleMute(params);
+        });
+
+        socket.on("ft-bridge-hangup", (params): void => {
+            FaceTimeAudioBridge.getInstance().handleHangup(params);
+        });
+
         socket.on("disconnect", reason => {
+            FaceTimeAudioBridge.getInstance().handleSocketDisconnect(socket.id);
             log.info(`Client ${socket.id} disconnected! Reason: ${reason}`);
         });
     }

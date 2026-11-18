@@ -12,6 +12,7 @@ export type ServerMetadataResponse = {
     macos_time_sync: number | null;
     local_ipv4s: string[];
     local_ipv6s: string[];
+    supportsFaceTimeCalls?: boolean;
 };
 
 /**
@@ -75,6 +76,7 @@ export type MessageResponse = {
     didNotifyRecipient?: boolean;
     shareStatus?: number | null;
     shareDirection?: number | null;
+    service?: string;
 };
 
 export type HandleResponse = {
@@ -96,9 +98,13 @@ export type ChatResponse = {
     properties?: NodeJS.Dict<any>[] | null;
     style: number;
     chatIdentifier: string;
+    serviceName?: string;
     isArchived: boolean;
+    isPinned?: boolean;
+    pinIndex?: number | null;
     isFiltered?: boolean;
     isFilteredAsSpam?: boolean;
+    autoSendReadReceipts?: boolean | null;
     displayName: string;
     groupId?: string;
     lastAddressedHandle?: string | null;

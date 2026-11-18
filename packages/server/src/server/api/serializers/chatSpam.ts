@@ -14,6 +14,21 @@ export function isChatFilteredAsSpam(properties: NodeJS.Dict<any>[] | null | und
     );
 }
 
+/**
+ * Returns the per-chat iOS/macOS `EnableReadReceiptForChat` override from `chat.properties`,
+ * or `null` when the chat follows the global Read Receipts setting.
+ */
+export function extractReadReceiptsOverride(properties: NodeJS.Dict<any>[] | null | undefined): boolean | null {
+    if (!Array.isArray(properties)) return null;
+    for (const props of properties) {
+        if (props == null || typeof props !== "object") continue;
+        if ("EnableReadReceiptForChat" in props && props.EnableReadReceiptForChat != null) {
+            return isTrue(props.EnableReadReceiptForChat);
+        }
+    }
+    return null;
+}
+
 // Plist decoders are not consistent about scalar types: a boolean may arrive
 // as true, 1, or "1", and an integer as a number, a bigint (for 8-byte ints)
 // or a numeric string. Accept the obvious encodings of each.

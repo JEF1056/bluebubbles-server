@@ -191,6 +191,68 @@ friendLocationCache.updateAll([normalizedLocation, missingLocation]);
 assert.equal(friendLocationCache.getAll().length, 2);
 friendLocationCache.replaceAll([{ ...normalizedLocation, last_updated: 1 }]);
 assert.deepEqual(friendLocationCache.getAll(), [normalizedLocation]);
+// Strictly newer shallow/legacy updates must supersede cached live entries.
+assert.equal(
+    friendLocationCache.update({
+        ...normalizedLocation,
+        status: "shallow",
+        last_updated: normalizedLocation.last_updated + 500
+    }),
+    true
+);
+assert.equal(friendLocationCache.get("alice@example.com").status, "shallow");
+assert.equal(
+    friendLocationCache.update({
+        ...normalizedLocation,
+        status: "live",
+        last_updated: normalizedLocation.last_updated + 1000
+    }),
+    true
+);
+assert.equal(
+    friendLocationCache.update({
+        ...normalizedLocation,
+        status: "legacy",
+        coordinates: null,
+        last_updated: normalizedLocation.last_updated + 2000
+    }),
+    true
+);
+assert.equal(friendLocationCache.get("alice@example.com").status, "legacy");
+// Same-timestamp downgrades (legacy/shallow over live) must still be dropped.
+assert.equal(
+    friendLocationCache.update({
+        ...normalizedLocation,
+        status: "live",
+        last_updated: normalizedLocation.last_updated + 3000
+    }),
+    true
+);
+assert.equal(
+    friendLocationCache.update({
+        ...normalizedLocation,
+        status: "legacy",
+        last_updated: normalizedLocation.last_updated + 3000
+    }),
+    false
+);
+assert.equal(
+    friendLocationCache.update({
+        ...normalizedLocation,
+        status: "shallow",
+        last_updated: normalizedLocation.last_updated + 3000
+    }),
+    false
+);
+assert.equal(
+    friendLocationCache.update({
+        ...normalizedLocation,
+        status: "live",
+        is_locating_in_progress: false,
+        last_updated: normalizedLocation.last_updated + 3000
+    }),
+    true
+);
 friendLocationCache.replaceAll([]);
 assert.deepEqual(friendLocationCache.getAll(), []);
 
@@ -271,6 +333,7 @@ const loadFindMyInterface = environment => {
                 execShellCommand: async command => openedFindMyCommands.push(command)
             }
         },
+        "@server/events": { NEW_FINDMY_DEVICE: "new-findmy-device" },
         "@server/env": environment,
         "@server/helpers/utils": { waitMs: async () => {} },
         "../apple/scripts": {
@@ -702,11 +765,441 @@ const runDeviceRefreshTests = async () => {
         helperResponse: { data: { devices: [], partial: false, skippedDevices: 0 } }
     });
     await assert.rejects(() => FindMyInterface.refreshDevices(), /Open FindMy App on Startup/);
+
+    // Verify refresh options forwarding and new-findmy-device emission on location change.
+    const sentMessages = [];
+    const { PrivateApiFindMy } = loadTypeScriptModule("../src/server/api/privateApi/apis/PrivateApiFindMy.ts", {
+        ".": {
+            PrivateApiAction: class {
+                async sendApiMessage(action, data, _tx, target) {
+                    sentMessages.push({ action, data, target });
+                    return { data: null };
+                }
+            }
+        },
+        "@server/managers/transactionManager/transactionPromise": {
+            TransactionPromise: class {
+                constructor(type) {
+                    this.type = type;
+                }
+            },
+            TransactionType: { FIND_MY: "FIND_MY" }
+        },
+        "@server/env": { isMinBigSur: true, isMinSonoma: true, isMinSequoia: true },
+        "@server/api/lib/findmy/privateApiSupport": findMyPrivateApiSupport
+    });
+    const api = new PrivateApiFindMy();
+    await api.refreshFriends();
+    await api.refreshFriends({ handle: " alice@example.com ", force: true, live: true });
+    await api.refreshDevices();
+    await api.refreshDevices({ deviceId: " device-1 ", force: true });
+    assert.deepEqual(
+        sentMessages.map(m => ({ action: m.action, data: m.data })),
+        [
+            { action: "refresh-findmy-friends", data: null },
+            { action: "refresh-findmy-friends", data: { handle: "alice@example.com", force: true, live: true } },
+            { action: "refresh-findmy-devices", data: null },
+            { action: "refresh-findmy-devices", data: { deviceId: "device-1", force: true } }
+        ]
+    );
+
+    const emittedDeviceEvents = [];
+    const deviceCacheForEvents = new FindMyDevicesCache();
+    deviceCacheForEvents.replaceAll([normalizedDeviceWithLocation]);
+    const forwardedOptions = [];
+    activeServer = {
+        repo: {
+            getConfig: name => name === "enable_private_api" || name === "open_findmy_on_startup"
+        },
+        privateApi: {
+            hasClient: () => true,
+            findmy: {
+                refreshFriends: async opts => {
+                    forwardedOptions.push({ kind: "friends", opts });
+                    return { data: { locations: [normalizedLocation], partial: false } };
+                },
+                refreshDevices: async opts => {
+                    forwardedOptions.push({ kind: "devices", opts });
+                    return {
+                        data: {
+                            devices: [
+                                rawDeviceWithLocation,
+                                {
+                                    ...rawDeviceWithLocation,
+                                    identifier: "device-2",
+                                    location: { ...rawDeviceWithLocation.location, timeStamp: 9999999 }
+                                }
+                            ],
+                            partial: false,
+                            skippedDevices: 0
+                        }
+                    };
+                }
+            }
+        },
+        findMyFriendsCache: new FindMyFriendsCache(),
+        findMyDevicesCache: deviceCacheForEvents,
+        emitMessage: async (type, data) => {
+            emittedDeviceEvents.push({ type, id: data?.identifier ?? data?.id });
+        },
+        logger: { debug: () => {}, warn: () => {} }
+    };
+
+    const bobCachedLocation = { ...normalizedLocation, handle: "bob@example.com" };
+    activeServer.findMyFriendsCache.updateAll([bobCachedLocation]);
+    await FindMyInterface.refreshFriends(false, { handle: "alice@example.com", force: true, live: true });
+    await FindMyInterface.refreshDevices({ deviceId: "device-2", force: true });
+    assert.deepEqual(forwardedOptions, [
+        { kind: "friends", opts: { handle: "alice@example.com", force: true, live: true } },
+        { kind: "devices", opts: { deviceId: "device-2", force: true } }
+    ]);
+    assert.ok(
+        activeServer.findMyFriendsCache.get("bob@example.com") != null,
+        "targeted single-friend refresh must preserve other cached friends"
+    );
+    assert.deepEqual(
+        emittedDeviceEvents,
+        [{ type: "new-findmy-device", id: "device-2" }],
+        "only devices with changed or newly discovered locations should emit new-findmy-device"
+    );
+
+    // Verify PrivateApiFindMyEventHandler emits new-findmy-device only on location change.
+    const { PrivateApiFindMyEventHandler } = loadTypeScriptModule(
+        "../src/server/api/privateApi/eventHandlers/PrivateApiFindMyEventHandler.ts",
+        {
+            "@server": { Server: () => activeServer },
+            net: {},
+            ".": {},
+            "@server/api/lib/findmy/utils": findMyUtilities,
+            "@server/events": {
+                NEW_FINDMY_DEVICE: "new-findmy-device",
+                NEW_FINDMY_LOCATION: "new-findmy-location"
+            },
+            "@server/helpers/utils": {
+                isEmpty: value => value == null || (typeof value === "string" && value.trim().length === 0),
+                titleCase: s => s,
+                waitMs: async () => {}
+            },
+            "@server/lib/logging/Loggable": {
+                Loggable: class {
+                    constructor() {
+                        this.log = { debug: () => {} };
+                    }
+                }
+            },
+            "@server/utils/StringUtils": { obfuscatedHandle: h => h }
+        }
+    );
+    emittedDeviceEvents.length = 0;
+    const eventHandler = new PrivateApiFindMyEventHandler();
+    await eventHandler.handle({
+        event: "new-findmy-device",
+        data: [
+            rawDeviceWithLocation,
+            {
+                ...rawDeviceWithLocation,
+                identifier: "device-2",
+                location: { ...rawDeviceWithLocation.location, timeStamp: 10000000 }
+            }
+        ]
+    });
+    assert.deepEqual(emittedDeviceEvents, [{ type: "new-findmy-device", id: "device-2" }]);
+
+    // Verify FindMyRouter.refreshFriends forwards live/force/handle and emits targeted new-findmy-location.
+    const emittedLocationEvents = [];
+    activeServer.emitMessage = async (type, data) => {
+        emittedLocationEvents.push({ type, handle: data?.handle });
+    };
+    const { FindMyRouter } = loadTypeScriptModule("../src/server/api/http/api/v1/routers/findmyRouter.ts", {
+        koa: {},
+        "koa-router": {},
+        "../responses/success": {
+            Success: class {
+                constructor(_ctx, payload) {
+                    this.payload = payload;
+                }
+                send() {
+                    return this.payload;
+                }
+            }
+        },
+        "../responses/errors": {
+            BadRequest: class extends Error {
+                constructor(params) {
+                    super(params?.error ?? "BadRequest");
+                }
+            },
+            ServerError: Error
+        },
+        "@server/api/interfaces/findMyInterface": { FindMyInterface },
+        "@server/api/lib/findmy/types": {},
+        "@server/events": { NEW_FINDMY_LOCATION: "new-findmy-location" },
+        "@server": { Server: () => activeServer }
+    });
+    forwardedOptions.length = 0;
+    const routerResult = await FindMyRouter.refreshFriends(
+        { request: { body: { handle: " alice@example.com ", force: true, live: true } } },
+        async () => {}
+    );
+    assert.deepEqual(forwardedOptions, [{ kind: "friends", opts: { handle: "alice@example.com", force: true, live: true } }]);
+    assert.deepEqual(emittedLocationEvents, [{ type: "new-findmy-location", handle: "alice@example.com" }]);
+    assert.equal(routerResult.data.length, 2);
+};
+
+const runLiveModeTests = async () => {
+    const { PrivateApiFindMy } = loadTypeScriptModule("../src/server/api/privateApi/apis/PrivateApiFindMy.ts", {
+        "@server/env": { isMinBigSur: true, isMinSonoma: true, isMinSequoia: true },
+        "@server/api/lib/findmy/privateApiSupport": {
+            resolveFindMyFriendsPrivateApiTarget: () => "com.apple.findmy",
+            resolveFindMyDevicesPrivateApiTarget: () => "com.apple.findmy"
+        },
+        "@server/managers/transactionManager/transactionPromise": {
+            TransactionPromise: class {
+                constructor(type) {
+                    this.type = type;
+                }
+            },
+            TransactionType: { FIND_MY: "FIND_MY" }
+        },
+        ".": { PrivateApiAction: class {} }
+    });
+
+    const sentApiMessages = [];
+    const api = new PrivateApiFindMy();
+    api.sendApiMessage = async (action, data, _request, target) => {
+        sentApiMessages.push({ action, data, target });
+        if (action === "start-findmy-live-location") {
+            return {
+                data: {
+                    live: true,
+                    locations: [
+                        {
+                            handle: data.handle,
+                            coordinates: [37.3352, -122.0094],
+                            status: "live",
+                            location_type: 2,
+                            horizontal_accuracy: 4.5,
+                            vertical_accuracy: 3.0,
+                            speed: 2.4,
+                            altitude: 18.0,
+                            last_updated: 1700000005250,
+                            is_locating_in_progress: false
+                        }
+                    ]
+                }
+            };
+        }
+        return { data: { stopped: true } };
+    };
+
+    await api.startLiveLocation(" alice@example.com ");
+    await api.stopLiveLocation(" alice@example.com ");
+    await api.stopLiveLocation();
+    assert.deepEqual(sentApiMessages, [
+        {
+            action: "start-findmy-live-location",
+            data: { handle: "alice@example.com" },
+            target: "com.apple.findmy"
+        },
+        {
+            action: "stop-findmy-live-location",
+            data: { handle: "alice@example.com" },
+            target: "com.apple.findmy"
+        },
+        {
+            action: "stop-findmy-live-location",
+            data: null,
+            target: "com.apple.findmy"
+        }
+    ]);
+
+    // Verify FindMyFriendsCache detects telemetry refinements at the same timestamp.
+    const cache = new FindMyFriendsCache();
+    const baseLive = {
+        handle: "alice@example.com",
+        coordinates: [37.3352, -122.0094],
+        status: "live",
+        location_type: 2,
+        horizontal_accuracy: 15.0,
+        vertical_accuracy: 5.0,
+        speed: 1.0,
+        altitude: 12.0,
+        last_updated: 1700000005250,
+        is_locating_in_progress: false
+    };
+    assert.equal(cache.updateAll([baseLive]).length, 1);
+    assert.equal(cache.updateAll([{ ...baseLive }]).length, 0);
+    assert.equal(
+        cache.updateAll([{ ...baseLive, horizontal_accuracy: 4.5, speed: 2.4 }]).length,
+        1,
+        "live accuracy/speed refinement must not be dropped by FindMyFriendsCache"
+    );
+
+    // Verify FindMyInterface.startLiveLocation, idle auto-stop timer, and stopLiveLocation.
+    const interfaceEvents = [];
+    sentApiMessages.length = 0;
+    let activeServer = {
+        repo: { getConfig: () => true },
+        privateApi: {
+            hasClient: () => true,
+            findmy: api
+        },
+        findMyFriendsCache: new FindMyFriendsCache(),
+        findMyDevicesCache: { getAll: () => [] },
+        emitMessage: async (type, data) => {
+            interfaceEvents.push({ type, data });
+        },
+        logger: { debug: () => {}, warn: () => {} }
+    };
+
+    const { FindMyInterface } = loadTypeScriptModule("../src/server/api/interfaces/findMyInterface.ts", {
+        "@server": { Server: () => activeServer },
+        path,
+        fs: { existsSync: () => false },
+        "@server/fileSystem": { FileSystem: { findMyDir: "" } },
+        "@server/events": { NEW_FINDMY_DEVICE: "new-findmy-device" },
+        "@server/env": { isMinBigSur: true, isMinSonoma: true, isMinSequoia: true },
+        "@server/helpers/utils": { waitMs: async () => {} },
+        "../apple/scripts": {
+            quitFindMyFriends: () => "",
+            startFindMyFriends: () => "",
+            showFindMyFriends: () => "",
+            hideFindMyFriends: () => ""
+        },
+        "@server/api/lib/findmy/types": {},
+        "@server/api/lib/findmy/utils": findMyUtilities,
+        "@server/api/lib/findmy/privateApiSupport": {
+            resolveFindMyFriendsPrivateApiTarget: () => "com.apple.findmy",
+            resolveFindMyDevicesPrivateApiTarget: () => "com.apple.findmy"
+        }
+    });
+
+    const startRes = await FindMyInterface.startLiveLocation("alice@example.com", { idleTimeoutMs: 25 });
+    assert.equal(startRes.live, true);
+    assert.equal(startRes.locations.length, 1);
+    assert.equal(startRes.locations[0].horizontal_accuracy, 4.5);
+    assert.equal(startRes.locations[0].speed, 2.4);
+    assert.equal(startRes.locations[0].altitude, 18.0);
+    assert.equal(startRes.locations[0].location_type, 2);
+
+    // Wait for idle auto-stop timer to fire automatically.
+    await new Promise(resolve => setTimeout(resolve, 60));
+    assert.ok(
+        sentApiMessages.some(
+            msg => msg.action === "stop-findmy-live-location" && msg.data?.handle === "alice@example.com"
+        ),
+        "idle auto-stop timer must stop live streaming on the helper"
+    );
+
+    // Verify PrivateApiFindMyEventHandler preserves all live telemetry fields through socket emit.
+    const { PrivateApiFindMyEventHandler } = loadTypeScriptModule(
+        "../src/server/api/privateApi/eventHandlers/PrivateApiFindMyEventHandler.ts",
+        {
+            "@server": { Server: () => activeServer },
+            net: {},
+            ".": {},
+            "@server/api/lib/findmy/utils": findMyUtilities,
+            "@server/events": {
+                NEW_FINDMY_DEVICE: "new-findmy-device",
+                NEW_FINDMY_LOCATION: "new-findmy-location"
+            },
+            "@server/helpers/utils": {
+                isEmpty: value => value == null || (typeof value === "string" && value.trim().length === 0),
+                titleCase: s => s,
+                waitMs: async () => {}
+            },
+            "@server/lib/logging/Loggable": {
+                Loggable: class {
+                    constructor() {
+                        this.log = { debug: () => {} };
+                    }
+                }
+            },
+            "@server/utils/StringUtils": { obfuscatedHandle: h => h }
+        }
+    );
+    interfaceEvents.length = 0;
+    const handler = new PrivateApiFindMyEventHandler();
+    await handler.handle({
+        event: "new-findmy-location",
+        data: [
+            {
+                handle: "alice@example.com",
+                coordinates: [37.3360, -122.0101],
+                status: "live",
+                location_type: 2,
+                horizontal_accuracy: 3.2,
+                vertical_accuracy: 2.1,
+                speed: 4.8,
+                altitude: 22.5,
+                last_updated: 1700000009500,
+                is_locating_in_progress: false
+            }
+        ]
+    });
+    assert.equal(interfaceEvents.length, 1);
+    assert.equal(interfaceEvents[0].type, "new-findmy-location");
+    assert.equal(interfaceEvents[0].data.status, "live");
+    assert.equal(interfaceEvents[0].data.location_type, 2);
+    assert.equal(interfaceEvents[0].data.horizontal_accuracy, 3.2);
+    assert.equal(interfaceEvents[0].data.vertical_accuracy, 2.1);
+    assert.equal(interfaceEvents[0].data.speed, 4.8);
+    assert.equal(interfaceEvents[0].data.altitude, 22.5);
+    assert.equal(interfaceEvents[0].data.is_locating_in_progress, false);
+
+    // Verify FindMyRouter.startLiveFriend & stopLiveFriend + route registration.
+    class MockBadRequest extends Error {
+        constructor(params) {
+            super(params?.error ?? "BadRequest");
+        }
+    }
+    const { FindMyRouter } = loadTypeScriptModule("../src/server/api/http/api/v1/routers/findmyRouter.ts", {
+        koa: {},
+        "koa-router": {},
+        "../responses/success": {
+            Success: class {
+                constructor(_ctx, payload) {
+                    this.payload = payload;
+                }
+                send() {
+                    return this.payload;
+                }
+            }
+        },
+        "../responses/errors": { BadRequest: MockBadRequest, ServerError: Error },
+        "@server/api/interfaces/findMyInterface": { FindMyInterface },
+        "@server/api/lib/findmy/types": {},
+        "@server/events": { NEW_FINDMY_LOCATION: "new-findmy-location" },
+        "@server": { Server: () => activeServer }
+    });
+
+    await assert.rejects(
+        () => FindMyRouter.startLiveFriend({ request: { body: { handle: "  " } } }, async () => {}),
+        MockBadRequest
+    );
+    const routerStart = await FindMyRouter.startLiveFriend(
+        { request: { body: { handle: "alice@example.com" } } },
+        async () => {}
+    );
+    assert.equal(routerStart.data.live, true);
+    const routerStop = await FindMyRouter.stopLiveFriend(
+        { request: { body: { handle: "alice@example.com" } } },
+        async () => {}
+    );
+    assert.equal(routerStop.data.stopped, true);
+
+    const httpRoutesSource = fs.readFileSync(
+        path.resolve(__dirname, "../src/server/api/http/api/v1/httpRoutes.ts"),
+        "utf8"
+    );
+    assert.ok(httpRoutesSource.includes('"findmy/friends/live/start"'), "httpRoutes must expose live/start");
+    assert.ok(httpRoutesSource.includes('"findmy/friends/live/stop"'), "httpRoutes must expose live/stop");
 };
 
 runFindMyDylibPluginTests()
     .then(runRefreshBranchTests)
     .then(runDeviceRefreshTests)
+    .then(runLiveModeTests)
     .then(() => console.log("PASS: Find My integration tests"))
     .catch(error => {
         console.error(error);

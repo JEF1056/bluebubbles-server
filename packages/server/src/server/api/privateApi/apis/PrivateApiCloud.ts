@@ -11,7 +11,7 @@ export class PrivateApiCloud extends PrivateApiAction {
     async getAccountInfo(): Promise<TransactionResult> {
         const action = "get-account-info";
         const request = new TransactionPromise(TransactionType.OTHER);
-        return this.sendApiMessage(action, null, request);
+        return this.sendApiMessage(action, {}, request);
     }
 
     async getContactCard(address: string = null): Promise<TransactionResult> {

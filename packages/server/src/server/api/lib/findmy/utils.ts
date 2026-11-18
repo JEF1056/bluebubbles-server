@@ -208,3 +208,40 @@ export const normalizeFindMyDevices = (devices: unknown): FindMyDevice[] => {
     if (!Array.isArray(devices)) return [];
     return devices.map(normalizeFindMyDevice).filter((device): device is FindMyDevice => device != null);
 };
+
+const hasLocationTupleChanged = (
+    previousLocation: FindMyDevice["location"] | undefined,
+    nextLocation: FindMyDevice["location"] | undefined
+): boolean => {
+    if (previousLocation == null && nextLocation == null) return false;
+    if (previousLocation == null || nextLocation == null) return nextLocation != null;
+
+    const prevTs = previousLocation.timeStamp;
+    const nextTs = nextLocation.timeStamp;
+    if (prevTs != null && nextTs != null && nextTs < prevTs) return false;
+
+    return (
+        prevTs !== nextTs ||
+        previousLocation.latitude !== nextLocation.latitude ||
+        previousLocation.longitude !== nextLocation.longitude ||
+        previousLocation.horizontalAccuracy !== nextLocation.horizontalAccuracy ||
+        previousLocation.locationFinished !== nextLocation.locationFinished ||
+        previousLocation.isInaccurate !== nextLocation.isInaccurate ||
+        previousLocation.isOld !== nextLocation.isOld ||
+        previousLocation.positionType !== nextLocation.positionType
+    );
+};
+
+export const hasFindMyDeviceLocationChanged = (
+    previousDevice: FindMyDevice | undefined,
+    nextDevice: FindMyDevice
+): boolean => {
+    if (previousDevice == null) {
+        return nextDevice.location != null || nextDevice.crowdSourcedLocation != null;
+    }
+
+    return (
+        hasLocationTupleChanged(previousDevice.location, nextDevice.location) ||
+        hasLocationTupleChanged(previousDevice.crowdSourcedLocation, nextDevice.crowdSourcedLocation)
+    );
+};

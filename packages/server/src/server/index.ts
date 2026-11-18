@@ -73,6 +73,7 @@ import { Alert } from "./databases/server/entity";
 import { getStartDelay } from "./utils/ConfigUtils";
 import { FindMyFriendsCache } from "./api/lib/findmy/FindMyFriendsCache";
 import { FindMyDevicesCache } from "./api/lib/findmy/FindMyDevicesCache";
+import { PinnedChatsCache } from "./api/lib/chats/PinnedChatsCache";
 import { ScheduledService } from "./lib/ScheduledService";
 import { getLogger } from "./lib/logging/Loggable";
 import { IMessageListener } from "./databases/imessage/listeners/IMessageListener";
@@ -177,6 +178,8 @@ class BlueBubblesServer extends EventEmitter {
     findMyFriendsCache: FindMyFriendsCache;
 
     findMyDevicesCache: FindMyDevicesCache;
+
+    pinnedChatsCache: PinnedChatsCache = new PinnedChatsCache();
 
     iMessageListener: IMessageListener;
 

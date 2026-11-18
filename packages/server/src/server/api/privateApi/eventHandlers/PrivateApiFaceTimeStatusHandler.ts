@@ -7,6 +7,7 @@ import { slugifyAddress } from "@server/helpers/utils";
 import { HandleSerializer } from "@server/api/serializers/HandleSerializer";
 import { FaceTimeSessionManager } from "@server/api/lib/facetime/FacetimeSessionManager";
 import { FaceTimeSession, FaceTimeSessionStatus, callStatusMap } from "@server/api/lib/facetime/FaceTimeSession";
+import { FaceTimeAudioBridge } from "@server/api/lib/facetime/FaceTimeAudioBridge";
 import { Loggable } from "@server/lib/logging/Loggable";
 
 type FaceTimeStatusData = {
@@ -21,6 +22,8 @@ type FaceTimeStatusData = {
     is_outgoing: boolean;
     is_audio: boolean;
     is_video: boolean;
+    is_telephony?: boolean;
+    provider_identifier?: string | null;
     url?: string | null;
 };
 
@@ -74,9 +77,14 @@ export class PrivateApiFaceTimeStatusHandler extends Loggable implements Private
             if (!isNew) return;
         }
 
-        // If the call was disonnected, update the session, but still emit an event
-        if (data.data.call_status === FaceTimeSessionStatus.DISCONNECTED && data.data.handle) {
-            this.log.info(`FaceTime call disconnected with ${data.data.handle.value}`);
+        // If the call was disconnected, update the session, clean up audio bridge, and emit an event
+        if (data.data.call_status === FaceTimeSessionStatus.DISCONNECTED) {
+            if (data.data.call_uuid) {
+                FaceTimeAudioBridge.getInstance().cleanupSession(data.data.call_uuid);
+            }
+            if (data.data.handle) {
+                this.log.info(`FaceTime call disconnected with ${data.data.handle.value}`);
+            }
         }
 
         const addr = slugifyAddress(data.data.handle.value);
@@ -95,7 +103,9 @@ export class PrivateApiFaceTimeStatusHandler extends Loggable implements Private
             image_url: data.data.image_url ?? null,
             is_outgoing: data.data.is_outgoing ?? false,
             is_audio: data.data.is_sending_audio ?? false,
-            is_video: data.data.is_sending_video ?? true
+            is_video: data.data.is_video ?? data.data.is_sending_video ?? true,
+            is_telephony: data.data.is_telephony ?? false,
+            provider_identifier: data.data.provider_identifier ?? null
         };
 
         Server().emitMessage(FT_CALL_STATUS_CHANGED, output, "high", true);

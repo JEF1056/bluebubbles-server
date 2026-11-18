@@ -134,6 +134,16 @@ export class HttpRoutes {
                         method: HttpMethod.POST,
                         path: "findmy/friends/refresh",
                         controller: FindMyRouter.refreshFriends
+                    },
+                    {
+                        method: HttpMethod.POST,
+                        path: "findmy/friends/live/start",
+                        controller: FindMyRouter.startLiveFriend
+                    },
+                    {
+                        method: HttpMethod.POST,
+                        path: "findmy/friends/live/stop",
+                        controller: FindMyRouter.stopLiveFriend
                     }
                 ]
             },
@@ -307,10 +317,28 @@ export class HttpRoutes {
                         controller: ChatRouter.count
                     },
                     {
+                        method: HttpMethod.GET,
+                        path: "pinned",
+                        middleware: [...HttpRoutes.protected, PrivateApiMiddleware],
+                        controller: ChatRouter.getPinned
+                    },
+                    {
                         method: HttpMethod.POST,
                         path: "query",
                         validators: [ChatValidator.validateQuery],
                         controller: ChatRouter.query
+                    },
+                    {
+                        method: HttpMethod.POST,
+                        path: ":guid/pin",
+                        middleware: [...HttpRoutes.protected, PrivateApiMiddleware],
+                        controller: ChatRouter.pinChat
+                    },
+                    {
+                        method: HttpMethod.POST,
+                        path: ":guid/unpin",
+                        middleware: [...HttpRoutes.protected, PrivateApiMiddleware],
+                        controller: ChatRouter.unpinChat
                     },
                     {
                         method: HttpMethod.GET,
@@ -406,6 +434,12 @@ export class HttpRoutes {
                         path: ":guid/icon",
                         middleware: [...HttpRoutes.protected],
                         controller: ChatRouter.getGroupIcon
+                    },
+                    {
+                        method: HttpMethod.GET,
+                        path: ":guid/background",
+                        middleware: [...HttpRoutes.protected],
+                        controller: ChatRouter.getBackground
                     },
                     {
                         method: HttpMethod.DELETE,
@@ -608,6 +642,21 @@ export class HttpRoutes {
                         method: HttpMethod.POST,
                         path: "leave/:call_uuid",
                         controller: FaceTimeRouter.leave
+                    },
+                    {
+                        method: HttpMethod.POST,
+                        path: "call",
+                        controller: FaceTimeRouter.call
+                    },
+                    {
+                        method: HttpMethod.POST,
+                        path: "decline/:call_uuid",
+                        controller: FaceTimeRouter.decline
+                    },
+                    {
+                        method: HttpMethod.POST,
+                        path: "set-muted/:call_uuid",
+                        controller: FaceTimeRouter.setMuted
                     }
                 ]
             },
@@ -734,6 +783,9 @@ export class HttpRoutes {
                     [api.root, `v${HttpRoutes.version}`, group.prefix, route.path],
                     middleware
                 );
+                if (group.prefix === "facetime" && route.path === "call") {
+                    HttpRoutes.registerRoute(router, route.method, [api.root, "v2", "facetime", "call"], middleware);
+                }
             }
         }
 
