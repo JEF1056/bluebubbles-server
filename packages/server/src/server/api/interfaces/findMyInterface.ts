@@ -238,6 +238,8 @@ export class FindMyInterface {
         if (privateApiEnabled && privateApiTarget != null && privateApiHelperAvailable) {
             try {
                 const trimmedHandle = typeof options?.handle === "string" ? options.handle.trim() : "";
+                const displayName =
+                    trimmedHandle.length > 0 ? await this.resolveContactDisplayName(trimmedHandle) : undefined;
                 const hasFriendOptions =
                     trimmedHandle.length > 0 ||
                     typeof options?.force === "boolean" ||
@@ -245,6 +247,7 @@ export class FindMyInterface {
                 const result = hasFriendOptions
                     ? await Server().privateApi.findmy.refreshFriends({
                           ...(trimmedHandle.length > 0 ? { handle: trimmedHandle } : {}),
+                          ...(displayName ? { displayName } : {}),
                           ...(typeof options?.force === "boolean" ? { force: options.force } : {}),
                           ...(typeof options?.live === "boolean" ? { live: options.live } : {})
                       })
@@ -296,6 +299,25 @@ export class FindMyInterface {
         return normalizeFindMyFriendLocations(Server().findMyFriendsCache.getAll());
     }
 
+    private static async resolveContactDisplayName(handle: string): Promise<string | undefined> {
+        try {
+            const { ContactInterface } = require("./contactInterface");
+            const contacts = await ContactInterface.queryContacts([handle]);
+            for (const contact of contacts) {
+                const display =
+                    (typeof contact?.displayName === "string" && contact.displayName.trim()) ||
+                    [contact?.firstName, contact?.lastName]
+                        .filter((p): p is string => typeof p === "string" && p.trim().length > 0)
+                        .join(" ")
+                        .trim();
+                if (display.length > 0) return display;
+            }
+        } catch {
+            // Best-effort lookup for FindMy People row selection.
+        }
+        return undefined;
+    }
+
     private static clearLiveIdleTimer(): void {
         if (this.liveFriendIdleTimer != null) {
             clearTimeout(this.liveFriendIdleTimer);
@@ -319,7 +341,8 @@ export class FindMyInterface {
             throw new Error("Find My Friends Private API helper is not connected");
         }
 
-        const result = await Server().privateApi.findmy.startLiveLocation(trimmedHandle);
+        const displayName = await this.resolveContactDisplayName(trimmedHandle);
+        const result = await Server().privateApi.findmy.startLiveLocation(trimmedHandle, displayName);
         const responseData = result?.data as FindMyFriendsRefreshResponse | undefined;
         let updatedLocations: FindMyFriendLocation[] = [];
         if (Array.isArray(responseData?.locations)) {

@@ -46,14 +46,18 @@ export const convertAudio = async (
     attachment: Attachment,
     {
         originalMimeType = null,
-        dryRun = false
+        dryRun = false,
+        format = "mp3"
     }: {
         originalMimeType?: string,
-        dryRun?: boolean
+        dryRun?: boolean,
+        format?: "mp3" | "m4a"
     } = {}
 ): Promise<string> => {
     if (!attachment) return null;
-    const newPath = getConversionPath(attachment, "mp3");
+    const outputExtension = format === "m4a" ? "m4a" : "mp3";
+    const outputMimeType = format === "m4a" ? "audio/mp4" : "audio/mp3";
+    const newPath = getConversionPath(attachment, outputExtension);
     const mType = originalMimeType ?? attachment.getMimeType();
     let failed = false;
     let ext = null;
@@ -70,12 +74,12 @@ export const convertAudio = async (
                 Server().log(`Attachment, ${attachment.transferName}, is still being written. Skipping...`, "debug");
                 return null;
             } else if (isNotEmpty(ext)) {
-                Server().log(`Converting attachment, ${attachment.transferName}, to an MP3...`);
+                Server().log(`Converting attachment, ${attachment.transferName}, to ${outputExtension.toUpperCase()}...`);
                 await FileSystem.convertCafToMp3(attachment.filePath, newPath);
             }
         } catch (ex: any) {
             failed = true;
-            Server().log(`Failed to convert CAF to MP3 for attachment, ${attachment.transferName}`, "debug");
+            Server().log(`Failed to convert CAF to ${outputExtension.toUpperCase()} for attachment, ${attachment.transferName}`, "debug");
             Server().log(ex?.message ?? ex, "error");
         }
     } else {
@@ -84,9 +88,9 @@ export const convertAudio = async (
 
     if (!failed && ext && (fs.existsSync(newPath) || dryRun)) {
         // If conversion is successful, we need to modify the attachment a bit
-        attachment.mimeType = "audio/mp3";
+        attachment.mimeType = outputMimeType;
         attachment.filePath = newPath;
-        attachment.transferName = basename(newPath).replace(`.${ext}`, ".mp3");
+        attachment.transferName = basename(newPath).replace(`.${ext}`, `.${outputExtension}`);
 
         // Set the fPath to the newly converted path
         return newPath;

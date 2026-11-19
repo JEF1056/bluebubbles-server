@@ -12,6 +12,7 @@ import {
 
 export interface RefreshFindMyFriendsOptions {
     handle?: string;
+    displayName?: string;
     force?: boolean;
     live?: boolean;
 }
@@ -26,6 +27,10 @@ const buildRefreshFriendsPayload = (options?: RefreshFindMyFriendsOptions): Node
     const handle = typeof options?.handle === "string" ? options.handle.trim() : "";
     if (handle.length > 0) {
         payload.handle = handle;
+    }
+    const displayName = typeof options?.displayName === "string" ? options.displayName.trim() : "";
+    if (displayName.length > 0) {
+        payload.displayName = displayName;
     }
     if (typeof options?.force === "boolean") {
         payload.force = options.force;
@@ -74,7 +79,7 @@ export class PrivateApiFindMy extends PrivateApiAction {
         );
     }
 
-    async startLiveLocation(handle: string): Promise<TransactionResult> {
+    async startLiveLocation(handle: string, displayName?: string): Promise<TransactionResult> {
         if (this.friendsTargetProcessIdentifier == null) {
             throw new Error("The Find My Friends private API is unavailable on this macOS version");
         }
@@ -84,10 +89,16 @@ export class PrivateApiFindMy extends PrivateApiAction {
             throw new Error("A friend handle is required to start Find My live location");
         }
 
+        const trimmedDisplayName = typeof displayName === "string" ? displayName.trim() : "";
+        const payload: NodeJS.Dict<any> = { handle: trimmedHandle };
+        if (trimmedDisplayName.length > 0) {
+            payload.displayName = trimmedDisplayName;
+        }
+
         const request = new TransactionPromise(TransactionType.FIND_MY);
         return this.sendApiMessage(
             "start-findmy-live-location",
-            { handle: trimmedHandle },
+            payload,
             request,
             this.friendsTargetProcessIdentifier
         );

@@ -1022,7 +1022,9 @@ export class SocketRoutes {
                     "-dislike",
                     "-laugh",
                     "-emphasize",
-                    "-question"
+                    "-question",
+                    "emoji",
+                    "-emoji"
                 ].includes(params.tapback)
             )
                 return response(cb, "error", createBadRequestResponse("Invalid tapback descriptor provided!"));
@@ -1040,7 +1042,8 @@ export class SocketRoutes {
                         chatGuid: params.chatGuid,
                         message,
                         reaction: params.tapback,
-                        tempGuid
+                        tempGuid,
+                        emoji: params.emoji
                     });
 
                     return response(

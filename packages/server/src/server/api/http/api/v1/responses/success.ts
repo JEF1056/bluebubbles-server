@@ -107,12 +107,47 @@ export class Success extends HTTPResponse {
 
 export class FileStream extends HTTPResponse {
     constructor(ctx: RouterContext, path: string, mimeType = "application/octet-stream") {
+        const stats = fs.statSync(path);
+        const total = stats.size;
+        const filename = path.split("/").pop() ?? "attachment";
+        const rangeHeader = ctx.request?.headers?.range ?? ctx.headers?.range;
+        const rangeMatch = typeof rangeHeader === "string" ? /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim()) : null;
+
+        ctx.response.set("Accept-Ranges", "bytes");
+
+        if (rangeMatch && (rangeMatch[1] !== "" || rangeMatch[2] !== "")) {
+            let start: number;
+            let end: number;
+            if (rangeMatch[1] === "") {
+                const suffixLen = Number.parseInt(rangeMatch[2], 10);
+                start = Math.max(0, total - suffixLen);
+                end = total - 1;
+            } else {
+                start = Number.parseInt(rangeMatch[1], 10);
+                end = rangeMatch[2] === "" ? total - 1 : Math.min(Number.parseInt(rangeMatch[2], 10), total - 1);
+            }
+
+            if (total === 0 || Number.isNaN(start) || Number.isNaN(end) || start < 0 || start >= total || start > end) {
+                ctx.response.set("Content-Range", `bytes */${total}`);
+                ctx.response.set("Content-Length", "0");
+                super(ctx, 416 as ValidStatuses, "", "html");
+                return;
+            }
+
+            const src = fs.createReadStream(path, { start, end });
+            ctx.response.set("Content-Type", mimeType as string);
+            ctx.response.set("Content-Range", `bytes ${start}-${end}/${total}`);
+            ctx.response.set("Content-Length", (end - start + 1).toString());
+            ctx.response.set("Content-Disposition", attachmentContentDisposition(filename));
+            super(ctx, 206 as ValidStatuses, src, "file");
+            return;
+        }
+
         const src = fs.createReadStream(path);
         ctx.response.set("Content-Type", mimeType as string);
         // Set the content-length header so that clients can show download progress
-        const stats = fs.statSync(path);
-        ctx.response.set("Content-Length", stats.size.toString());
-        ctx.response.set("Content-Disposition", attachmentContentDisposition(path.split("/").pop() ?? "attachment"));
+        ctx.response.set("Content-Length", total.toString());
+        ctx.response.set("Content-Disposition", attachmentContentDisposition(filename));
         super(ctx, 200, src, "file");
     }
 }

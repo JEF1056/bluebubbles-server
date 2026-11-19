@@ -87,7 +87,7 @@ export class FaceTimeSession extends Loggable {
     update(session: FaceTimeSession) {
         if (session.status === FaceTimeSessionStatus.DISCONNECTED) {
             this.invalidate();
-        } else if (this.status === FaceTimeSessionStatus.INCOMING) {
+        } else if ([FaceTimeSessionStatus.INCOMING, FaceTimeSessionStatus.OUTGOING].includes(this.status)) {
             if ([FaceTimeSessionStatus.INCOMING, FaceTimeSessionStatus.ANSWERED].includes(session.status)) {
                 this.status = FaceTimeSessionStatus.ANSWERED;
                 this.emit("answered", true);

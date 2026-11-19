@@ -24,7 +24,7 @@ import { ChatResponse } from "@server/types";
 import { startChat } from "../apple/scripts";
 import { MessageInterface } from "./messageInterface";
 import { CHAT_READ_STATUS_CHANGED, PINNED_CHATS_UPDATED } from "@server/events";
-import { ChatSerializer } from "../serializers/ChatSerializer";
+import { ChatSerializer, resolveEffectiveChatServiceName } from "../serializers/ChatSerializer";
 import { Attachment } from "@server/databases/imessage/entity/Attachment";
 import { Message } from "@server/databases/imessage/entity/Message";
 import { MessageSerializer } from "../serializers/MessageSerializer";
@@ -101,6 +101,11 @@ export class ChatInterface {
                 } else {
                     chatRes.lastMessage = null;
                 }
+                chatRes.serviceName = resolveEffectiveChatServiceName(
+                    chatRes.guid,
+                    chatRes.serviceName,
+                    chatRes.lastMessage?.service
+                );
             }
 
             results.push(chatRes);

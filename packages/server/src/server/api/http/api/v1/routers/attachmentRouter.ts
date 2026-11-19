@@ -32,7 +32,7 @@ export class AttachmentRouter {
 
     static async download(ctx: RouterContext, _: Next) {
         const { guid } = ctx.params;
-        const { height, width, quality, original, force } = ctx.request.query;
+        const { height, width, quality, original, force, format } = ctx.request.query;
         const useOriginal = isTruthyBool(original as string);
         const forceDownload = isTruthyBool((force as string) ?? "true");
 
@@ -65,15 +65,14 @@ export class AttachmentRouter {
 
         // If we want to resize the image, do so here
         if (!useOriginal) {
-            const converters = [convertImage, convertAudio];
-            for (const conversion of converters) {
-                // Try to convert the attachments using available converters
-                const newPath = await conversion(attachment, { originalMimeType: mimeType });
-                if (newPath) {
-                    aPath = newPath;
-                    mimeType = attachment.mimeType ?? mimeType;
-                    break;
-                }
+            const audioFormat = format === "m4a" ? "m4a" : "mp3";
+            let newPath = await convertImage(attachment, { originalMimeType: mimeType });
+            if (!newPath) {
+                newPath = await convertAudio(attachment, { originalMimeType: mimeType, format: audioFormat });
+            }
+            if (newPath) {
+                aPath = newPath;
+                mimeType = attachment.mimeType ?? mimeType;
             }
 
             // Handle resizing the image

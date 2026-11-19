@@ -3,7 +3,7 @@ import { isEmpty, isNotEmpty } from "@server/helpers/utils";
 import { isMinHighSierra, isMinMonterey, isMinVentura } from "@server/env";
 import { HandleResponse, MessageResponse } from "@server/types";
 import { AttachmentSerializer } from "./AttachmentSerializer";
-import { ChatSerializer } from "./ChatSerializer";
+import { ChatSerializer, resolveEffectiveChatServiceName } from "./ChatSerializer";
 import { DEFAULT_ATTACHMENT_CONFIG, DEFAULT_MESSAGE_CONFIG } from "./constants";
 import { HandleSerializer } from "./HandleSerializer";
 import type { MessageSerializerMultiParams, MessageSerializerSingleParams } from "./types";
@@ -161,6 +161,7 @@ export class MessageSerializer {
             associatedMessageType: message.associatedMessageType,
             expressiveSendStyleId: message.expressiveSendStyleId,
             threadOriginatorGuid: message.threadOriginatorGuid,
+            threadOriginatorPart: message.threadOriginatorPart,
             hasPayloadData: !!message.payloadData,
             service: message.service
         };
@@ -176,7 +177,6 @@ export class MessageSerializer {
                     isSystemMessage: message.isSystemMessage,
                     isServiceMessage: message.isServiceMessage,
                     isForward: message.isForward,
-                    threadOriginatorPart: message.threadOriginatorPart,
                     isCorrupt: message.isCorrupt,
                     datePlayed: message.datePlayed ? message.datePlayed.getTime() : null,
                     cacheRoomnames: message.cacheRoomnames,
@@ -209,6 +209,13 @@ export class MessageSerializer {
                 config: { includeParticipants: false, includeMessages: false },
                 isForNotification
             });
+            if (isNotEmpty(message?.service)) {
+                for (const chat of output.chats) {
+                    if (!chat.serviceName || chat.serviceName === "SMS") {
+                        chat.serviceName = resolveEffectiveChatServiceName(chat.guid, chat.serviceName, message.service);
+                    }
+                }
+            }
         }
 
         if (isMinHighSierra) {

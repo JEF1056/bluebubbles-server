@@ -93,22 +93,23 @@ export class PrivateApiMessage extends PrivateApiAction {
         chatGuid: string,
         selectedMessageGuid: string,
         reactionType: ValidTapback | ValidRemoveTapback,
-        partIndex?: number
+        partIndex?: number,
+        emoji?: string
     ): Promise<TransactionResult> {
         const action = "send-reaction";
         this.throwForNoMissingFields(action, [chatGuid, selectedMessageGuid, reactionType]);
 
         const request = new TransactionPromise(TransactionType.MESSAGE);
-        return this.sendApiMessage(
-            action,
-            {
-                chatGuid,
-                selectedMessageGuid,
-                reactionType,
-                partIndex: partIndex ?? 0
-            },
-            request
-        );
+        const payload: Record<string, any> = {
+            chatGuid,
+            selectedMessageGuid,
+            reactionType,
+            partIndex: partIndex ?? 0
+        };
+        if (emoji) {
+            payload.emoji = emoji;
+        }
+        return this.sendApiMessage(action, payload, request);
     }
 
     async edit({

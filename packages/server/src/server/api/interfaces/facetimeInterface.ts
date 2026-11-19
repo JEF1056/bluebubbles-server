@@ -1,5 +1,5 @@
 import { Server } from "@server";
-import { FaceTimeSession } from "../lib/facetime/FaceTimeSession";
+import { FaceTimeSession, FaceTimeSessionStatus } from "../lib/facetime/FaceTimeSession";
 import { FaceTimeAudioBridge } from "../lib/facetime/FaceTimeAudioBridge";
 import { isMinMonterey } from "@server/env";
 import { checkPrivateApiStatus } from "@server/helpers/utils";
@@ -52,7 +52,17 @@ export class FaceTimeInterface {
         }
 
         const session = new FaceTimeSession({ callUuid });
-        const url = await session.generateLink();
+        session.status = FaceTimeSessionStatus.OUTGOING;
+        let url: string;
+        try {
+            url = await session.generateLink();
+        } catch (err) {
+            // Only leave if the call is still outgoing/ringing; never drop an already answered call.
+            if (session.status === FaceTimeSessionStatus.OUTGOING) {
+                session.leaveCall().catch(() => {});
+            }
+            throw err;
+        }
         session.admitAndLeave().catch(() => {});
         return { link: { url }, call };
     }

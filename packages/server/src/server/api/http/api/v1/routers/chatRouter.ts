@@ -12,7 +12,7 @@ import { arrayHasOne } from "@server/utils/CollectionUtils";
 import { FileStream, Success } from "../responses/success";
 import { IMessageError, NotFound } from "../responses/errors";
 import { parseWithQuery } from "../utils";
-import { ChatSerializer } from "@server/api/serializers/ChatSerializer";
+import { ChatSerializer, resolveEffectiveChatServiceName } from "@server/api/serializers/ChatSerializer";
 
 export class ChatRouter {
     static async count(ctx: RouterContext, _: Next) {
@@ -58,6 +58,11 @@ export class ChatRouter {
                     loadChatParticipants: false
                 }
             });
+            res.serviceName = resolveEffectiveChatServiceName(
+                res.guid,
+                res.serviceName,
+                res.lastMessage?.service
+            );
         }
 
         return new Success(ctx, { data: res }).send();

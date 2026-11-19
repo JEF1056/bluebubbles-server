@@ -50,6 +50,10 @@ export class HttpService extends Loggable {
         maxHttpBufferSize: 1000 * 1000 * 100,
         allowEIO3: true,
         transports: ["websocket", "polling"],
+        cors: {
+            origin: "*",
+            methods: ["GET", "POST"]
+        },
 
         // Reject a new session before engine.io accepts any of its payloads (up to maxHttpBufferSize
         // each), so an unauthenticated client can't make the server buffer data. engine.io only calls
@@ -143,6 +147,11 @@ export class HttpService extends Loggable {
 
         // Allow cross origin requests
         this.koaApp.use(koaCors());
+        this.koaApp.use(async (ctx, next) => {
+            ctx.set("Cross-Origin-Resource-Policy", "cross-origin");
+            ctx.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
+            await next();
+        });
 
         // This allows us to properly pull the IP from the request
         this.koaApp.proxy = true;

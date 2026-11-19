@@ -87,6 +87,7 @@ export type SendReactionParams = {
     reaction: ValidTapback | ValidRemoveTapback;
     tempGuid?: string | null;
     partIndex?: number | null;
+    emoji?: string | null;
 };
 
 export type SendMultipartTextParams = {
