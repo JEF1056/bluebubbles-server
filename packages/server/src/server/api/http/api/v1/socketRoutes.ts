@@ -1234,7 +1234,11 @@ export class SocketRoutes {
         });
 
         socket.on("ft-bridge-ice", async (params): Promise<void> => {
-            await FaceTimeAudioBridge.getInstance().handleIce(params);
+            try {
+                await FaceTimeAudioBridge.getInstance().handleIce(params);
+            } catch (ex: any) {
+                log.debug(`ft-bridge-ice failed: ${ex?.message ?? ex}`);
+            }
         });
 
         socket.on("ft-bridge-mute", (params): void => {

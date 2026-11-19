@@ -31,14 +31,12 @@ export const DebounceSubsequentWithWait = <T extends (...args: any[]) => any>(
                     // values (e.g. the user's poll interval setting) can change at runtime.
                     const resolvedTimeoutMs = typeof timeoutMs === "function" ? timeoutMs() : timeoutMs;
                     await waitMs(resolvedTimeoutMs);
-                    const result = await originalMethod.apply(this, args);
+                } finally {
+                    // Clear before originalMethod so changes arriving mid-poll aren't dropped.
                     timeouts.delete(name);
-                    return result;
-                } catch (ex) {
-                    timeouts.delete(name);
-                    throw ex;
                 }
-            }
+                return await originalMethod.apply(this, args);
+            };
 
             const promise = promiseWrapper.call(this);
             timeouts.set(name, promise);

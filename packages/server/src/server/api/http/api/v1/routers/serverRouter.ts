@@ -10,8 +10,6 @@ import { isEmpty, isTruthyBool } from "@server/helpers/utils";
 import { BadRequest, ServerError } from "../responses/errors";
 import { parseWithQuery } from "../utils";
 import { isMinHighSierra, isMinVentura } from "@server/env";
-import { supportsChatStateSnapshot } from "@server/databases/imessage/snapshot/ChatStateSnapshot";
-import { supportsRecoverableMessages } from "@server/databases/imessage/snapshot/RecoverableMessageSnapshot";
 
 export class ServerRouter {
     static async getInfo(ctx: RouterContext, _: Next) {
@@ -19,7 +17,7 @@ export class ServerRouter {
     }
 
     static async getChatStateSnapshot(ctx: RouterContext, _: Next) {
-        if (!supportsChatStateSnapshot(isMinHighSierra)) {
+        if (!isMinHighSierra) {
             throw new BadRequest({
                 message: "Chat-state snapshots require macOS High Sierra or later!",
                 error: "UNSUPPORTED_MACOS_VERSION"
@@ -38,7 +36,7 @@ export class ServerRouter {
     }
 
     static async getRecoverableMessageSnapshot(ctx: RouterContext, _: Next) {
-        if (!supportsRecoverableMessages(isMinVentura)) {
+        if (!isMinVentura) {
             throw new BadRequest({
                 message: "Recently Deleted requires macOS Ventura or later!",
                 error: "UNSUPPORTED_MACOS_VERSION"

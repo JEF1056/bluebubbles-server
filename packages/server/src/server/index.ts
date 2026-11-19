@@ -82,19 +82,16 @@ import { MessagePoller } from "./databases/imessage/pollers/MessagePoller";
 import { ChatUpdatePoller } from "./databases/imessage/pollers/ChatChangePoller";
 import {
     loadChatStateSnapshot,
-    supportsChatStateSnapshot,
     type ChatStateSnapshotResult
 } from "./databases/imessage/snapshot/ChatStateSnapshot";
 import { RecoverableMessagePoller } from "./databases/imessage/pollers/RecoverableMessagePoller";
 import {
     loadRecoverableMessageSnapshot,
-    supportsRecoverableMessages,
     type RecoverableMessageSnapshotResult
 } from "./databases/imessage/snapshot/RecoverableMessageSnapshot";
 import { obfuscatedHandle } from "./utils/StringUtils";
 import { AutoStartMethods } from "./databases/server/constants";
 import { MacOsInterface } from "./api/interfaces/macosInterface";
-import { resolveFcmPriority } from "./services/fcmService/FcmPriority";
 
 const findProcess = require("find-process");
 
@@ -944,16 +941,21 @@ class BlueBubblesServer extends EventEmitter {
             this.logger.debug("Warning: macOS Big Sur does NOT support creating group chats due to API limitations!");
         }
 
-        // Check for contact permissions
-        const contactStatus = await requestContactPermission();
-        if (contactStatus === "Denied") {
-            this.logger.debug(
-                "Contacts authorization status is denied! You may need to manually " +
-                    "allow BlueBubbles to access your contacts."
-            );
-        } else {
-            this.logger.debug(`Contacts authorization status: ${contactStatus}`);
-        }
+        // Check for contact permissions without blocking unattended startup if macOS prompts
+        void requestContactPermission()
+            .then(contactStatus => {
+                if (contactStatus === "Denied") {
+                    this.logger.debug(
+                        "Contacts authorization status is denied! You may need to manually " +
+                            "allow BlueBubbles to access your contacts."
+                    );
+                } else {
+                    this.logger.debug(`Contacts authorization status: ${contactStatus}`);
+                }
+            })
+            .catch(ex => {
+                this.logger.debug(`Failed to check contacts authorization status: ${ex?.message ?? String(ex)}`);
+            });
 
         // Check if MacForge is running
         if (isMinCatalina && this.repo.getConfig("enable_private_api")) {
@@ -1232,7 +1234,7 @@ class BlueBubblesServer extends EventEmitter {
                     await this.fcm?.sendNotification(
                         devices.map(device => device.identifier),
                         { type, data: notifData },
-                        resolveFcmPriority(type, priority)
+                        type === CHAT_READ_STATUS_CHANGED ? "high" : priority
                     );
                 }
             }
@@ -1367,7 +1369,7 @@ class BlueBubblesServer extends EventEmitter {
         // but created earlier never appears in its result set. Preserve the
         // existing OS gate because the snapshot query uses chat columns that
         // are unavailable on earlier macOS versions.
-        if (supportsChatStateSnapshot(isMinHighSierra)) {
+        if (isMinHighSierra) {
             this.iMessageListener.addPoller(new ChatUpdatePoller(this.iMessageRepo, cache));
         }
 
@@ -1389,7 +1391,7 @@ class BlueBubblesServer extends EventEmitter {
         // Recently Deleted only exists on Ventura and later. Deleting a single
         // message leaves both the chat row and the message row in place, so no
         // other poller can observe it.
-        if (supportsRecoverableMessages(isMinVentura)) {
+        if (isMinVentura) {
             this.iMessageListener.addPoller(new RecoverableMessagePoller(this.iMessageRepo, cache));
         }
 

@@ -4,7 +4,6 @@ import test from "node:test";
 import {
     buildRecoverableMessageSnapshot,
     parseRecoverableMessageRows,
-    supportsRecoverableMessages,
     type RecoverableMessageEntry,
     type RecoverableMessageRow
 } from "../src/server/databases/imessage/snapshot/RecoverableMessageSnapshot";
@@ -12,11 +11,6 @@ import {
 function row(overrides: Partial<RecoverableMessageRow> = {}): RecoverableMessageRow {
     return { chat_guid: "chat-a", message_guid: "msg-1", chat_has_messages: 1, ...overrides };
 }
-
-test("Recently Deleted requires Ventura or later", () => {
-    assert.equal(supportsRecoverableMessages(true), true);
-    assert.equal(supportsRecoverableMessages(false), false);
-});
 
 test("a recoverable row parses into a deleted message entry", () => {
     assert.deepEqual(parseRecoverableMessageRows([row()]), [

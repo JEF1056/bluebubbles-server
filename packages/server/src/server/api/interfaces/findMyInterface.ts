@@ -14,7 +14,7 @@ import {
     FindMyItem
 } from "@server/api/lib/findmy/types";
 import {
-    hasFindMyDeviceLocationChanged,
+    getChangedFindMyDevices,
     normalizeFindMyDevices,
     normalizeFindMyFriendLocations,
     transformFindMyItemToDevice
@@ -45,20 +45,8 @@ export class FindMyInterface {
         previousDevices: FindMyDevice[],
         nextDevices: FindMyDevice[]
     ): Promise<void> {
-        const previousById = new Map<string, FindMyDevice>();
-        for (const device of previousDevices) {
-            const identifier = device.identifier ?? device.id;
-            if (identifier) {
-                previousById.set(identifier, device);
-            }
-        }
-
-        for (const device of nextDevices) {
-            const identifier = device.identifier ?? device.id;
-            const previousDevice = identifier ? previousById.get(identifier) : undefined;
-            if (hasFindMyDeviceLocationChanged(previousDevice, device)) {
-                await Server().emitMessage?.(NEW_FINDMY_DEVICE, device, "normal", false, true);
-            }
+        for (const device of getChangedFindMyDevices(previousDevices, nextDevices)) {
+            await Server().emitMessage?.(NEW_FINDMY_DEVICE, device, "normal", false, true);
         }
     }
 
@@ -227,15 +215,21 @@ export class FindMyInterface {
         return Server().privateApi.hasClient(processIdentifier);
     }
 
+    private static isFriendsHelperReady(): boolean {
+        const privateApiTarget = resolveFindMyFriendsPrivateApiTarget({ isMinBigSur, isMinSonoma, isMinSequoia });
+        return (
+            Boolean(Server().repo.getConfig("enable_private_api")) &&
+            privateApiTarget != null &&
+            Server().privateApi.hasClient(privateApiTarget)
+        );
+    }
+
     static async refreshFriends(
         allowFindMyAppFallback = true,
         options?: RefreshFindMyFriendsOptions
     ): Promise<FindMyFriendLocation[]> {
-        const privateApiEnabled = Boolean(Server().repo.getConfig("enable_private_api"));
-        const privateApiTarget = resolveFindMyFriendsPrivateApiTarget({ isMinBigSur, isMinSonoma, isMinSequoia });
-        const privateApiHelperAvailable = privateApiTarget != null && Server().privateApi.hasClient(privateApiTarget);
         let receivedUsableHelperResponse = false;
-        if (privateApiEnabled && privateApiTarget != null && privateApiHelperAvailable) {
+        if (this.isFriendsHelperReady()) {
             try {
                 const trimmedHandle = typeof options?.handle === "string" ? options.handle.trim() : "";
                 const displayName =
@@ -334,10 +328,7 @@ export class FindMyInterface {
             throw new Error("A friend handle is required to start Find My live location");
         }
 
-        const privateApiEnabled = Boolean(Server().repo.getConfig("enable_private_api"));
-        const privateApiTarget = resolveFindMyFriendsPrivateApiTarget({ isMinBigSur, isMinSonoma, isMinSequoia });
-        const privateApiHelperAvailable = privateApiTarget != null && Server().privateApi.hasClient(privateApiTarget);
-        if (!privateApiEnabled || privateApiTarget == null || !privateApiHelperAvailable) {
+        if (!this.isFriendsHelperReady()) {
             throw new Error("Find My Friends Private API helper is not connected");
         }
 
@@ -392,10 +383,7 @@ export class FindMyInterface {
             this.activeLiveFriendHandle = null;
         }
 
-        const privateApiEnabled = Boolean(Server().repo.getConfig("enable_private_api"));
-        const privateApiTarget = resolveFindMyFriendsPrivateApiTarget({ isMinBigSur, isMinSonoma, isMinSequoia });
-        const privateApiHelperAvailable = privateApiTarget != null && Server().privateApi.hasClient(privateApiTarget);
-        if (!privateApiEnabled || privateApiTarget == null || !privateApiHelperAvailable) {
+        if (!this.isFriendsHelperReady()) {
             return {
                 handle: trimmedHandle ?? previousHandle ?? null,
                 stopped: false

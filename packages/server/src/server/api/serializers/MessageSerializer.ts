@@ -159,6 +159,7 @@ export class MessageSerializer {
             balloonBundleId: message.balloonBundleId,
             associatedMessageGuid: message.associatedMessageGuid,
             associatedMessageType: message.associatedMessageType,
+            associatedMessageEmoji: message.associatedMessageEmoji,
             expressiveSendStyleId: message.expressiveSendStyleId,
             threadOriginatorGuid: message.threadOriginatorGuid,
             threadOriginatorPart: message.threadOriginatorPart,

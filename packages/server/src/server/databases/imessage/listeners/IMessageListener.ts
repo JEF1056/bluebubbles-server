@@ -18,6 +18,20 @@ const getPollDebounceMs = (): number => {
         : DEFAULT_POLL_DEBOUNCE_MS;
 };
 
+export const getFileStatSignature = async (filePaths: string[]): Promise<string> => {
+    const parts = await Promise.all(
+        filePaths.map(async (filePath) => {
+            try {
+                const stat = await fs.promises.stat(filePath);
+                return `${filePath}:${stat.mtimeMs}:${stat.size}`;
+            } catch {
+                return `${filePath}:missing`;
+            }
+        })
+    );
+    return parts.join("|");
+};
+
 export class IMessageListener extends Loggable {
     tag = "IMessageListener";
 
@@ -40,6 +54,8 @@ export class IMessageListener extends Loggable {
     pollIntervalMs: number;
 
     pollTimer: NodeJS.Timeout | null = null;
+
+    lastStatSignature: string | null = null;
 
     constructor({
         filePaths,
@@ -109,6 +125,7 @@ export class IMessageListener extends Loggable {
         });
 
         this.watcher.start();
+        this.lastStatSignature = await getFileStatSignature(this.filePaths);
         this.startPollTimer();
     }
 
@@ -116,6 +133,9 @@ export class IMessageListener extends Loggable {
         if (this.pollTimer || this.pollIntervalMs <= 0) return;
 
         this.pollTimer = setInterval(async () => {
+            const signature = await getFileStatSignature(this.filePaths);
+            if (signature === this.lastStatSignature) return;
+            this.lastStatSignature = signature;
             await this.handleChangeEvent({
                 filePath: "poll-interval",
                 prevStat: null,
@@ -129,6 +149,8 @@ export class IMessageListener extends Loggable {
     async handleChangeEvent(event: FileChangeEvent) {
         await this.processLock.acquire();
         try {
+            // Snapshot before polling so any write landing mid-poll is caught on the next tick.
+            this.lastStatSignature = await getFileStatSignature(this.filePaths);
             const now = Date.now();
             let prevTime = this.lastCheck;
     

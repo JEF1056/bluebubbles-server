@@ -245,3 +245,19 @@ export const hasFindMyDeviceLocationChanged = (
         hasLocationTupleChanged(previousDevice.crowdSourcedLocation, nextDevice.crowdSourcedLocation)
     );
 };
+
+export const getChangedFindMyDevices = (
+    previousDevices: FindMyDevice[],
+    nextDevices: FindMyDevice[]
+): FindMyDevice[] => {
+    const previousById = new Map<string, FindMyDevice>();
+    for (const device of previousDevices) {
+        const identifier = device.identifier ?? device.id;
+        if (identifier) previousById.set(identifier, device);
+    }
+
+    return nextDevices.filter(device => {
+        const identifier = device.identifier ?? device.id;
+        return hasFindMyDeviceLocationChanged(identifier ? previousById.get(identifier) : undefined, device);
+    });
+};

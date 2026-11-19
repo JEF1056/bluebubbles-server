@@ -19,13 +19,6 @@ export type RecoverableMessageRow = {
 };
 
 /**
- * Recently Deleted (`chat_recoverable_message_join`) arrived with macOS
- * Ventura. Earlier versions hard-delete, which the whole-chat delete path
- * already covers.
- */
-export const supportsRecoverableMessages = (isMinVenturaOrLater: boolean): boolean => isMinVenturaOrLater;
-
-/**
  * Selects every message Apple currently holds in Recently Deleted.
  *
  * The scan is driven by `chat_recoverable_message_join`, which holds only the

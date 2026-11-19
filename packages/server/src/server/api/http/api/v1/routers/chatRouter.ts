@@ -398,11 +398,8 @@ export class ChatRouter {
         }).send();
     }
 
-    static async pinChat(ctx: RouterContext, _: Next) {
+    private static async setChatPinned(ctx: RouterContext, pinned: boolean) {
         const { guid: chatGuid } = ctx?.params ?? {};
-        const rawPinned = ctx?.request?.body?.pinned;
-        const pinned = rawPinned != null ? isTruthyBool(rawPinned) : true;
-
         const [chats, __] = await Server().iMessageRepo.getChats({ chatGuid, withParticipants: false });
         if (isEmpty(chats)) throw new NotFound({ error: "Chat does not exist!" });
 
@@ -413,16 +410,12 @@ export class ChatRouter {
         }).send();
     }
 
+    static async pinChat(ctx: RouterContext, _: Next) {
+        const rawPinned = ctx?.request?.body?.pinned;
+        return ChatRouter.setChatPinned(ctx, rawPinned != null ? isTruthyBool(rawPinned) : true);
+    }
+
     static async unpinChat(ctx: RouterContext, _: Next) {
-        const { guid: chatGuid } = ctx?.params ?? {};
-
-        const [chats, __] = await Server().iMessageRepo.getChats({ chatGuid, withParticipants: false });
-        if (isEmpty(chats)) throw new NotFound({ error: "Chat does not exist!" });
-
-        const pinnedChatGuids = await ChatInterface.setPinned(chats[0].guid, false);
-        return new Success(ctx, {
-            message: "Successfully unpinned chat!",
-            data: { pinnedChatGuids }
-        }).send();
+        return ChatRouter.setChatPinned(ctx, false);
     }
 }

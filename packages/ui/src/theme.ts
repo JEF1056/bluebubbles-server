@@ -2,10 +2,16 @@ import { mode } from '@chakra-ui/theme-tools';
 import { useAppSelector } from './app/hooks';
 
 
+const appFontStack = '"Google Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+
 export const baseTheme = {
     config: {
         initialColorMode: 'system',
         useSystemColorMode: false
+    },
+    fonts: {
+        heading: appFontStack,
+        body: appFontStack,
     },
     styles: {
         global: (props: any) => {

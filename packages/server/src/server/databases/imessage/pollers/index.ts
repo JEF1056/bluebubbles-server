@@ -1,4 +1,4 @@
-import { EventCache, KeyedEventCache } from "@server/eventCache";
+import { EventCache } from "@server/eventCache";
 import { MessageRepository } from "..";
 import { Message } from "../entity/Message";
 import { CHAT_READ_STATUS_CHANGED } from "@server/events";
@@ -38,12 +38,12 @@ export class IMessageCache {
 
     chatStates: Record<string, ChatState> = {};
 
-    messageEvents: KeyedEventCache;
+    messageEvents: EventCache;
 
     chatEvents: EventCache;
 
     constructor() {
-        this.messageEvents = new KeyedEventCache();
+        this.messageEvents = new EventCache();
         this.chatEvents = new EventCache();
     }
 

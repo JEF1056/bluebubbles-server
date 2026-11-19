@@ -6,15 +6,8 @@ import {
     buildChatTransitionQuery,
     compareDecimalStrings,
     parseChatSnapshotRows,
-    parseChatTransitionRows,
-    supportsChatStateSnapshot
+    parseChatTransitionRows
 } from "../src/server/databases/imessage/snapshot/ChatStateSnapshot";
-
-/** Snapshot queries require chat.last_read_message_timestamp (High Sierra+). */
-test("supports chat-state snapshots only on High Sierra or later", () => {
-    assert.equal(supportsChatStateSnapshot(false), false);
-    assert.equal(supportsChatStateSnapshot(true), true);
-});
 
 /** The live poll may inspect only Apple's indexed unread-message candidates. */
 test("transition query derives read state from unread-only message candidates", () => {

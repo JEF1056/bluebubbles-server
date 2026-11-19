@@ -29,13 +29,23 @@ conversionModule._compile(compiled.outputText, sourcePath);
 
 const { getConvertedImageName, getImageConversion } = conversionModule.exports;
 
-test("converts HEIC and HEIF attachments to PNG", () => {
+test("converts HEIC and HEIF attachments to JPEG by default and PNG when hasAlpha is true", () => {
     assert.deepEqual(getImageConversion("public.heic", "image/heic"), {
+        sourceExtension: "heic",
+        outputExtension: "jpeg",
+        outputMimeType: "image/jpeg"
+    });
+    assert.deepEqual(getImageConversion("public.heif", "image/heif-sequence"), {
+        sourceExtension: "heif",
+        outputExtension: "jpeg",
+        outputMimeType: "image/jpeg"
+    });
+    assert.deepEqual(getImageConversion("public.heic", "image/heic", true), {
         sourceExtension: "heic",
         outputExtension: "png",
         outputMimeType: "image/png"
     });
-    assert.deepEqual(getImageConversion("public.heif", "image/heif-sequence"), {
+    assert.deepEqual(getImageConversion("public.heif", "image/heif-sequence", true), {
         sourceExtension: "heif",
         outputExtension: "png",
         outputMimeType: "image/png"
@@ -60,9 +70,13 @@ test("ignores image types that do not require conversion", () => {
 });
 
 test("replaces source extensions without duplicating the output extension", () => {
-    const conversion = getImageConversion("public.heic", "image/heic");
+    const jpegConversion = getImageConversion("public.heic", "image/heic");
+    assert.equal(getConvertedImageName("photo.HEIC", jpegConversion), "photo.jpeg");
+    assert.equal(getConvertedImageName("photo", jpegConversion), "photo.jpeg");
+    assert.equal(getConvertedImageName("photo.jpeg", jpegConversion), "photo.jpeg");
 
-    assert.equal(getConvertedImageName("photo.HEIC", conversion), "photo.png");
-    assert.equal(getConvertedImageName("photo", conversion), "photo.png");
-    assert.equal(getConvertedImageName("photo.png", conversion), "photo.png");
+    const pngConversion = getImageConversion("public.heic", "image/heic", true);
+    assert.equal(getConvertedImageName("photo.HEIC", pngConversion), "photo.png");
+    assert.equal(getConvertedImageName("photo", pngConversion), "photo.png");
+    assert.equal(getConvertedImageName("photo.png", pngConversion), "photo.png");
 });

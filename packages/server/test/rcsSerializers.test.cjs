@@ -173,6 +173,46 @@ test("ChatInterface.get updates stale SMS serviceName from cached lastMessage.se
     assert.equal(results[0].serviceName, "iMessage");
 });
 
+test("MessageSerializer.serialize preserves associatedMessageEmoji and threadOriginatorPart for RCS", async () => {
+    const emojiTapback = await MessageSerializer.serialize({
+        message: {
+            ROWID: 69132,
+            guid: "50A7BF06-31B1-4602-8872-A517D74EA741",
+            universalText: () => "Reacted 😭 to “Hi”",
+            service: "RCS",
+            isFromMe: true,
+            dateCreated: new Date(1792098155620),
+            associatedMessageGuid: "6A35DF5D-EC56-4179-B822-2BD3E38DEE26",
+            associatedMessageType: "2006",
+            associatedMessageEmoji: "😭",
+            attachments: []
+        },
+        config: { includeChats: false }
+    });
+    assert.equal(emojiTapback.associatedMessageType, "2006");
+    assert.equal(emojiTapback.associatedMessageEmoji, "😭");
+    assert.equal(emojiTapback.associatedMessageGuid, "6A35DF5D-EC56-4179-B822-2BD3E38DEE26");
+    assert.equal(emojiTapback.service, "RCS");
+
+    const rcsReply = await MessageSerializer.serialize({
+        message: {
+            ROWID: 69150,
+            guid: "7BED1730-3D04-4BE9-99C9-C7F5888E1A51",
+            universalText: () => "Aaa",
+            service: "RCS",
+            isFromMe: true,
+            dateCreated: new Date(1792098156620),
+            threadOriginatorGuid: "F06F9F04-F749-45D2-A736-938F742F0801",
+            threadOriginatorPart: "0:0:4",
+            attachments: []
+        },
+        config: { includeChats: false }
+    });
+    assert.equal(rcsReply.threadOriginatorGuid, "F06F9F04-F749-45D2-A736-938F742F0801");
+    assert.equal(rcsReply.threadOriginatorPart, "0:0:4");
+    assert.equal(rcsReply.service, "RCS");
+});
+
 test("MessageSerializer preserves threadOriginatorPart on notifications and updates stale chat serviceName", async () => {
     const incomingRcsReply = {
         ROWID: 66008,

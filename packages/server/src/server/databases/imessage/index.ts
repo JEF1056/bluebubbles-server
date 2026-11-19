@@ -291,6 +291,7 @@ export class MessageRepository extends Loggable {
         withChats = false,
         withChatParticipants = false,
         withAttachments = true,
+        withCount = true,
         sort = "DESC",
         orderBy = "message.dateCreated",
         where = []
@@ -350,7 +351,9 @@ export class MessageRepository extends Loggable {
         query.skip(offset);
         query.take(limit);
 
-        const [messages, totalCount] = await query.getManyAndCount();
+        const [messages, totalCount] = withCount
+            ? await query.getManyAndCount()
+            : [await query.getMany(), 0];
         if (withAttachments) await this.addMissingAttachmentsFromAttributedBody(messages);
         return [messages, totalCount];
     }
@@ -372,6 +375,7 @@ export class MessageRepository extends Loggable {
         withChats = false,
         withChatParticipants = false,
         withAttachments = true,
+        withCount = true,
         sort = "DESC",
         orderBy = "message.dateCreated",
         where = []
@@ -531,7 +535,8 @@ export class MessageRepository extends Loggable {
     }
 
     private async addMissingAttachmentsFromAttributedBody(messages: Message[]): Promise<void> {
-        const attachmentCache = new Map<string, Attachment | null>();
+        const pending: Array<{ message: Message; normalizedGuid: string }> = [];
+        const lookupGuids = new Set<string>();
 
         for (const message of messages) {
             const guids = this.getAttributedBodyAttachmentGuids(message);
@@ -551,16 +556,43 @@ export class MessageRepository extends Loggable {
                 });
                 if (existing) continue;
 
-                if (!attachmentCache.has(normalizedGuid)) {
-                    attachmentCache.set(normalizedGuid, await this.getAttachment(guid));
-                }
-
-                const attachment = attachmentCache.get(normalizedGuid);
-                if (!attachment) continue;
-
-                const alreadyAdded = message.attachments.some(item => item.ROWID === attachment.ROWID);
-                if (!alreadyAdded) message.attachments.push(attachment);
+                pending.push({ message, normalizedGuid });
+                lookupGuids.add(guid);
+                if (guid.length > 36) lookupGuids.add(normalizedGuid);
             }
+        }
+
+        if (lookupGuids.size === 0) return;
+
+        const guidList = Array.from(lookupGuids);
+        const query = this.db.getRepository(Attachment).createQueryBuilder("attachment");
+        if (isMinHighSierra) {
+            query.where("attachment.guid IN (:...guids) OR attachment.originalGuid IN (:...guids)", {
+                guids: guidList
+            });
+        } else {
+            query.where("attachment.guid IN (:...guids)", { guids: guidList });
+        }
+
+        const fetched = await query.getMany();
+        const attachmentMap = new Map<string, Attachment>();
+        for (const attachment of fetched) {
+            if (attachment.guid) {
+                const norm = this.normalizeAttachmentGuid(attachment.guid);
+                if (!attachmentMap.has(norm)) attachmentMap.set(norm, attachment);
+            }
+            if (attachment.originalGuid) {
+                const normOrig = this.normalizeAttachmentGuid(attachment.originalGuid);
+                if (!attachmentMap.has(normOrig)) attachmentMap.set(normOrig, attachment);
+            }
+        }
+
+        for (const { message, normalizedGuid } of pending) {
+            const attachment = attachmentMap.get(normalizedGuid);
+            if (!attachment) continue;
+
+            const alreadyAdded = message.attachments.some(item => item.ROWID === attachment.ROWID);
+            if (!alreadyAdded) message.attachments.push(attachment);
         }
     }
 

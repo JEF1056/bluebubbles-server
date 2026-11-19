@@ -7,6 +7,7 @@ export type DBMessageParams = {
     withChats?: boolean;
     withChatParticipants?: boolean;
     withAttachments?: boolean;
+    withCount?: boolean;
     includeCreated?: boolean;
     sort?: "ASC" | "DESC";
     orderBy?: string;
@@ -15,7 +16,7 @@ export type DBMessageParams = {
 
 export type DBWhereItem = {
     statement: string;
-    args: { [key: string]: string | number };
+    args: { [key: string]: string | number | string[] | number[] };
 };
 
 export type ChatParams = {

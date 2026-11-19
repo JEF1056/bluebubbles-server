@@ -45,6 +45,7 @@ export class MessagePoller extends IMessagePoller {
             after: afterLookback,
             withChats: true,
             withAttachments: false,
+            withCount: false,
             orderBy: "message.dateCreated"
         });
 
@@ -77,6 +78,7 @@ export class MessagePoller extends IMessagePoller {
             const [hydrated] = await this.repo.getMessages({
                 withChats: true,
                 withAttachments: true,
+                withCount: false,
                 limit: entries.length,
                 where: [
                     {
@@ -98,6 +100,7 @@ export class MessagePoller extends IMessagePoller {
         if (this.unsentIds.length > 0) {
             const [previouslyUnsentEntries, _] = await this.repo.getMessages({
                 withChats: true,
+                withCount: false,
                 where: [
                     {
                         statement: `message.ROWID in (${this.unsentIds.join(", ")})`,

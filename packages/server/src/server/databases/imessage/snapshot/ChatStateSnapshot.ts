@@ -30,10 +30,6 @@ export type ChatTransitionRow = {
     row_id: string | null;
 };
 
-/** Chat-state queries require chat.last_read_message_timestamp (macOS High Sierra+). */
-export const supportsChatStateSnapshot = (isHighSierraOrLater: boolean): boolean => isHighSierraOrLater;
-
-/** Compare non-negative decimal integers without converting them to JS Number. */
 /**
  * When Apple last marked the chat read, in epoch milliseconds. The read
  * pointer is chat.last_read_message_timestamp: nanoseconds since 2001-01-01 UTC.
@@ -65,6 +61,29 @@ export function compareDecimalStrings(a: string, b: string): number {
  * as Unread". Apple flips is_read back but leaves both date_read and the chat
  * pointer where they were, so the pointer test alone would hide it.
  */
+const UNREAD_MESSAGE_PREDICATE = `
+    m.is_read = 0
+    AND m.is_from_me = 0
+    AND m.item_type = 0
+    AND (m.date > COALESCE(c.last_read_message_timestamp, 0) OR m.date_read > 0)
+    AND (
+        COALESCE(m.associated_message_type, 0) = 0
+        OR (
+            COALESCE(m.associated_message_type, 0) != 0
+            AND NOT EXISTS (
+                SELECT 1
+                FROM chat_message_join newer_j
+                JOIN message newer_m ON newer_m.ROWID = newer_j.message_id
+                WHERE newer_j.chat_id = j.chat_id
+                    AND (
+                        newer_m.date > m.date
+                        OR (newer_m.date = m.date AND newer_m.ROWID > m.ROWID)
+                    )
+            )
+        )
+    )
+`.trim();
+
 export function buildChatTransitionQuery(): string {
     return `
         WITH unread_chat_ids AS (
@@ -72,26 +91,7 @@ export function buildChatTransitionQuery(): string {
             FROM message m
             JOIN chat_message_join j ON j.message_id = m.ROWID
             JOIN chat c ON c.ROWID = j.chat_id
-            WHERE m.is_read = 0
-                AND m.is_from_me = 0
-                AND m.item_type = 0
-                AND (m.date > COALESCE(c.last_read_message_timestamp, 0) OR m.date_read > 0)
-                AND (
-                    COALESCE(m.associated_message_type, 0) = 0
-                    OR (
-                        COALESCE(m.associated_message_type, 0) != 0
-                        AND NOT EXISTS (
-                            SELECT 1
-                            FROM chat_message_join newer_j
-                            JOIN message newer_m ON newer_m.ROWID = newer_j.message_id
-                            WHERE newer_j.chat_id = j.chat_id
-                                AND (
-                                    newer_m.date > m.date
-                                    OR (newer_m.date = m.date AND newer_m.ROWID > m.ROWID)
-                                )
-                        )
-                    )
-                )
+            WHERE ${UNREAD_MESSAGE_PREDICATE}
         )
         SELECT
             c.guid AS guid,
@@ -168,26 +168,7 @@ export function buildChatSnapshotQuery(): string {
             c.guid AS guid,
             SUM(
                 CASE
-                    WHEN m.is_read = 0
-                        AND m.item_type = 0
-                        AND m.is_from_me = 0
-                        AND (m.date > COALESCE(c.last_read_message_timestamp, 0) OR m.date_read > 0)
-                        AND (
-                            COALESCE(m.associated_message_type, 0) = 0
-                            OR (
-                                COALESCE(m.associated_message_type, 0) != 0
-                                AND NOT EXISTS (
-                                    SELECT 1
-                                    FROM chat_message_join newer_j
-                                    JOIN message newer_m ON newer_m.ROWID = newer_j.message_id
-                                    WHERE newer_j.chat_id = j.chat_id
-                                        AND (
-                                            newer_m.date > m.date
-                                            OR (newer_m.date = m.date AND newer_m.ROWID > m.ROWID)
-                                        )
-                                )
-                            )
-                        )
+                    WHEN ${UNREAD_MESSAGE_PREDICATE}
                     THEN 1
                     ELSE 0
                 END

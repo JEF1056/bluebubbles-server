@@ -1,12 +1,8 @@
 import { Server } from "@server";
 import * as net from "net";
 import { PrivateApiEventHandler, EventData } from ".";
-import { FindMyDevice, FindMyFriendLocation } from "@server/api/lib/findmy/types";
-import {
-    hasFindMyDeviceLocationChanged,
-    normalizeFindMyDevices,
-    normalizeFindMyFriendLocations
-} from "@server/api/lib/findmy/utils";
+import { FindMyFriendLocation } from "@server/api/lib/findmy/types";
+import { getChangedFindMyDevices, normalizeFindMyDevices, normalizeFindMyFriendLocations } from "@server/api/lib/findmy/utils";
 import { NEW_FINDMY_DEVICE, NEW_FINDMY_LOCATION } from "@server/events";
 import { isEmpty, titleCase, waitMs } from "@server/helpers/utils";
 import { Loggable } from "@server/lib/logging/Loggable";
@@ -36,23 +32,8 @@ export class PrivateApiFindMyEventHandler extends Loggable implements PrivateApi
         if (normalizedDevices.length === 0) return;
 
         const previousDevices = Server().findMyDevicesCache.getAll();
-        const previousById = new Map<string, FindMyDevice>();
-        for (const device of previousDevices) {
-            const identifier = device.identifier ?? device.id;
-            if (identifier) {
-                previousById.set(identifier, device);
-            }
-        }
-
-        const changedDevices = normalizedDevices.filter(device => {
-            const identifier = device.identifier ?? device.id;
-            const previousDevice = identifier ? previousById.get(identifier) : undefined;
-            return hasFindMyDeviceLocationChanged(previousDevice, device);
-        });
-
         Server().findMyDevicesCache.updateAll(normalizedDevices);
-
-        for (const device of changedDevices) {
+        for (const device of getChangedFindMyDevices(previousDevices, normalizedDevices)) {
             await Server().emitMessage(NEW_FINDMY_DEVICE, device, "normal", false, true);
         }
     }

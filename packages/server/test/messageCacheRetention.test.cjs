@@ -21,7 +21,7 @@ const constantsPath = path.join(__dirname, "../src/server/databases/imessage/pol
 const constants = loadTypeScriptModule(constantsPath);
 
 const eventCachePath = path.join(__dirname, "../src/server/eventCache/index.ts");
-const { EventCache, KeyedEventCache } = loadTypeScriptModule(eventCachePath, {
+const { EventCache } = loadTypeScriptModule(eventCachePath, {
     "@server/helpers/utils": {
         isEmpty: value => value === null || value === undefined || value.length === 0
     }
@@ -29,7 +29,7 @@ const { EventCache, KeyedEventCache } = loadTypeScriptModule(eventCachePath, {
 
 const pollerPath = path.join(__dirname, "../src/server/databases/imessage/pollers/index.ts");
 const { IMessageCache, IMessagePoller } = loadTypeScriptModule(pollerPath, {
-    "@server/eventCache": { EventCache, KeyedEventCache },
+    "@server/eventCache": { EventCache },
     "@server/events": { CHAT_READ_STATUS_CHANGED: "chat-read-status-changed" },
     "@server/lib/logging/Loggable": { Loggable: class {} },
     "./constants": constants
@@ -93,7 +93,7 @@ test("chat deduplication keeps its shorter retention", () => {
     const guid = "expired-chat";
     const expiredAt = Date.now() - constants.CHAT_DEDUP_CACHE_RETENTION_MS - 1;
 
-    cache.chatEvents.items.push({ date: expiredAt, item: guid });
+    cache.chatEvents.items.set(guid, expiredAt);
     cache.chatStates[guid] = {
         cacheTime: expiredAt,
         lastReadMessageTimestamp: 1_000
@@ -105,11 +105,11 @@ test("chat deduplication keeps its shorter retention", () => {
     assert.equal(cache.chatStates[guid], undefined);
 });
 
-test("message event cache uses keyed lookup without changing chat cache storage", () => {
+test("event caches use Map-backed O(1) lookup", () => {
     const cache = new IMessageCache();
 
     assert.equal(cache.messageEvents.items instanceof Map, true);
-    assert.equal(Array.isArray(cache.chatEvents.items), true);
+    assert.equal(cache.chatEvents.items instanceof Map, true);
     assert.equal(cache.messageEvents.add("message-guid"), true);
     assert.equal(cache.messageEvents.add("message-guid"), false);
     assert.equal(cache.messageEvents.find("message-guid"), "message-guid");

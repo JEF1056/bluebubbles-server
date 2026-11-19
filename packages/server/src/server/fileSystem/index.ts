@@ -826,11 +826,27 @@ export class FileSystem {
         }
     }
 
+    static async hasAlpha(filePath: string): Promise<boolean> {
+        const oldPath = FileSystem.getRealPath(filePath);
+        if (!oldPath || !fs.existsSync(oldPath)) return false;
+        try {
+            const output = await FileSystem.execFileCommand("/usr/bin/sips", ["-g", "hasAlpha", oldPath]);
+            return typeof output === "string" && /hasAlpha:\s*yes/i.test(output);
+        } catch {
+            return false;
+        }
+    }
+
     static async convertToPng(originalPath: string, outputPath: string): Promise<void> {
         const oldPath = FileSystem.getRealPath(originalPath);
-        const output = await FileSystem.execShellCommand(
-            `/usr/bin/sips --setProperty "format" "png" "${oldPath}" --out "${outputPath}"`
-        );
+        const output = await FileSystem.execFileCommand("/usr/bin/sips", [
+            "--setProperty",
+            "format",
+            "png",
+            oldPath,
+            "--out",
+            outputPath
+        ]);
         if (isNotEmpty(output) && output.includes("Error:")) {
             throw Error(`Failed to convert image to PNG: ${output}`);
         }
@@ -1015,25 +1031,27 @@ export class FileSystem {
         </array>
         <key>Label</key>
         <string>com.bluebubbles.server</string>
-        <key>Program</key>
-        <string>${appPath}</string>
+        <key>ProgramArguments</key>
+        <array>
+            <string>${appPath}</string>
+        </array>
         <key>RunAtLoad</key>
         <true/>
         <key>KeepAlive</key>
-        <dict>
-	        <key>SuccessfulExit</key>
-	        <false/>
-            <key>Crashed</key>
-            <true/>
-	    </dict>
+        <true/>
+        <key>ThrottleInterval</key>
+        <integer>10</integer>
+        <key>ProcessType</key>
+        <string>Interactive</string>
+        <key>LimitLoadToSessionType</key>
+        <string>Aqua</string>
     </dict>
 </plist>`;
 
         const plistName = "com.bluebubbles.server";
         const filePath = path.join(userHomeDir(), "Library", "LaunchAgents", `${plistName}.plist`);
-        if (!fs.existsSync(filePath)) {
-            fs.writeFileSync(filePath, plist);
-        }
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.writeFileSync(filePath, plist);
 
         try {
             // Always disable first, which will never error out.

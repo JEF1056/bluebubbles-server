@@ -4,20 +4,27 @@ export type ImageConversion = {
     outputMimeType: "image/jpeg" | "image/png";
 };
 
-export const getImageConversion = (uti: string | null, mimeType: string | null): ImageConversion | null => {
+export const getImageConversion = (
+    uti: string | null,
+    mimeType: string | null,
+    hasAlpha = false
+): ImageConversion | null => {
+    const outputExtension = hasAlpha ? "png" : "jpeg";
+    const outputMimeType = hasAlpha ? "image/png" : "image/jpeg";
+
     if (uti === "public.heic" || mimeType?.startsWith("image/heic")) {
         return {
             sourceExtension: "heic",
-            outputExtension: "png",
-            outputMimeType: "image/png"
+            outputExtension,
+            outputMimeType
         };
     }
 
     if (uti === "public.heif" || mimeType?.startsWith("image/heif")) {
         return {
             sourceExtension: "heif",
-            outputExtension: "png",
-            outputMimeType: "image/png"
+            outputExtension,
+            outputMimeType
         };
     }
 

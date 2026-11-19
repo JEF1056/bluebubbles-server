@@ -30,6 +30,8 @@ import { Message } from "@server/databases/imessage/entity/Message";
 import { MessageSerializer } from "../serializers/MessageSerializer";
 
 export class ChatInterface {
+    private static backgroundInFlight = new Map<string, Promise<{ filePath: string; mimeType: string } | null>>();
+
     static async get({
         guid = null,
         withArchived = true,
@@ -41,43 +43,91 @@ export class ChatInterface {
         // When sorting by lastmessage, paginate after sorting so limit/offset return the truly most recent chats.
         const deferPagination = Boolean(sort && sort === "lastmessage" && withLastMessage && !guid);
 
-        // First fetch chats without the last message.
-        // This is because fetching the last message will make the participants list 1 for each chat.
-        // It will also only return chats that have a last message.
-        const [rawChats, totalChats] = await Server().iMessageRepo.getChats({
-            chatGuid: guid as string,
-            withLastMessage: false,
-            withArchived,
-            offset: deferPagination ? null : offset,
-            limit: deferPagination ? null : limit
-        });
-
         const lastMessageCache: { [key: string]: Message | null } = {};
+        let tmpTotal = 0;
         if (withLastMessage) {
-            const [tmpChats, _] = await Server().iMessageRepo.getChats({
+            const [tmpChats, tmpCount] = await Server().iMessageRepo.getChats({
                 chatGuid: guid as string,
                 withLastMessage: true,
                 withParticipants: false,
                 withArchived,
                 offset: null,
-                limit: null
+                limit: null,
+                ...(deferPagination
+                    ? { where: [{ statement: "EXISTS (SELECT 1 FROM chat_handle_join j WHERE j.chat_id = chat.ROWID)", args: {} }] }
+                    : {})
             });
+            tmpTotal = tmpCount;
 
             for (const chat of tmpChats) {
                 lastMessageCache[chat.guid] = chat.messages.length > 0 ? chat.messages[0] : null;
             }
         }
 
+        const msgTime = (chatGuid: string) => {
+            const m = lastMessageCache[chatGuid];
+            const d = m?.dateCreated ?? m?.dateDelivered;
+            return d instanceof Date ? d.getTime() : Number(d ?? 0);
+        };
+
+        let rawChats: Chat[] = [];
+        let totalChats = 0;
+        let paged = false;
+        const start = Number(offset ?? 0);
+
+        if (deferPagination) {
+            const sortedGuids = Object.keys(lastMessageCache).sort((a, b) => msgTime(b) - msgTime(a));
+            if (limit != null && start + Number(limit) <= sortedGuids.length) {
+                const pageGuids = sortedGuids.slice(start, start + Number(limit));
+                paged = true;
+                if (pageGuids.length > 0) {
+                    const [pageChats] = await Server().iMessageRepo.getChats({
+                        chatGuid: guid as string,
+                        withLastMessage: false,
+                        withArchived,
+                        offset: null,
+                        limit: null,
+                        where: [{ statement: "chat.guid IN (:...guids)", args: { guids: pageGuids } }]
+                    });
+                    const pageSet = new Set(pageGuids);
+                    rawChats = (pageChats ?? []).filter(c => pageSet.has(c.guid));
+                }
+                const repo = Server().iMessageRepo as any;
+                if (repo?.db?.getRepository) {
+                    const countQuery = repo.db
+                        .getRepository(Chat)
+                        .createQueryBuilder("chat")
+                        .innerJoin("chat.participants", "handle");
+                    if (!withArchived) countQuery.andWhere("chat.is_archived == 0");
+                    totalChats = await countQuery.getCount();
+                } else {
+                    totalChats = tmpTotal;
+                }
+            } else {
+                [rawChats, totalChats] = await Server().iMessageRepo.getChats({
+                    chatGuid: guid as string,
+                    withLastMessage: false,
+                    withArchived,
+                    offset: null,
+                    limit: null
+                });
+            }
+        } else {
+            [rawChats, totalChats] = await Server().iMessageRepo.getChats({
+                chatGuid: guid as string,
+                withLastMessage: false,
+                withArchived,
+                offset,
+                limit
+            });
+        }
+
         let chats = rawChats ?? [];
         if (deferPagination) {
-            const msgTime = (c: Chat) => {
-                const m = lastMessageCache[c.guid];
-                const d = m?.dateCreated ?? m?.dateDelivered;
-                return d instanceof Date ? d.getTime() : Number(d ?? 0);
-            };
-            chats = [...chats].sort((a, b) => msgTime(b) - msgTime(a));
-            const start = Number(offset ?? 0);
-            chats = limit != null ? chats.slice(start, start + Number(limit)) : chats.slice(start);
+            chats = [...chats].sort((a, b) => msgTime(b.guid) - msgTime(a.guid));
+            if (!paged) {
+                chats = limit != null ? chats.slice(start, start + Number(limit)) : chats.slice(start);
+            }
         }
 
         const results = [];
@@ -500,48 +550,67 @@ export class ChatInterface {
         const backgroundGuid = extractBackgroundGuid(chat.properties);
         if (!backgroundGuid) return null;
 
+        const existing = ChatInterface.backgroundInFlight.get(backgroundGuid);
+        if (existing) return existing;
+
+        const promise = ChatInterface.resolveBackground(backgroundGuid).finally(() => {
+            ChatInterface.backgroundInFlight.delete(backgroundGuid);
+        });
+        ChatInterface.backgroundInFlight.set(backgroundGuid, promise);
+        return promise;
+    }
+
+    private static async resolveBackground(
+        backgroundGuid: string
+    ): Promise<{ filePath: string; mimeType: string } | null> {
+        const fileExistsNonEmpty = async (filePath: string): Promise<boolean> => {
+            const stat = await fs.promises.stat(filePath).catch(() => null);
+            return Boolean(stat && stat.size > 0);
+        };
+
         const outDir = path.join(FileSystem.convertDir, "backgrounds");
         const jpgPath = path.join(outDir, `${backgroundGuid}.jpg`);
-        if (fs.existsSync(jpgPath) && fs.statSync(jpgPath).size > 0) {
+        if (await fileExistsNonEmpty(jpgPath)) {
             return { filePath: jpgPath, mimeType: "image/jpeg" };
         }
 
         const pngPath = path.join(outDir, `${backgroundGuid}.png`);
-        if (fs.existsSync(pngPath) && fs.statSync(pngPath).size > 0) {
+        if (await fileExistsNonEmpty(pngPath)) {
             return { filePath: pngPath, mimeType: "image/png" };
         }
 
         const cacheDir = path.join(os.homedir(), "Library", "Messages", "TranscriptBackgroundCache");
         const archivePath = path.join(cacheDir, backgroundGuid);
-        if (fs.existsSync(archivePath)) {
-            const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "bb-bg-"));
+        if (await fs.promises.access(archivePath).then(() => true, () => false)) {
+            const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "bb-bg-"));
             try {
                 await FileSystem.execFileCommand("/usr/bin/aa", ["extract", "-d", tmpDir, "-i", archivePath]);
                 const imgPath = findLayerStackImage(tmpDir);
                 if (imgPath) {
-                    fs.mkdirSync(outDir, { recursive: true });
+                    await fs.promises.mkdir(outDir, { recursive: true });
                     const tmpOut = `${jpgPath}.${process.pid}.tmp.jpg`;
                     await FileSystem.convertToJpg(imgPath, tmpOut);
-                    if (fs.existsSync(tmpOut) && fs.statSync(tmpOut).size > 0) {
-                        fs.renameSync(tmpOut, jpgPath);
+                    if (await fileExistsNonEmpty(tmpOut)) {
+                        await fs.promises.rename(tmpOut, jpgPath);
                         return { filePath: jpgPath, mimeType: "image/jpeg" };
                     }
                 }
             } catch (ex: any) {
                 Server().log(`Failed to extract chat background archive ${backgroundGuid}: ${ex?.message ?? ex}`, "warn");
             } finally {
-                (fs as any).rmSync(tmpDir, { recursive: true, force: true });
+                await (fs.promises as any).rm(tmpDir, { recursive: true, force: true });
             }
         }
 
         const watchPath = path.join(cacheDir, `${backgroundGuid}-watchBackground`);
-        if (fs.existsSync(watchPath)) {
-            const pngData = extractWatchBackgroundImage(fs.readFileSync(watchPath));
+        const watchBuf = await fs.promises.readFile(watchPath).catch(() => null);
+        if (watchBuf) {
+            const pngData = extractWatchBackgroundImage(watchBuf);
             if (pngData) {
-                fs.mkdirSync(outDir, { recursive: true });
+                await fs.promises.mkdir(outDir, { recursive: true });
                 const tmpOut = `${pngPath}.${process.pid}.tmp.png`;
-                fs.writeFileSync(tmpOut, pngData);
-                fs.renameSync(tmpOut, pngPath);
+                await fs.promises.writeFile(tmpOut, pngData);
+                await fs.promises.rename(tmpOut, pngPath);
                 return { filePath: pngPath, mimeType: "image/png" };
             }
         }

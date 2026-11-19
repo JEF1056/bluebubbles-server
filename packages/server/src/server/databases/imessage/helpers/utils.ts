@@ -111,14 +111,27 @@ export const convertImage = async (
 ): Promise<string> => {
     if (!attachment) return null;
     const mType = originalMimeType ?? attachment.getMimeType();
-    const conversion = getImageConversion(attachment.uti, mType);
+    let conversion = getImageConversion(attachment.uti, mType);
     if (!conversion) return null;
 
-    const guid = attachment.originalGuid ?? attachment.guid;
+    const guid = FileSystem.toPathComponent(attachment.originalGuid ?? attachment.guid, "unknown");
     const newDir = `${FileSystem.convertDir}/${guid}`;
     if (!fs.existsSync(newDir)) fs.mkdirSync(newDir, { recursive: true });
-    const originalName = isEmpty(attachment.transferName) ? guid : attachment.transferName;
-    const outputName = getConvertedImageName(originalName, conversion);
+    const safeName = isEmpty(attachment.transferName)
+        ? guid
+        : FileSystem.toPathComponent(attachment.transferName, guid);
+
+    if (!dryRun && (conversion.sourceExtension === "heic" || conversion.sourceExtension === "heif")) {
+        const pngConv = getImageConversion(attachment.uti, mType, true);
+        if (fs.existsSync(`${newDir}/${getConvertedImageName(safeName, pngConv)}`)) {
+            conversion = pngConv;
+        } else if (!fs.existsSync(`${newDir}/${getConvertedImageName(safeName, conversion)}`)) {
+            const hasAlpha = attachment.filePath ? await FileSystem.hasAlpha(attachment.filePath) : false;
+            conversion = getImageConversion(attachment.uti, mType, hasAlpha);
+        }
+    }
+
+    const outputName = getConvertedImageName(safeName, conversion);
     const newPath = `${newDir}/${outputName}`;
     let failed = false;
 
