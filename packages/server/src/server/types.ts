@@ -13,6 +13,7 @@ export type ServerMetadataResponse = {
     local_ipv4s: string[];
     local_ipv6s: string[];
     supportsFaceTimeCalls?: boolean;
+    lan_proof_key?: string;
 };
 
 /**

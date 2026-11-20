@@ -28,7 +28,8 @@ export class ContactsOAuthWindow extends Window {
             width: 800,
             height: 600,
             webPreferences: {
-                nodeIntegration: true,
+                nodeIntegration: false,
+                contextIsolation: true
             }
         });
 

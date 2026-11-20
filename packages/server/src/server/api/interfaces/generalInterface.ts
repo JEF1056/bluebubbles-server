@@ -24,7 +24,8 @@ export class GeneralInterface {
             macos_time_sync: await FileSystem.getTimeSync(),
             local_ipv4s: FileSystem.getLocalIps("IPv4"),
             local_ipv6s: FileSystem.getLocalIps("IPv6"),
-            supportsFaceTimeCalls: isMinMonterey
+            supportsFaceTimeCalls: isMinMonterey,
+            lan_proof_key: Server().repo.getConfig("lan_proof_key") as string
         };
     }
 

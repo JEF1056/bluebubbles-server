@@ -339,7 +339,7 @@ export class OauthService extends Loggable {
         this.running = true;
 
         // Start the server
-        this.httpServer.listen(this.port, () => {
+        this.httpServer.listen(this.port, "127.0.0.1", () => {
             this.log.info(`Successfully started OAuth2 server`);
         });
     }
@@ -974,7 +974,8 @@ export class OauthService extends Loggable {
                 width: 800,
                 height: 600,
                 webPreferences: {
-                    nodeIntegration: true
+                    nodeIntegration: false,
+                    contextIsolation: true
                 }
             });
 

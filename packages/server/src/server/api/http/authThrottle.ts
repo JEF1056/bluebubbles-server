@@ -68,19 +68,27 @@ export const normalizeAddress = (value: string | null | undefined): string | nul
 
 export const isLoopback = (addr: string): boolean => addr === "::1" || (net.isIPv4(addr) && addr.startsWith("127."));
 
-/**
- * Addresses that may legitimately be a reverse proxy in front of the server:
- * this machine or the local network. Their X-Forwarded-For is trusted.
- */
-export const isTrustedProxy = (addr: string): boolean => {
-    if (isLoopback(addr)) return true;
+export const isDirectLanPeer = (addr: string): boolean => {
+    if (isLoopback(addr)) return false;
     if (net.isIPv4(addr)) {
         const [a, b] = addr.split(".").map(Number);
-        return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254);
+        // RFC1918, IPv4 link-local, and Tailscale CGNAT (100.64.0.0/10)
+        return (
+            a === 10 ||
+            (a === 172 && b >= 16 && b <= 31) ||
+            (a === 192 && b === 168) ||
+            (a === 169 && b === 254) ||
+            (a === 100 && b >= 64 && b <= 127)
+        );
     }
-    // fc00::/7 (unique local) and fe80::/10 (link local)
-    return /^f[cd]/.test(addr) || /^fe[89ab]/.test(addr);
+    // Tailscale IPv6 (fd7a:115c:a1e0::/48), IPv6 ULA (fc00::/7), and link-local (fe80::/10)
+    return addr.startsWith("fd7a:115c:a1e0:") || /^f[cd][0-9a-f]{2}:/.test(addr) || /^fe[89ab][0-9a-f]:/.test(addr);
 };
+
+/**
+ * Only loopback peers (e.g. local cloudflared) are trusted to supply X-Forwarded-For.
+ */
+export const isTrustedProxy = (addr: string): boolean => isLoopback(addr);
 
 /**
  * Works out which client a request came from.
@@ -88,9 +96,7 @@ export const isTrustedProxy = (addr: string): boolean => {
  * Koa's `ctx.request.ip` (with `proxy = true`) is the LEFTMOST X-Forwarded-For
  * entry, which the client writes itself, so an attacker could rotate it to
  * dodge a per-address limit. Instead, only honour X-Forwarded-For when the
- * direct peer is a local proxy, and take the rightmost entry that a proxy
- * appended for a non-local hop. If every hop is local, the leftmost entry is
- * the original LAN client.
+ * direct peer is loopback, and take the rightmost non-loopback entry.
  */
 export const resolveClientAddress = (
     peerAddress: string | null | undefined,
@@ -98,7 +104,7 @@ export const resolveClientAddress = (
 ): string | null => {
     const peer = normalizeAddress(peerAddress);
     if (!peer) return null;
-    if (!isTrustedProxy(peer)) return peer;
+    if (!isLoopback(peer)) return peer;
 
     const header = Array.isArray(forwardedFor) ? forwardedFor.join(",") : forwardedFor ?? "";
     const hops = header
@@ -108,10 +114,65 @@ export const resolveClientAddress = (
     if (hops.length === 0) return peer;
 
     for (let i = hops.length - 1; i >= 0; i--) {
-        if (!isTrustedProxy(hops[i])) return hops[i];
+        if (!isLoopback(hops[i])) return hops[i];
     }
 
     return hops[0];
+};
+
+let cachedAllowedHostsRaw: string | undefined;
+let cachedAllowedHosts = new Set<string>();
+
+const getExtraAllowedHosts = (): Set<string> => {
+    const raw = process.env.BB_ALLOWED_HOSTS ?? "";
+    if (raw !== cachedAllowedHostsRaw) {
+        cachedAllowedHostsRaw = raw;
+        cachedAllowedHosts = new Set(
+            raw
+                .split(",")
+                .map(s => s.trim().toLowerCase().replace(/\.$/, ""))
+                .filter(Boolean)
+        );
+    }
+    return cachedAllowedHosts;
+};
+
+// DNS-rebinding guard: a rebinding page arrives with its own external DNS name as Host.
+export const isAllowedHost = (hostHeader: string | undefined, serverAddress: string | undefined): boolean => {
+    if (!hostHeader) return true;
+    if (/[\s/@?#\\]/.test(hostHeader)) return false;
+    let host: string;
+    try {
+        host = new URL(`http://${hostHeader}`).hostname.toLowerCase().replace(/[[\]]/g, "").replace(/\.$/, "");
+    } catch {
+        return false;
+    }
+    if (!host) return false;
+    if (net.isIP(host) || !host.includes(".") || host.endsWith(".local") || host.endsWith(".ts.net")) return true;
+    if (serverAddress) {
+        try {
+            const raw = serverAddress.includes("://") ? serverAddress : `http://${serverAddress}`;
+            const configured = new URL(raw).hostname.toLowerCase().replace(/[[\]]/g, "").replace(/\.$/, "");
+            if (configured && host === configured) return true;
+        } catch {
+            // No valid public address configured
+        }
+    }
+    return getExtraAllowedHosts().has(host);
+};
+
+export const isValidLanProofNonce = (nonce: string | null | undefined): nonce is string =>
+    typeof nonce === "string" && /^[0-9a-f]{32}$/.test(nonce);
+
+export const lanProof = (
+    key: string | null | undefined,
+    nonce: string | null | undefined,
+    peerAddress: string | null | undefined
+): string | null => {
+    if (!key || !isValidLanProofNonce(nonce)) return null;
+    const peer = normalizeAddress(peerAddress);
+    if (!peer || !isDirectLanPeer(peer)) return null;
+    return crypto.createHmac("sha256", key).update(nonce).digest("hex");
 };
 
 /**

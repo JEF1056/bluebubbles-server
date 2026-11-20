@@ -17,7 +17,7 @@ const ALLOWED_WEB_ORIGINS = new Set([
         .filter(Boolean)
 ]);
 
-const isAllowedCorsOrigin = (origin?: string): boolean => {
+export const isAllowedCorsOrigin = (origin?: string): boolean => {
     if (!origin) return false;
     if (ALLOWED_WEB_ORIGINS.has(origin)) return true;
     return /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
@@ -39,7 +39,15 @@ import { ScheduledService } from "../../lib/ScheduledService";
 import { Loggable } from "../../lib/logging/Loggable";
 import { ProxyServices } from "@server/databases/server/constants";
 import { ProcessSpawner } from "@server/lib/ProcessSpawner";
-import { AuthThrottle, resolveClientAddress } from "./authThrottle";
+import {
+    AuthThrottle,
+    isAllowedHost,
+    isDirectLanPeer,
+    isValidLanProofNonce,
+    lanProof,
+    normalizeAddress,
+    resolveClientAddress
+} from "./authThrottle";
 
 /**
  * This service class handles all routing for incoming socket
@@ -73,6 +81,14 @@ export class HttpService extends Loggable {
         // each), so an unauthenticated client can't make the server buffer data. engine.io only calls
         // this for a session's first request, and passes the same query that becomes socket.handshake.query.
         allowRequest: (req, callback) => {
+            const origin = req.headers.origin;
+            const serverAddress = Server().repo?.getConfig("server_address") as string;
+            const hostOk = isAllowedHost(req.headers.host, serverAddress);
+            if (!hostOk || (origin && !isAllowedCorsOrigin(origin))) {
+                callback("Forbidden", false);
+                return;
+            }
+
             let query = (req as any)._query as Record<string, unknown>;
             if (!query) {
                 query = Object.fromEntries(new URL(req.url ?? "", "http://localhost").searchParams.entries());
@@ -161,6 +177,11 @@ export class HttpService extends Loggable {
 
         // Strict credentialed CORS for authorized web client + localhost dev only
         this.koaApp.use(async (ctx, next) => {
+            const serverAddress = Server().repo?.getConfig("server_address") as string;
+            if (!isAllowedHost(ctx.get("host"), serverAddress)) {
+                ctx.status = 403;
+                return;
+            }
             const origin = ctx.get("Origin");
             if (origin && isAllowedCorsOrigin(origin)) {
                 ctx.vary("Origin");
@@ -187,6 +208,31 @@ export class HttpService extends Loggable {
             if (ctx.method === "GET" && ctx.path === "/api/v1/access-bounce") {
                 ctx.set("Cache-Control", "no-store");
                 ctx.redirect("https://chat.jessfan.com/");
+                return;
+            }
+            if (ctx.method === "GET" && ctx.path === "/api/v1/lan-proof") {
+                ctx.set("Cache-Control", "no-store");
+                const peer = normalizeAddress(ctx.req.socket.remoteAddress);
+                if (!peer || !isDirectLanPeer(peer)) {
+                    ctx.status = 403;
+                    ctx.body = { status: 403, message: "Forbidden" };
+                    return;
+                }
+                const nonce = typeof ctx.query.nonce === "string" ? ctx.query.nonce : "";
+                if (!isValidLanProofNonce(nonce)) {
+                    ctx.status = 400;
+                    ctx.body = { status: 400, message: "Invalid nonce" };
+                    return;
+                }
+                const key = Server().repo?.getConfig("lan_proof_key") as string;
+                const proof = lanProof(key, nonce, peer);
+                if (!proof) {
+                    ctx.status = 500;
+                    ctx.body = { status: 500, message: "LAN proof key unavailable" };
+                    return;
+                }
+                ctx.status = 200;
+                ctx.body = { status: 200, message: "Success", data: { proof } };
                 return;
             }
             await next();

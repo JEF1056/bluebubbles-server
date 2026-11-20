@@ -1,3 +1,4 @@
+import * as crypto from "crypto";
 
 export enum AutoStartMethods {
     None = "none",
@@ -30,6 +31,7 @@ export const DEFAULT_DB_ITEMS: { [key: string]: () => any } = {
     auto_start_method: () => AutoStartMethods.None,
     proxy_service: () => ProxyServices.Cloudflare,
     encrypt_coms: () => 0,
+    lan_proof_key: () => crypto.randomBytes(32).toString("hex"),
     hide_dock_icon: () => 0,
     last_fcm_restart: () => 0,
     start_via_terminal: () => 0,
