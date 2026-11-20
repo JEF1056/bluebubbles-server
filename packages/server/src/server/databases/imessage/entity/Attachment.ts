@@ -94,7 +94,7 @@ export class Attachment {
             nullable: true
         })
     )
-    stickerUserInfo: Blob;
+    stickerUserInfo: Buffer | Uint8Array | Record<string, unknown> | Blob | null;
 
     @conditional(
         isMinSierra,

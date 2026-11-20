@@ -112,6 +112,14 @@ export type ChatResponse = {
     lastAddressedHandle?: string | null;
 };
 
+export type StickerPlacementResponse = {
+    xScalar: number;
+    yScalar: number;
+    scale: number;
+    rotation: number;
+    parentPreviewWidth: number;
+};
+
 export type AttachmentResponse = {
     originalROWID: number;
     guid: string;
@@ -131,6 +139,7 @@ export type AttachmentResponse = {
     originalGuid?: string;
     metadata?: { [key: string]: string | boolean | number };
     hasLivePhoto?: boolean;
+    stickerPlacement?: StickerPlacementResponse | null;
 };
 
 export type ValidTapback = "love" | "like" | "dislike" | "laugh" | "emphasize" | "question" | "emoji";
