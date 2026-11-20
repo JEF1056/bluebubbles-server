@@ -125,6 +125,21 @@ export class HttpRoutes {
                         controller: FindMyRouter.refreshDevices
                     },
                     {
+                        method: HttpMethod.POST,
+                        path: "findmy/devices/ring",
+                        controller: FindMyRouter.ringDevice
+                    },
+                    {
+                        method: HttpMethod.GET,
+                        path: "findmy/devices/ble-spec",
+                        controller: FindMyRouter.bleSpec
+                    },
+                    {
+                        method: HttpMethod.GET,
+                        path: "findmy/devices/icon",
+                        controller: FindMyRouter.deviceIcon
+                    },
+                    {
                         method: HttpMethod.GET,
                         path: "findmy/friends",
                         middleware: [...HttpRoutes.protected, PrivateApiMiddleware],
@@ -629,9 +644,44 @@ export class HttpRoutes {
                 prefix: "facetime",
                 routes: [
                     {
+                        method: HttpMethod.GET,
+                        path: "sessions",
+                        controller: FaceTimeRouter.listSessions
+                    },
+                    {
                         method: HttpMethod.POST,
                         path: "session",
                         controller: FaceTimeRouter.newSession
+                    },
+                    {
+                        method: HttpMethod.POST,
+                        path: "session/:call_uuid/answer",
+                        controller: FaceTimeRouter.answer
+                    },
+                    {
+                        method: HttpMethod.POST,
+                        path: "session/:call_uuid/handoff",
+                        controller: FaceTimeRouter.handoff
+                    },
+                    {
+                        method: HttpMethod.POST,
+                        path: "session/:call_uuid/mute",
+                        controller: FaceTimeRouter.setMuted
+                    },
+                    {
+                        method: HttpMethod.POST,
+                        path: "session/:call_uuid/leave",
+                        controller: FaceTimeRouter.leave
+                    },
+                    {
+                        method: HttpMethod.POST,
+                        path: "session/:call_uuid/end",
+                        controller: FaceTimeRouter.end
+                    },
+                    {
+                        method: HttpMethod.POST,
+                        path: "session/:call_uuid/decline",
+                        controller: FaceTimeRouter.decline
                     },
                     {
                         method: HttpMethod.POST,
@@ -657,6 +707,16 @@ export class HttpRoutes {
                         method: HttpMethod.POST,
                         path: "set-muted/:call_uuid",
                         controller: FaceTimeRouter.setMuted
+                    },
+                    {
+                        method: HttpMethod.POST,
+                        path: "dtmf",
+                        controller: FaceTimeRouter.dtmf
+                    },
+                    {
+                        method: HttpMethod.GET,
+                        path: "bridge/status",
+                        controller: FaceTimeRouter.bridgeStatus
                     }
                 ]
             },

@@ -36,7 +36,8 @@ export const HomeLayout = (): JSX.Element => {
     const address = useAppSelector(state => state.config.server_address);
     const password = useAppSelector(state => state.config.password);
     const port = useAppSelector(state => state.config.socket_port);
-    const qrCode: any = buildQrData(password, address);
+    const customHeaders = useAppSelector(state => state.config.custom_headers);
+    const qrCode: any = buildQrData(password, address, customHeaders);
     const computerId = useAppSelector(state => state.config.computer_id);
     const iMessageEmail = useAppSelector(state => state.config.detected_imessage);
     const [statDays, setStatDays] = useState(180);

@@ -18,21 +18,7 @@ export type RecoverableMessageRow = {
     chat_has_messages: number | null;
 };
 
-/**
- * Selects every message Apple currently holds in Recently Deleted.
- *
- * The scan is driven by `chat_recoverable_message_join`, which holds only the
- * messages currently pending permanent deletion (111 rows on the author's Mac,
- * against ~2,460 chats). It deliberately does NOT aggregate the message table:
- * an earlier message-GUID fingerprint diff was reverted for exactly that cost.
- *
- * `message.date_retracted` is not consulted. That column marks unsend, which
- * upstream's MessagePoller already reports through `updated-message`.
- *
- * `chat_has_messages` lets the detector tell a single-message delete apart from
- * a whole-conversation delete, which drops every message into Recently Deleted
- * at once and is already reported as one `chat-deleted` event.
- */
+// Driven by chat_recoverable_message_join (not full message table) to keep snapshot queries fast.
 export function buildRecoverableMessageQuery(): string {
     return `
         SELECT

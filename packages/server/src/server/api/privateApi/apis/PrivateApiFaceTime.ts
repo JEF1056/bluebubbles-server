@@ -19,6 +19,19 @@ export class PrivateApiFaceTime extends PrivateApiAction {
         return this.sendApiMessage(action, { callUUID: uuid });
     }
 
+    async endAndInvalidateCall(
+        uuid: string,
+        url: string | null = null,
+        groupUUID: string | null = null
+    ): Promise<TransactionResult> {
+        const action = "end-and-invalidate-call";
+        const request = new TransactionPromise(TransactionType.OTHER);
+        const args: Record<string, any> = { callUUID: uuid };
+        if (url) args.url = url;
+        if (groupUUID) args.groupUUID = groupUUID;
+        return this.sendApiMessage(action, args, request);
+    }
+
     async declineCall(uuid: string): Promise<TransactionResult> {
         const action = "decline-call";
         const request = new TransactionPromise(TransactionType.OTHER);
@@ -34,6 +47,12 @@ export class PrivateApiFaceTime extends PrivateApiAction {
     async setMuted(uuid: string, muted: boolean): Promise<TransactionResult> {
         const action = "set-muted";
         return this.sendApiMessage(action, { callUUID: uuid, muted });
+    }
+
+    async playDtmf(uuid: string, digit: string): Promise<TransactionResult> {
+        const action = "play-dtmf";
+        const request = new TransactionPromise(TransactionType.OTHER);
+        return this.sendApiMessage(action, { callUUID: uuid, digit }, request);
     }
 
     async generateLink(uuid: string = null): Promise<TransactionResult> {
@@ -57,5 +76,11 @@ export class PrivateApiFaceTime extends PrivateApiAction {
             },
             request
         );
+    }
+
+    async admitAnyPendingMember(): Promise<TransactionResult> {
+        const action = "admit-any-pending-member";
+        const request = new TransactionPromise(TransactionType.OTHER);
+        return this.sendApiMessage(action, {}, request);
     }
 }

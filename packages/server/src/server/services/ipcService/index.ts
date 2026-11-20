@@ -1,5 +1,8 @@
 import { app, dialog, ipcMain, systemPreferences } from "electron";
 import { askForAccessibilityAccess, askForFullDiskAccess } from "node-mac-permissions";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 import process from "process";
 
 import { Server } from "@server";
@@ -28,6 +31,10 @@ import { ZrokManager } from "@server/managers/zrokManager";
 import { ProxyServices } from "@server/databases/server/constants";
 import { Webhook } from "@server/databases/server/entity";
 import { getWebhookSecurityOptions } from "@server/services/webhookService";
+import { utagService } from "@server/api/lib/utag";
+import { gfindService } from "@server/api/lib/gfind";
+import { UTagOAuthWindow } from "../../../windows/UTagOAuthWindow";
+import { GoogleFindOAuthWindow } from "../../../windows/GoogleFindOAuthWindow";
 import { validateWebhookUrl } from "@server/services/webhookService/addressGuard";
 
 export class IPCService extends Loggable {
@@ -91,7 +98,15 @@ export class IPCService extends Loggable {
             if (!Server().repo.db) return {};
             const cfg = Server().repo?.config;
             const serverInfo = await GeneralInterface.getServerMetadata();
-            return { ...cfg, ...serverInfo };
+            let custom_headers: Record<string, string> | undefined;
+            try {
+                const tokenPath = path.join(os.homedir(), ".cloudflared", "bluebubbles-device-token.json");
+                if (fs.existsSync(tokenPath)) {
+                    const parsed = JSON.parse(fs.readFileSync(tokenPath, "utf8"));
+                    if (parsed?.headers && typeof parsed.headers === "object") custom_headers = parsed.headers;
+                }
+            } catch { /* ignore unreadable token file */ }
+            return { ...cfg, ...serverInfo, ...(custom_headers ? { custom_headers } : {}) };
         });
 
         ipcMain.handle("get-alerts", async (_, __) => {
@@ -488,6 +503,179 @@ export class IPCService extends Loggable {
 
         ipcMain.handle("install-update", async (_, __) => {
             await Server().updater?.installUpdate();
+        });
+
+        const getFormattedUtagStatus = () => {
+            const s = utagService.getStatus();
+            return {
+                enabled: Boolean(Server().repo.getConfig("enable_utag")),
+                signedIn: s.connected,
+                email: s.email,
+                tagCount: s.tagCount,
+                lastSync: s.lastSyncAt,
+                hasPin: s.hasPin,
+                needsPin: s.needsPin,
+                lastError: s.lastError
+            };
+        };
+
+        const getFormattedGfindStatus = () => {
+            const s = gfindService.getStatus();
+            return {
+                enabled: Boolean(Server().repo.getConfig("enable_gfind")),
+                signedIn: s.connected,
+                email: s.email,
+                e2eeUnlocked: s.e2eeUnlocked,
+                ownerKeyVersion: s.ownerKeyVersion,
+                ownerKeyResetRequired: s.ownerKeyMismatch,
+                fcmConnected: s.fcmConnected,
+                tagCount: s.tagCount,
+                androidDeviceCount: s.androidDeviceCount,
+                lastSync: s.lastSyncAt,
+                lastError: s.lastError
+            };
+        };
+
+        ipcMain.handle("utag-get-status", async () => {
+            return getFormattedUtagStatus();
+        });
+
+        ipcMain.handle("utag-start-auth", async () => {
+            const { url } = await utagService.startSignIn();
+            UTagOAuthWindow.open({
+                url,
+                onCallbackUrl: async callbackUrl => {
+                    await utagService.completeOAuthCallback(callbackUrl);
+                    if (Server().repo.getConfig("enable_utag")) {
+                        utagService.start();
+                        await utagService.refreshDevices().catch(() => undefined);
+                    }
+                    Server().emitToUI("utag-status-update", getFormattedUtagStatus());
+                },
+                onError: err => {
+                    Server().emitToUI("utag-status-update", {
+                        ...getFormattedUtagStatus(),
+                        lastError: err.message
+                    });
+                }
+            });
+            return { ok: true, url };
+        });
+
+        ipcMain.handle("utag-complete-auth", async (_, payload: string | { callbackUrl?: string }) => {
+            const callbackUrl = typeof payload === "string" ? payload : String(payload?.callbackUrl ?? "");
+            await utagService.completeOAuthCallback(callbackUrl);
+            if (Server().repo.getConfig("enable_utag")) {
+                utagService.start();
+                await utagService.refreshDevices().catch(() => undefined);
+            }
+            const status = getFormattedUtagStatus();
+            Server().emitToUI("utag-status-update", status);
+            return status;
+        });
+
+        ipcMain.handle("utag-set-pin", async (_, payload: string | null | { pin?: string | null }) => {
+            const rawPin = typeof payload === "object" && payload !== null ? (payload.pin ?? null) : payload;
+            const pin = typeof rawPin === "string" ? rawPin : "";
+            utagService.setE2eePin(pin);
+            if (Server().repo.getConfig("enable_utag") && utagService.getStatus().connected) {
+                await utagService.refreshDevices().catch(() => undefined);
+            }
+            const status = getFormattedUtagStatus();
+            Server().emitToUI("utag-status-update", status);
+            return status;
+        });
+
+        ipcMain.handle("utag-sync-now", async () => {
+            await utagService.refreshDevices();
+            const status = getFormattedUtagStatus();
+            Server().emitToUI("utag-status-update", status);
+            return status;
+        });
+
+        ipcMain.handle("utag-disconnect", async () => {
+            utagService.disconnect();
+            const status = getFormattedUtagStatus();
+            Server().emitToUI("utag-status-update", status);
+            return status;
+        });
+
+        ipcMain.handle("gfind-get-status", async () => {
+            return getFormattedGfindStatus();
+        });
+
+        ipcMain.handle("gfind-start-auth", async () => {
+            GoogleFindOAuthWindow.open({
+                mode: "auth",
+                kdi: gfindService.getEncryptionUnlockKdi(),
+                onOAuthToken: async oauthToken => {
+                    const res = await gfindService.completeOAuthToken(oauthToken);
+                    Server().emitToUI("gfind-status-update", getFormattedGfindStatus());
+                    return { kdi: res.kdi, email: res.email };
+                },
+                onVaultKeys: async payload => {
+                    await gfindService.completeVaultUnlock(payload);
+                    if (Server().repo.getConfig("enable_gfind")) {
+                        gfindService.start();
+                    }
+                    Server().emitToUI("gfind-status-update", getFormattedGfindStatus());
+                },
+                onError: err => {
+                    Server().emitToUI("gfind-status-update", {
+                        ...getFormattedGfindStatus(),
+                        lastError: err.message
+                    });
+                }
+            });
+            return { ok: true, started: true };
+        });
+
+        ipcMain.handle("gfind-complete-oauth-token", async (_, payload: string | { oauthToken?: string }) => {
+            const oauthToken = typeof payload === "string" ? payload : String(payload?.oauthToken ?? "");
+            await gfindService.completeOAuthToken(oauthToken);
+            if (Server().repo.getConfig("enable_gfind")) {
+                gfindService.start();
+            }
+            const status = getFormattedGfindStatus();
+            Server().emitToUI("gfind-status-update", status);
+            return status;
+        });
+
+        ipcMain.handle("gfind-open-vault-unlock", async () => {
+            GoogleFindOAuthWindow.open({
+                mode: "vault",
+                kdi: gfindService.getEncryptionUnlockKdi(),
+                email: gfindService.getStatus().email,
+                onVaultKeys: async payload => {
+                    await gfindService.completeVaultUnlock(payload);
+                    if (Server().repo.getConfig("enable_gfind")) {
+                        gfindService.start();
+                    }
+                    Server().emitToUI("gfind-status-update", getFormattedGfindStatus());
+                },
+                onError: err => {
+                    Server().emitToUI("gfind-status-update", {
+                        ...getFormattedGfindStatus(),
+                        lastError: err.message
+                    });
+                }
+            });
+            return { ok: true, opened: true };
+        });
+
+        ipcMain.handle("gfind-sync-now", async () => {
+            await gfindService.refreshDevices();
+            const status = getFormattedGfindStatus();
+            Server().emitToUI("gfind-status-update", status);
+            return status;
+        });
+
+        ipcMain.handle("gfind-disconnect", async () => {
+            gfindService.disconnect();
+            await GoogleFindOAuthWindow.clearSession().catch(() => undefined);
+            const status = getFormattedGfindStatus();
+            Server().emitToUI("gfind-status-update", status);
+            return status;
         });
     }
 }

@@ -16,42 +16,41 @@ export class ServerRouter {
         return new Success(ctx, { data: await GeneralInterface.getServerMetadata() }).send();
     }
 
-    static async getChatStateSnapshot(ctx: RouterContext, _: Next) {
-        if (!isMinHighSierra) {
-            throw new BadRequest({
-                message: "Chat-state snapshots require macOS High Sierra or later!",
-                error: "UNSUPPORTED_MACOS_VERSION"
-            });
+    private static async serveSnapshot(
+        ctx: RouterContext,
+        supported: boolean,
+        unsupportedMsg: string,
+        failMsg: string,
+        loader: () => Promise<any>
+    ) {
+        if (!supported) {
+            throw new BadRequest({ message: unsupportedMsg, error: "UNSUPPORTED_MACOS_VERSION" });
         }
-
         try {
-            const result = await Server().getChatStateSnapshot();
-            return new Success(ctx, { data: result }).send();
+            return new Success(ctx, { data: await loader() }).send();
         } catch (ex: any) {
-            throw new ServerError({
-                message: "Failed to build chat state snapshot!",
-                error: ex?.message ?? ex.toString()
-            });
+            throw new ServerError({ message: failMsg, error: ex?.message ?? ex.toString() });
         }
     }
 
-    static async getRecoverableMessageSnapshot(ctx: RouterContext, _: Next) {
-        if (!isMinVentura) {
-            throw new BadRequest({
-                message: "Recently Deleted requires macOS Ventura or later!",
-                error: "UNSUPPORTED_MACOS_VERSION"
-            });
-        }
+    static getChatStateSnapshot(ctx: RouterContext, _: Next) {
+        return ServerRouter.serveSnapshot(
+            ctx,
+            isMinHighSierra,
+            "Chat-state snapshots require macOS High Sierra or later!",
+            "Failed to build chat state snapshot!",
+            () => Server().getChatStateSnapshot()
+        );
+    }
 
-        try {
-            const result = await Server().getRecoverableMessageSnapshot();
-            return new Success(ctx, { data: result }).send();
-        } catch (ex: any) {
-            throw new ServerError({
-                message: "Failed to build recoverable message snapshot!",
-                error: ex?.message ?? ex.toString()
-            });
-        }
+    static getRecoverableMessageSnapshot(ctx: RouterContext, _: Next) {
+        return ServerRouter.serveSnapshot(
+            ctx,
+            isMinVentura,
+            "Recently Deleted requires macOS Ventura or later!",
+            "Failed to build recoverable message snapshot!",
+            () => Server().getRecoverableMessageSnapshot()
+        );
     }
 
     static async checkForUpdate(ctx: RouterContext, _: Next) {

@@ -20,6 +20,16 @@ export interface FindMyDevice {
     locFoundEnabled?: unknown;
     nwd?: unknown;
     deviceStatus?: string;
+    last_updated?: number | null;
+    is_live?: boolean;
+    locating_in_progress?: boolean;
+    long_address?: string | null;
+    short_address?: string | null;
+    street?: string | null;
+    city?: string | null;
+    state?: string | null;
+    zip?: string | null;
+    country?: string | null;
     remoteWipe?: unknown;
     fmlyShare?: unknown;
     thisDevice?: unknown;
@@ -59,6 +69,8 @@ export interface FindMyDevice {
 
     // Extra properties from BlueBubbles
     groupName?: FindMyItem["groupName"];
+    iconUrl?: string | null;
+    iconCategory?: string | null;
 }
 
 export interface FindMyItem {
@@ -102,7 +114,17 @@ export interface FindMyItem {
     name: string;
 }
 
-interface FindMyAddress {
+export type FindMyFriendStatus = "legacy" | "live" | "shallow";
+
+export type FindMyStructuredAddress = {
+    street: string | null;
+    city: string | null;
+    state: string | null;
+    zip: string | null;
+    country: string | null;
+};
+
+export interface FindMyAddress {
     subAdministrativeArea?: string;
     label?: string;
     streetAddress?: string;
@@ -110,15 +132,20 @@ interface FindMyAddress {
     stateCode?: string;
     administrativeArea?: string;
     streetName?: string;
-    formattedAddressLines: Array<string>;
+    postalCode?: string;
+    formattedAddressLines?: Array<string>;
     mapItemFullAddress?: string;
     fullThroroughfare?: string;
     areaOfInterest?: Array<unknown>;
     locality?: string;
     country?: string;
+    street?: string | null;
+    city?: string | null;
+    state?: string | null;
+    zip?: string | null;
 }
 
-interface FindMyLocation {
+export interface FindMyLocation {
     positionType?: string;
     verticalAccuracy?: number;
     longitude?: number;
@@ -139,9 +166,17 @@ export type FindMyFriendLocation = {
     short_address: string | null;
     subtitle: string | null;
     title: string | null;
+    street: string | null;
+    city: string | null;
+    state: string | null;
+    zip: string | null;
+    country: string | null;
+    address: FindMyStructuredAddress | null;
     last_updated: number | null;
+    is_live: boolean;
+    locating_in_progress: boolean;
     is_locating_in_progress: boolean | 0 | 1;
-    status: "legacy" | "live" | "shallow";
+    status: "legacy" | "live" | "shallow" | null;
     location_type?: number | null;
     horizontal_accuracy?: number | null;
     vertical_accuracy?: number | null;

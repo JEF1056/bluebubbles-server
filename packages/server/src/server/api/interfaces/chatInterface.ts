@@ -89,8 +89,7 @@ export class ChatInterface {
                         limit: null,
                         where: [{ statement: "chat.guid IN (:...guids)", args: { guids: pageGuids } }]
                     });
-                    const pageSet = new Set(pageGuids);
-                    rawChats = (pageChats ?? []).filter(c => pageSet.has(c.guid));
+                    rawChats = pageChats ?? [];
                 }
                 const repo = Server().iMessageRepo as any;
                 if (repo?.db?.getRepository) {
@@ -144,13 +143,9 @@ export class ChatInterface {
 
             // Insert the lastmessage from the cache into the chat
             if (withLastMessage) {
-                if (Object.keys(lastMessageCache).includes(chat.guid) && lastMessageCache[chat.guid]) {
-                    chatRes.lastMessage = await MessageSerializer.serialize({
-                        message: lastMessageCache[chat.guid] as Message
-                    });
-                } else {
-                    chatRes.lastMessage = null;
-                }
+                chatRes.lastMessage = lastMessageCache[chat.guid]
+                    ? await MessageSerializer.serialize({ message: lastMessageCache[chat.guid] as Message })
+                    : null;
                 chatRes.serviceName = resolveEffectiveChatServiceName(
                     chatRes.guid,
                     chatRes.serviceName,
@@ -175,28 +170,23 @@ export class ChatInterface {
         return [results, totalChats];
     }
 
+    private static syncPinnedChats(res: any): string[] {
+        const { changed, pinnedChatGuids } = Server().pinnedChatsCache.setPinnedGuids(res?.data?.pinnedChatGuids ?? []);
+        if (changed) Server().emitMessage(PINNED_CHATS_UPDATED, { pinnedChatGuids }, "normal", false);
+        return pinnedChatGuids;
+    }
+
     static async getPinnedChats(refresh = true): Promise<string[]> {
         if (!refresh && Server().pinnedChatsCache.isInitialized()) {
             return Server().pinnedChatsCache.getPinnedGuids();
         }
-
         checkPrivateApiStatus();
-        const res = await Server().privateApi.chat.getPinnedChats();
-        const { changed, pinnedChatGuids } = Server().pinnedChatsCache.setPinnedGuids(res?.data?.pinnedChatGuids ?? []);
-        if (changed) {
-            Server().emitMessage(PINNED_CHATS_UPDATED, { pinnedChatGuids }, "normal", false);
-        }
-        return pinnedChatGuids;
+        return ChatInterface.syncPinnedChats(await Server().privateApi.chat.getPinnedChats());
     }
 
     static async setPinned(guid: string, pinned = true): Promise<string[]> {
         checkPrivateApiStatus();
-        const res = await Server().privateApi.chat.updatePinnedChat(guid, pinned);
-        const { changed, pinnedChatGuids } = Server().pinnedChatsCache.setPinnedGuids(res?.data?.pinnedChatGuids ?? []);
-        if (changed) {
-            Server().emitMessage(PINNED_CHATS_UPDATED, { pinnedChatGuids }, "normal", false);
-        }
-        return pinnedChatGuids;
+        return ChatInterface.syncPinnedChats(await Server().privateApi.chat.updatePinnedChat(guid, pinned));
     }
 
     static async setDisplayName(chat: Chat, displayName: string): Promise<Chat> {
@@ -635,7 +625,8 @@ export class ChatInterface {
         await Server().privateApi.chat.markRead(chatGuid);
         await Server().emitMessage(CHAT_READ_STATUS_CHANGED, {
             chatGuid,
-            read: true
+            read: true,
+            readAt: Date.now()
         });
     }
 

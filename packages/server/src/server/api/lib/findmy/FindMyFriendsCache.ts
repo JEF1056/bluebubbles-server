@@ -1,94 +1,189 @@
 import { isEmpty } from "@server/helpers/utils";
 import { FindMyFriendLocation } from "./types";
 
-const STATUS_RANK: Record<FindMyFriendLocation["status"], number> = {
-    legacy: 0,
-    shallow: 1,
-    live: 2
+const statusRank: Record<string, number> = {
+    legacy: 1,
+    shallow: 2,
+    live: 3
 };
 
+const hasValidCoordinates = (coords: [number, number] | null | undefined): coords is [number, number] =>
+    Array.isArray(coords) &&
+    coords.length === 2 &&
+    typeof coords[0] === "number" &&
+    typeof coords[1] === "number" &&
+    Number.isFinite(coords[0]) &&
+    Number.isFinite(coords[1]) &&
+    !(coords[0] === 0 && coords[1] === 0);
+
+const mergeFallbackAddress = (
+    merged: FindMyFriendLocation,
+    existing: FindMyFriendLocation
+): Partial<FindMyFriendLocation> => ({
+    long_address: merged.long_address ?? existing.long_address,
+    short_address: merged.short_address ?? existing.short_address,
+    street: merged.street ?? existing.street,
+    city: merged.city ?? existing.city,
+    state: merged.state ?? existing.state,
+    zip: merged.zip ?? existing.zip,
+    country: merged.country ?? existing.country,
+    address: merged.address ?? existing.address
+});
+
+export type FindMyFriendUpdateListener = (location: FindMyFriendLocation) => void;
+
 export class FindMyFriendsCache {
-    private locationsByHandle: Record<string, FindMyFriendLocation> = {};
+    private cache: Map<string, FindMyFriendLocation> = new Map();
+    private listeners: Set<FindMyFriendUpdateListener> = new Set();
 
-    updateAll(friendLocations: FindMyFriendLocation[]): FindMyFriendLocation[] {
-        const updatedLocations: FindMyFriendLocation[] = [];
-        for (const friendLocation of friendLocations) {
-            if (this.update(friendLocation)) {
-                updatedLocations.push(friendLocation);
-            }
-        }
-
-        return updatedLocations;
-    }
-
-    replaceAll(friendLocations: FindMyFriendLocation[]): FindMyFriendLocation[] {
-        const snapshotHandles = new Set(
-            friendLocations
-                .map(friendLocation => friendLocation.handle)
-                .filter((friendHandle): friendHandle is string => !isEmpty(friendHandle))
-        );
-        for (const cachedHandle of Object.keys(this.locationsByHandle)) {
-            if (!snapshotHandles.has(cachedHandle)) {
-                delete this.locationsByHandle[cachedHandle];
-            }
-        }
-
-        return this.updateAll(friendLocations);
-    }
-
-    update(friendLocation: FindMyFriendLocation): boolean {
-        const friendHandle = friendLocation?.handle;
-        if (isEmpty(friendHandle)) return false;
-
-        const storeLocation = (): true => {
-            this.locationsByHandle[friendHandle] = friendLocation;
-            return true;
+    onUpdate(listener: FindMyFriendUpdateListener): () => void {
+        this.listeners.add(listener);
+        return () => {
+            this.listeners.delete(listener);
         };
-
-        const cachedLocation = this.locationsByHandle[friendHandle];
-        if (!cachedLocation) return storeLocation();
-
-        const updatedTimestamp = friendLocation.last_updated ?? 0;
-        const cachedTimestamp = cachedLocation.last_updated ?? 0;
-        if (updatedTimestamp < cachedTimestamp) return false;
-
-        // Allow strictly newer updates (including shallow/legacy) to supersede cached live entries;
-        // only block lower-quality status downgrades when timestamps are equal.
-        const hasStrictlyNewerTimestamp = updatedTimestamp > cachedTimestamp;
-        const updatedRank = STATUS_RANK[friendLocation.status] ?? 0;
-        const cachedRank = STATUS_RANK[cachedLocation.status] ?? 0;
-        if (!hasStrictlyNewerTimestamp && updatedRank < cachedRank) return false;
-
-        const cachedCoordinates = cachedLocation.coordinates ?? [0, 0];
-        const updatedCoordinates = friendLocation.coordinates ?? [0, 0];
-        const bothLocationsAreLegacy = cachedLocation.status === "legacy" && friendLocation.status === "legacy";
-        const wouldReplaceKnownLegacyCoordinates =
-            bothLocationsAreLegacy &&
-            cachedCoordinates[0] !== 0 &&
-            cachedCoordinates[1] !== 0 &&
-            updatedCoordinates[0] === 0 &&
-            updatedCoordinates[1] === 0;
-        const hasUnchangedLocation =
-            cachedLocation.status === friendLocation.status &&
-            cachedLocation.location_type === friendLocation.location_type &&
-            cachedCoordinates[0] === updatedCoordinates[0] &&
-            cachedCoordinates[1] === updatedCoordinates[1] &&
-            cachedLocation.horizontal_accuracy === friendLocation.horizontal_accuracy &&
-            cachedLocation.vertical_accuracy === friendLocation.vertical_accuracy &&
-            cachedLocation.speed === friendLocation.speed &&
-            cachedLocation.altitude === friendLocation.altitude &&
-            updatedTimestamp === cachedTimestamp &&
-            Boolean(cachedLocation.is_locating_in_progress) === Boolean(friendLocation.is_locating_in_progress);
-
-        if (wouldReplaceKnownLegacyCoordinates || hasUnchangedLocation) return false;
-        return storeLocation();
     }
 
-    get(handle: string): FindMyFriendLocation | null {
-        return this.locationsByHandle[handle] ?? null;
+    private notifyUpdate(location: FindMyFriendLocation) {
+        for (const listener of Array.from(this.listeners)) {
+            try {
+                listener(location);
+            } catch {
+                // Ignore listener failures so cache updates never fail
+            }
+        }
     }
 
     getAll(): FindMyFriendLocation[] {
-        return Object.values(this.locationsByHandle);
+        return Array.from(this.cache.values());
+    }
+
+    get(handle: string): FindMyFriendLocation | null {
+        return this.cache.get(handle) ?? null;
+    }
+
+    updateAll(locations: FindMyFriendLocation[]): FindMyFriendLocation[] {
+        const updatedLocations: FindMyFriendLocation[] = [];
+        for (const loc of locations) {
+            const updated = this.update(loc);
+            if (updated) {
+                updatedLocations.push(this.cache.get(loc.handle) ?? loc);
+            }
+        }
+        return updatedLocations;
+    }
+
+    replaceAll(locations: FindMyFriendLocation[]): FindMyFriendLocation[] {
+        const nextCache = new Map<string, FindMyFriendLocation>();
+        const updatedLocations: FindMyFriendLocation[] = [];
+
+        for (const loc of locations) {
+            if (!loc || isEmpty(loc.handle)) continue;
+
+            const existing = this.cache.get(loc.handle);
+            const existingTimestamp = existing?.last_updated ?? 0;
+            const nextTimestamp = loc.last_updated ?? 0;
+
+            if (existing && existingTimestamp > nextTimestamp) {
+                nextCache.set(loc.handle, existing);
+                continue;
+            }
+
+            nextCache.set(loc.handle, loc);
+            if (!existing || this.updateWouldChange(existing, loc)) {
+                updatedLocations.push(loc);
+            }
+        }
+
+        this.cache = nextCache;
+        for (const loc of updatedLocations) {
+            this.notifyUpdate(loc);
+        }
+        return updatedLocations;
+    }
+
+    private updateWouldChange(existing: FindMyFriendLocation, incoming: FindMyFriendLocation): boolean {
+        return (
+            existing.last_updated !== incoming.last_updated ||
+            this.hasTelemetryOrStateChanged(existing, incoming)
+        );
+    }
+
+    private hasTelemetryOrStateChanged(existing: FindMyFriendLocation, incoming: FindMyFriendLocation): boolean {
+        const existingLat = existing.coordinates?.[0] ?? null;
+        const existingLon = existing.coordinates?.[1] ?? null;
+        const incomingLat = incoming.coordinates?.[0] ?? null;
+        const incomingLon = incoming.coordinates?.[1] ?? null;
+        return (
+            existingLat !== incomingLat ||
+            existingLon !== incomingLon ||
+            existing.horizontal_accuracy !== incoming.horizontal_accuracy ||
+            existing.vertical_accuracy !== incoming.vertical_accuracy ||
+            existing.speed !== incoming.speed ||
+            existing.altitude !== incoming.altitude ||
+            Boolean(existing.locating_in_progress) !== Boolean(incoming.locating_in_progress) ||
+            Boolean(existing.is_locating_in_progress) !== Boolean(incoming.is_locating_in_progress) ||
+            Boolean(existing.is_live) !== Boolean(incoming.is_live) ||
+            existing.location_type !== incoming.location_type ||
+            existing.status !== incoming.status ||
+            existing.long_address !== incoming.long_address ||
+            existing.short_address !== incoming.short_address ||
+            existing.title !== incoming.title ||
+            existing.subtitle !== incoming.subtitle
+        );
+    }
+
+    update(location: FindMyFriendLocation): boolean {
+        if (!location || isEmpty(location.handle)) return false;
+
+        const existing = this.cache.get(location.handle);
+        const cachedTimestamp = existing?.last_updated ?? 0;
+        const updatedTimestamp = location.last_updated ?? 0;
+
+        if (existing) {
+            // Never overwrite a newer fix with an older fix
+            if (updatedTimestamp < cachedTimestamp) {
+                return false;
+            }
+
+            // At the same timestamp, reject lower-tier status downgrades (e.g., shallow/legacy over live)
+            if (updatedTimestamp === cachedTimestamp) {
+                const cachedRank = statusRank[existing.status ?? ""] ?? 0;
+                const updatedRank = statusRank[location.status ?? ""] ?? 0;
+                if (updatedRank < cachedRank) {
+                    return false;
+                }
+            }
+
+            let merged = location;
+
+            // Preserve cached coordinates, coordinate timestamp, and granular address when incoming has null/[0,0]
+            if (!hasValidCoordinates(merged.coordinates) && hasValidCoordinates(existing.coordinates)) {
+                merged = {
+                    ...merged,
+                    coordinates: existing.coordinates,
+                    last_updated: existing.last_updated,
+                    ...mergeFallbackAddress(merged, existing)
+                };
+            } else if (updatedTimestamp === cachedTimestamp && !merged.long_address && existing.long_address) {
+                // Preserve already-resolved granular street address if a same-timestamp update lacks one
+                merged = {
+                    ...merged,
+                    ...mergeFallbackAddress(merged, existing),
+                    long_address: existing.long_address
+                };
+            }
+
+            if (!this.updateWouldChange(existing, merged)) {
+                return false;
+            }
+
+            this.cache.set(location.handle, merged);
+            this.notifyUpdate(merged);
+            return true;
+        }
+
+        this.cache.set(location.handle, location);
+        this.notifyUpdate(location);
+        return true;
     }
 }

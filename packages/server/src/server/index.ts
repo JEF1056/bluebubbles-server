@@ -73,6 +73,8 @@ import { Alert } from "./databases/server/entity";
 import { getStartDelay } from "./utils/ConfigUtils";
 import { FindMyFriendsCache } from "./api/lib/findmy/FindMyFriendsCache";
 import { FindMyDevicesCache } from "./api/lib/findmy/FindMyDevicesCache";
+import { utagService } from "./api/lib/utag";
+import { gfindService } from "./api/lib/gfind";
 import { PinnedChatsCache } from "./api/lib/chats/PinnedChatsCache";
 import { ScheduledService } from "./lib/ScheduledService";
 import { getLogger } from "./lib/logging/Loggable";
@@ -81,14 +83,12 @@ import { IMessageCache } from "./databases/imessage/pollers";
 import { MessagePoller } from "./databases/imessage/pollers/MessagePoller";
 import { ChatUpdatePoller } from "./databases/imessage/pollers/ChatChangePoller";
 import {
-    loadChatStateSnapshot,
-    type ChatStateSnapshotResult
-} from "./databases/imessage/snapshot/ChatStateSnapshot";
-import { RecoverableMessagePoller } from "./databases/imessage/pollers/RecoverableMessagePoller";
-import {
-    loadRecoverableMessageSnapshot,
+    getChatStateSnapshot as fetchChatStateSnapshot,
+    getRecoverableMessageSnapshot as fetchRecoverableMessageSnapshot,
+    type ChatStateSnapshotResult,
     type RecoverableMessageSnapshotResult
-} from "./databases/imessage/snapshot/RecoverableMessageSnapshot";
+} from "./helpers/serverSnapshots";
+import { RecoverableMessagePoller } from "./databases/imessage/pollers/RecoverableMessagePoller";
 import { obfuscatedHandle } from "./utils/StringUtils";
 import { AutoStartMethods } from "./databases/server/constants";
 import { MacOsInterface } from "./api/interfaces/macosInterface";
@@ -583,6 +583,13 @@ class BlueBubblesServer extends EventEmitter {
         } catch (ex: any) {
             this.logger.error(`Failed to start FCM service! ${ex?.message ?? String(ex)}}`);
         }
+
+        if (this.repo.getConfig("enable_utag")) {
+            utagService.start();
+        }
+        if (this.repo.getConfig("enable_gfind")) {
+            gfindService.start();
+        }
     }
 
     async stopServices(): Promise<void> {
@@ -630,6 +637,18 @@ class BlueBubblesServer extends EventEmitter {
             this.scheduledMessages?.stop();
         } catch (ex: any) {
             this.logger.error(`Failed to stop Scheduled Messages service! ${ex?.message ?? ex}`);
+        }
+
+        try {
+            utagService.stop();
+        } catch (ex: any) {
+            this.logger.error(`Failed to stop uTag service! ${ex?.message ?? ex}`);
+        }
+
+        try {
+            gfindService.stop();
+        } catch (ex: any) {
+            this.logger.error(`Failed to stop Google Find service! ${ex?.message ?? ex}`);
         }
 
         this.logger.info("Finished stopping services...");
@@ -765,6 +784,14 @@ class BlueBubblesServer extends EventEmitter {
                     this.logger.info("Restarting FCM and Proxy Services...");
                     await this.fcm.start();
                     this.restartProxyServices();
+                    if (this.repo.getConfig("enable_utag")) {
+                        utagService.start();
+                        void utagService.refreshDevices().catch(() => undefined);
+                    }
+                    if (this.repo.getConfig("enable_gfind")) {
+                        gfindService.start();
+                        void gfindService.refreshDevices().catch(() => undefined);
+                    }
                 } else {
                     this.logger.info("Disconnected from network!");
                 }
@@ -1144,6 +1171,22 @@ class BlueBubblesServer extends EventEmitter {
             }
         }
 
+        if (prevConfig.enable_utag !== nextConfig.enable_utag) {
+            if (nextConfig.enable_utag) {
+                utagService.start();
+            } else {
+                utagService.stop();
+            }
+        }
+
+        if (prevConfig.enable_gfind !== nextConfig.enable_gfind) {
+            if (nextConfig.enable_gfind) {
+                gfindService.start();
+            } else {
+                gfindService.stop();
+            }
+        }
+
         // If the password changes, we need to make sure the clients connected to the socket are kicked.
         if (prevConfig.password !== nextConfig.password) {
             this.httpService.kickClients();
@@ -1152,60 +1195,14 @@ class BlueBubblesServer extends EventEmitter {
         this.emitToUI("config-update", nextConfig);
     }
 
-    /**
-     * Serves the complete Apple-side chat list with each chat's current read
-     * state, for a client to reconcile against.
-     *
-     * The live read events and the delete APIs cover changes that happen while a
-     * client is connected. Nothing covers a client that was offline, so the
-     * device silently keeps chats Apple no longer has and read states it never
-     * received. This is the recovery half of that: a full statement of what
-     * exists now, rather than a replay of what changed.
-     *
-     * `complete` is what licenses the client to delete. It is only true when the
-     * entire query succeeded, so a failure, timeout or unavailable database
-     * cannot be read as "Apple has no chats" and wipe the device.
-     */
+    // Full Apple-side chat read-state snapshot for offline client reconciliation.
     async getChatStateSnapshot(): Promise<ChatStateSnapshotResult> {
-        if (!this.iMessageRepo?.db) {
-            throw new Error("iMessage repository is not initialized");
-        }
-
-        const snapshot = await loadChatStateSnapshot(this.iMessageRepo.db);
-        const unread = snapshot.chats.filter(chat => !chat.read).length;
-        this.logger.info(
-            `Served chat state snapshot: ${snapshot.chats.length} chats ` +
-                `(${snapshot.chats.length - unread} read, ${unread} unread)`
-        );
-
-        return snapshot;
+        return fetchChatStateSnapshot(this.iMessageRepo?.db, this.logger);
     }
 
-    /**
-     * Serves every message Apple currently holds in Recently Deleted,
-     * grouped by chat, for a client to reconcile against.
-     *
-     * The live events cover deletions and restorations that happen while a
-     * client is connected. Nothing covers a client that was offline, so the
-     * device keeps showing messages Apple has since deleted. This is the
-     * recovery half: a statement of what is deleted now, not a replay.
-     *
-     * `complete` is what licenses the client to un-hide anything. It is only
-     * true when the whole query succeeded, so a failure cannot be read as
-     * "nothing is deleted" and restore messages the user deleted on Apple.
-     */
+    // Full Recently Deleted message snapshot per chat for offline client reconciliation.
     async getRecoverableMessageSnapshot(): Promise<RecoverableMessageSnapshotResult> {
-        if (!this.iMessageRepo?.db) {
-            throw new Error("iMessage repository is not initialized");
-        }
-
-        const snapshot = await loadRecoverableMessageSnapshot(this.iMessageRepo.db);
-        const total = snapshot.chats.reduce((sum, chat) => sum + chat.deletedMessageGuids.length, 0);
-        this.logger.info(
-            `Served recoverable message snapshot: ${total} deleted messages across ${snapshot.chats.length} chats`
-        );
-
-        return snapshot;
+        return fetchRecoverableMessageSnapshot(this.iMessageRepo?.db, this.logger);
     }
 
     /**

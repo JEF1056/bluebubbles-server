@@ -8,24 +8,7 @@ type ResponseClasses = ResponseParams | string | fs.ReadStream;
 type ResponseTypes = "json" | "html" | "file";
 
 function normalizeMalformedSurrogates(value: string): string {
-    let normalized = "";
-    for (let i = 0; i < value.length; i += 1) {
-        const code = value.charCodeAt(i);
-        if (code >= 0xd800 && code <= 0xdbff) {
-            const next = value.charCodeAt(i + 1);
-            if (next >= 0xdc00 && next <= 0xdfff) {
-                normalized += value[i] + value[i + 1];
-                i += 1;
-            } else {
-                normalized += "\ufffd";
-            }
-        } else if (code >= 0xdc00 && code <= 0xdfff) {
-            normalized += "\ufffd";
-        } else {
-            normalized += value[i];
-        }
-    }
-    return normalized;
+    return value.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "\ufffd");
 }
 
 export function attachmentContentDisposition(filename: string): string {
@@ -135,18 +118,18 @@ export class FileStream extends HTTPResponse {
             }
 
             const src = fs.createReadStream(path, { start, end });
-            ctx.response.set("Content-Type", mimeType as string);
             ctx.response.set("Content-Range", `bytes ${start}-${end}/${total}`);
             ctx.response.set("Content-Length", (end - start + 1).toString());
+            ctx.response.set("Content-Type", mimeType as string);
             ctx.response.set("Content-Disposition", attachmentContentDisposition(filename));
             super(ctx, 206 as ValidStatuses, src, "file");
             return;
         }
 
         const src = fs.createReadStream(path);
-        ctx.response.set("Content-Type", mimeType as string);
         // Set the content-length header so that clients can show download progress
         ctx.response.set("Content-Length", total.toString());
+        ctx.response.set("Content-Type", mimeType as string);
         ctx.response.set("Content-Disposition", attachmentContentDisposition(filename));
         super(ctx, 200, src, "file");
     }

@@ -21,6 +21,8 @@ import { StartDelayField } from 'app/components/fields/StartDelayField';
 import { LandingPageField } from 'app/components/fields/LandingPageField';
 import { OpenFindMyOnStartupField } from 'app/components/fields/OpenFindMyOnStartupField';
 import { AutoLockMacField } from 'app/components/fields/AutoLockMacField';
+import { UTagIntegrationField } from 'app/components/fields/UTagIntegrationField';
+import { GoogleFindIntegrationField } from 'app/components/fields/GoogleFindIntegrationField';
 
 
 export const FeatureSettings = (): JSX.Element => {
@@ -31,6 +33,10 @@ export const FeatureSettings = (): JSX.Element => {
                 <Divider orientation='horizontal' />
                 <Spacer />
                 <OpenFindMyOnStartupField />
+                <Spacer />
+                <UTagIntegrationField />
+                <Spacer />
+                <GoogleFindIntegrationField />
                 <Spacer />
                 <AutoCaffeinateField />
                 <Spacer />

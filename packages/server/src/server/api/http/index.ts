@@ -5,10 +5,23 @@ import { Server as SocketServer, ServerOptions } from "socket.io";
 import KoaApp from "koa";
 import koaJson from "koa-json";
 import KoaRouter from "koa-router";
-import koaCors from "koa-cors";
 import * as https from "https";
 import * as http from "http";
 import * as fs from "fs";
+
+const ALLOWED_WEB_ORIGINS = new Set([
+    "https://chat.jessfan.com",
+    ...(process.env.BB_CORS_ORIGINS ?? "")
+        .split(",")
+        .map(s => s.trim())
+        .filter(Boolean)
+]);
+
+const isAllowedCorsOrigin = (origin?: string): boolean => {
+    if (!origin) return false;
+    if (ALLOWED_WEB_ORIGINS.has(origin)) return true;
+    return /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+};
 
 // Internal libraries
 import { Server } from "@server";
@@ -51,8 +64,9 @@ export class HttpService extends Loggable {
         allowEIO3: true,
         transports: ["websocket", "polling"],
         cors: {
-            origin: "*",
-            methods: ["GET", "POST"]
+            origin: (origin, callback) => callback(null, !origin || isAllowedCorsOrigin(origin)),
+            methods: ["GET", "POST"],
+            credentials: true
         },
 
         // Reject a new session before engine.io accepts any of its payloads (up to maxHttpBufferSize
@@ -145,11 +159,36 @@ export class HttpService extends Loggable {
     configureKoa() {
         if (!this.koaApp) return;
 
-        // Allow cross origin requests
-        this.koaApp.use(koaCors());
+        // Strict credentialed CORS for authorized web client + localhost dev only
         this.koaApp.use(async (ctx, next) => {
-            ctx.set("Cross-Origin-Resource-Policy", "cross-origin");
+            const origin = ctx.get("Origin");
+            if (origin && isAllowedCorsOrigin(origin)) {
+                ctx.vary("Origin");
+                ctx.set("Access-Control-Allow-Origin", origin);
+                ctx.set("Access-Control-Allow-Credentials", "true");
+                ctx.set("Access-Control-Allow-Methods", "GET,HEAD,PUT,POST,PATCH,DELETE,OPTIONS");
+                const reqHeaders = ctx.get("Access-Control-Request-Headers");
+                if (reqHeaders) ctx.set("Access-Control-Allow-Headers", reqHeaders);
+                ctx.set("Access-Control-Max-Age", "86400");
+                if (ctx.method === "OPTIONS") {
+                    ctx.status = 204;
+                    return;
+                }
+            }
+            ctx.set("Cross-Origin-Resource-Policy", "same-site");
+            ctx.set("X-Content-Type-Options", "nosniff");
             ctx.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
+            // Cloudflare Access SSO cookie check + fixed-origin return bounce for chat.jessfan.com
+            if (ctx.method === "GET" && ctx.path === "/api/v1/access-check") {
+                ctx.set("Cache-Control", "no-store");
+                ctx.status = 204;
+                return;
+            }
+            if (ctx.method === "GET" && ctx.path === "/api/v1/access-bounce") {
+                ctx.set("Cache-Control", "no-store");
+                ctx.redirect("https://chat.jessfan.com/");
+                return;
+            }
             await next();
         });
 

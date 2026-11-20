@@ -17,9 +17,12 @@ const loadTypeScriptModule = (relativeSourcePath, moduleMocks = {}) => {
     const loadedModule = { exports: {} };
     const executeModule = new Function("require", "module", "exports", compiledCode);
     const moduleRequire = moduleName => {
-        return Object.prototype.hasOwnProperty.call(moduleMocks, moduleName)
-            ? moduleMocks[moduleName]
-            : require(moduleName);
+        if (Object.prototype.hasOwnProperty.call(moduleMocks, moduleName)) return moduleMocks[moduleName];
+        if (moduleName.startsWith(".")) {
+            const resolvedTs = path.resolve(path.dirname(sourcePath), `${moduleName}.ts`);
+            if (fs.existsSync(resolvedTs)) return loadTypeScriptModule(path.relative(__dirname, resolvedTs), moduleMocks);
+        }
+        return require(moduleName);
     };
     executeModule(moduleRequire, loadedModule, loadedModule.exports);
     return loadedModule.exports;
@@ -63,6 +66,8 @@ assert.equal(normalizedLocation.short_address, null);
 assert.equal(normalizedLocation.subtitle, null);
 assert.equal(normalizedLocation.title, "Alice");
 assert.equal(normalizedLocation.last_updated, 1234567);
+assert.equal(normalizedLocation.is_live, true);
+assert.equal(normalizedLocation.locating_in_progress, true);
 assert.equal(normalizedLocation.is_locating_in_progress, true);
 assert.equal(normalizedLocation.status, "live");
 assert.equal(normalizedLocation.location_type, 2);
@@ -70,7 +75,36 @@ assert.equal(normalizedLocation.horizontal_accuracy, 6.5);
 assert.equal(normalizedLocation.vertical_accuracy, 9);
 assert.equal(normalizedLocation.speed, 1.25);
 assert.equal(normalizedLocation.altitude, 32);
+assert.equal(normalizedLocation.city, "Seattle");
+assert.equal(normalizedLocation.state, "WA");
 assert.equal(Object.prototype.hasOwnProperty.call(normalizedLocation, "description"), false);
+
+const granularFriendLocation = normalizeFindMyFriendLocation({
+    handle: "carol@example.com",
+    coordinates: [37.7824, -122.2165],
+    long_address: "3501 Fruitvale Ave, Oakland, CA 94602, United States",
+    short_address: "Oakland, CA",
+    last_updated: 1700000000000,
+    status: "shallow",
+    location_type: 1,
+    is_locating_in_progress: false
+});
+assert.equal(granularFriendLocation.long_address, "3501 Fruitvale Ave, Oakland, CA 94602, United States");
+assert.equal(granularFriendLocation.street, "3501 Fruitvale Ave");
+assert.equal(granularFriendLocation.city, "Oakland");
+assert.equal(granularFriendLocation.state, "CA");
+assert.equal(granularFriendLocation.zip, "94602");
+assert.equal(granularFriendLocation.country, "United States");
+assert.equal(granularFriendLocation.is_live, false, "shallow must never set is_live=true");
+assert.equal(granularFriendLocation.locating_in_progress, false);
+
+const zeroTimestampLocation = normalizeFindMyFriendLocation({
+    handle: "zero@example.com",
+    coordinates: [37.78, -122.22],
+    last_updated: 0,
+    status: "legacy"
+});
+assert.equal(zeroTimestampLocation.last_updated, null, "timestamp 0 must normalize to null, never Date.now()");
 
 const missingLocation = normalizeFindMyFriendLocation({
     handle: "bob@example.com",
@@ -86,7 +120,9 @@ const missingLocation = normalizeFindMyFriendLocation({
 
 assert.equal(missingLocation.coordinates, null, "null or blank coordinates must not become (0, 0)");
 assert.equal(missingLocation.last_updated, null);
-assert.equal(missingLocation.status, "legacy");
+assert.equal(missingLocation.status, null);
+assert.equal(missingLocation.is_live, false);
+assert.equal(missingLocation.locating_in_progress, false);
 
 const invalidCoordinateLocation = normalizeFindMyFriendLocation({
     ...missingLocation,
@@ -122,8 +158,10 @@ const rawDeviceWithLocation = {
         countryCode: "US",
         administrativeArea: "WA",
         locality: "Seattle",
-        mapItemFullAddress: "Seattle, WA",
-        formattedAddressLines: ["Seattle, WA", ""]
+        streetAddress: "400 Broad St",
+        postalCode: "98109",
+        mapItemFullAddress: "400 Broad St, Seattle, WA 98109",
+        formattedAddressLines: ["400 Broad St", "Seattle, WA 98109"]
     },
     location: {
         latitude: "47.61",
@@ -150,7 +188,14 @@ assert.equal(normalizedDeviceWithLocation.deviceStatus, "online");
 assert.equal(normalizedDeviceWithLocation.location.latitude, 47.61);
 assert.equal(normalizedDeviceWithLocation.location.longitude, -122.33);
 assert.equal(normalizedDeviceWithLocation.location.timeStamp, 1234567);
-assert.deepEqual(normalizedDeviceWithLocation.address.formattedAddressLines, ["Seattle, WA"]);
+assert.equal(normalizedDeviceWithLocation.last_updated, 1234567);
+assert.equal(normalizedDeviceWithLocation.is_live, false);
+assert.equal(normalizedDeviceWithLocation.long_address, "400 Broad St, Seattle, WA 98109");
+assert.equal(normalizedDeviceWithLocation.street, "400 Broad St");
+assert.equal(normalizedDeviceWithLocation.city, "Seattle");
+assert.equal(normalizedDeviceWithLocation.state, "WA");
+assert.equal(normalizedDeviceWithLocation.zip, "98109");
+assert.deepEqual(normalizedDeviceWithLocation.address.formattedAddressLines, ["400 Broad St", "Seattle, WA 98109"]);
 assert.equal(
     normalizedDeviceWithLocation.crowdSourcedLocation,
     undefined,
@@ -1196,10 +1241,235 @@ const runLiveModeTests = async () => {
     assert.ok(httpRoutesSource.includes('"findmy/friends/live/stop"'), "httpRoutes must expose live/stop");
 };
 
+const runAsyncRefreshAndCloudProfileTests = async () => {
+    // P1-1: replaceAll must notify onUpdate listeners for updated/new entries
+    const replaceCache = new FindMyFriendsCache();
+    const notifiedHandles = [];
+    replaceCache.onUpdate(loc => notifiedHandles.push(loc.handle));
+    replaceCache.replaceAll([
+        normalizeFindMyFriendLocation({
+            handle: "alice@example.com",
+            coordinates: [37.77, -122.41],
+            last_updated: 1700000000000,
+            status: "shallow",
+            is_locating_in_progress: false
+        })
+    ]);
+    assert.deepEqual(notifiedHandles, ["alice@example.com"], "replaceAll must notify onUpdate listeners");
+
+    // P1-2: null and [0,0] coordinate guard preserves cached coordinates, coordinate timestamp, and granular address
+    const pinGuardCache = new FindMyFriendsCache();
+    const initialPin = normalizeFindMyFriendLocation({
+        handle: "alice@example.com",
+        coordinates: [37.7824, -122.2165],
+        long_address: "3501 Fruitvale Ave, Oakland, CA 94602, United States",
+        short_address: "Oakland, CA",
+        last_updated: 1700000000000,
+        status: "live",
+        is_locating_in_progress: false
+    });
+    pinGuardCache.update(initialPin);
+
+    for (const [idx, badCoords] of [null, [0, 0]].entries()) {
+        const updated = pinGuardCache.update({
+            ...initialPin,
+            coordinates: badCoords,
+            long_address: null,
+            short_address: null,
+            street: null,
+            city: null,
+            state: null,
+            zip: null,
+            country: null,
+            address: null,
+            last_updated: 1700000050000 + idx * 1000,
+            status: idx === 0 ? "shallow" : "legacy",
+            is_live: false,
+            locating_in_progress: idx === 0,
+            is_locating_in_progress: idx === 0
+        });
+        assert.equal(updated, true);
+        const preserved = pinGuardCache.get("alice@example.com");
+        assert.deepEqual(preserved.coordinates, [37.7824, -122.2165], "must preserve cached coordinates");
+        assert.equal(preserved.last_updated, 1700000000000, "must preserve coordinate last_updated");
+        assert.equal(preserved.long_address, "3501 Fruitvale Ave, Oakland, CA 94602, United States");
+        assert.equal(preserved.street, "3501 Fruitvale Ave");
+        assert.equal(preserved.city, "Oakland");
+        assert.equal(preserved.locating_in_progress, idx === 0);
+        assert.equal(preserved.status, idx === 0 ? "shallow" : "legacy");
+        assert.equal(preserved.is_live, false);
+    }
+
+    // P1-1: refreshFriends awaits onUpdate ONLY when targeted handle has locating_in_progress === true
+    const cache = new FindMyFriendsCache();
+    cache.updateAll([
+        normalizeFindMyFriendLocation({
+            handle: "alice@example.com",
+            coordinates: [37.77, -122.41],
+            long_address: "San Francisco, CA",
+            last_updated: 1700000000000,
+            status: "shallow",
+            is_locating_in_progress: true
+        })
+    ]);
+
+    let activeServer = {
+        repo: { getConfig: name => name === "enable_private_api" },
+        privateApi: {
+            hasClient: () => true,
+            findmy: {
+                refreshFriends: async () => {
+                    // Simulate macOS XPC accepting immediately while locating, then pushing fresh fix 40ms later
+                    setTimeout(() => {
+                        cache.updateAll([
+                            normalizeFindMyFriendLocation({
+                                handle: "alice@example.com",
+                                coordinates: [37.7824, -122.2165],
+                                long_address: "3501 Fruitvale Ave, Oakland, CA 94602",
+                                short_address: "Oakland, CA",
+                                last_updated: 1700000055000,
+                                status: "shallow",
+                                is_locating_in_progress: false
+                            })
+                        ]);
+                    }, 40);
+                    return { data: { locations: cache.getAll(), partial: false } };
+                }
+            }
+        },
+        findMyFriendsCache: cache,
+        findMyDevicesCache: { getAll: () => [] },
+        emitMessage: async () => {},
+        logger: { debug: () => {}, warn: () => {} }
+    };
+
+    const { FindMyInterface } = loadTypeScriptModule("../src/server/api/interfaces/findMyInterface.ts", {
+        "@server": { Server: () => activeServer },
+        "@server/fileSystem": { FileSystem: {} },
+        "@server/events": { NEW_FINDMY_DEVICE: "new-findmy-device" },
+        "@server/env": { isMinBigSur: true, isMinSequoia: true, isMinSonoma: true },
+        "@server/helpers/utils": { waitMs: async ms => new Promise(r => setTimeout(r, ms)) },
+        "../apple/scripts": {},
+        "@server/api/lib/findmy/utils": findMyUtilities,
+        "@server/api/lib/findmy/privateApiSupport": findMyPrivateApiSupport
+    });
+
+    const refreshed = await FindMyInterface.refreshFriends(false, { handle: "alice@example.com", force: true });
+    assert.equal(refreshed.length, 1);
+    assert.equal(refreshed[0].last_updated, 1700000055000);
+    assert.equal(refreshed[0].street, "3501 Fruitvale Ave");
+    assert.equal(refreshed[0].city, "Oakland");
+    assert.equal(refreshed[0].is_live, false);
+
+    // P1-1: untargeted and non-locating targeted calls must not stall post-helper
+    const untargetedStart = Date.now();
+    await FindMyInterface.refreshFriends(false);
+    assert.ok(Date.now() - untargetedStart < 200, "untargeted refreshFriends must not stall");
+
+    const cachedTargetStart = Date.now();
+    await FindMyInterface.refreshFriends(false, { handle: "alice@example.com" });
+    assert.ok(Date.now() - cachedTargetStart < 200, "non-locating targeted refreshFriends must not stall");
+
+    // P1-3 & B3: iCloudInterface non-self isolation, self fallback, memoization, and no duplicate contact card IPC
+    let accountInfoIpcCount = 0;
+    let contactCardIpcCalls = [];
+    let queryContactsCalls = [];
+    const mockCloudServer = {
+        repo: { getConfig: () => true },
+        privateApi: {
+            hasClient: () => true,
+            flavour: "Messages",
+            cloud: {
+                getAccountInfo: async () => {
+                    accountInfoIpcCount += 1;
+                    return {
+                        data: {
+                            account_name: "Jess Fan",
+                            apple_id: "jessefan2002@gmail.com",
+                            active_alias: "+16692535118",
+                            aliases: [{ Alias: "+16692535118", Status: 5000, IsUserVisible: true }],
+                            vetted_aliases: [{ Alias: "+16692535118", Status: 5000, IsUserVisible: true }]
+                        }
+                    };
+                },
+                getContactCard: async addr => {
+                    contactCardIpcCalls.push(addr);
+                    if (addr === "other@example.com") {
+                        return { data: { name: null, avatar_path: null } };
+                    }
+                    return { data: { name: null, avatar_path: null } };
+                },
+                modifyActiveAlias: async () => ({ data: {} })
+            }
+        }
+    };
+
+    const { iCloudInterface } = loadTypeScriptModule("../src/server/api/interfaces/iCloudInterface.ts", {
+        "@server": { Server: () => mockCloudServer },
+        "@server/env": { isMinBigSur: true, isMinHighSierra: true },
+        "@server/helpers/utils": {
+            checkPrivateApiStatus: () => {},
+            isNotEmpty: v => v != null && String(v).trim().length > 0
+        },
+        "./contactInterface": {
+            ContactInterface: {
+                queryContacts: async ids => {
+                    queryContactsCalls.push(ids);
+                    return [{ firstName: "Jess", lastName: "Fan", displayName: "Jess Fan", avatar: "AQID" }];
+                }
+            }
+        }
+    });
+
+    const acct = await iCloudInterface.getAccountInfo();
+    assert.equal(acct.account_name, "Jess Fan");
+    assert.equal(acct.first_name, "Jess");
+    assert.equal(acct.last_name, "Fan");
+    assert.equal(acct.apple_id, "jessefan2002@gmail.com");
+    assert.ok(Array.isArray(acct.active_aliases) && acct.active_aliases.includes("+16692535118"));
+    assert.equal(accountInfoIpcCount, 1);
+
+    // B3: second getAccountInfo() within TTL hits cache
+    await iCloudInterface.getAccountInfo();
+    assert.equal(accountInfoIpcCount, 1, "getAccountInfo() must be memoized within 5-min TTL");
+
+    // B3: getContactCard() for self reuses cached accountInfo and makes only 1 getContactCard IPC
+    contactCardIpcCalls = [];
+    const selfCard = await iCloudInterface.getContactCard();
+    assert.equal(selfCard.name, "Jess Fan");
+    assert.equal(selfCard.display_name, "Jess Fan");
+    assert.equal(selfCard.first_name, "Jess");
+    assert.equal(selfCard.last_name, "Fan");
+    assert.equal(selfCard.avatar, "AQID");
+    assert.equal(contactCardIpcCalls.length, 1, "self getContactCard must not duplicate getContactCard IPC");
+
+    // P1-3: non-self lookup returns ONLY Private API contact card (no AddressBook/NickNameCache fallback)
+    const abCallsBeforeNonSelf = queryContactsCalls.length;
+    const otherCard = await iCloudInterface.getContactCard("other@example.com");
+    assert.equal(otherCard.name, null);
+    assert.equal(otherCard.avatar, null);
+    assert.equal(
+        queryContactsCalls.length,
+        abCallsBeforeNonSelf,
+        "non-self getContactCard must not query AddressBook"
+    );
+
+    // P1-3: self alias lookup keeps full self fallback chain
+    const selfAliasCard = await iCloudInterface.getContactCard("+16692535118");
+    assert.equal(selfAliasCard.name, "Jess Fan");
+    assert.equal(selfAliasCard.avatar, "AQID");
+
+    // B3: invalidateAccountInfoCache / modifyActiveAlias clears memoized account info
+    await iCloudInterface.modifyActiveAlias("+16692535118");
+    await iCloudInterface.getAccountInfo();
+    assert.equal(accountInfoIpcCount, 2, "modifyActiveAlias must invalidate memoized getAccountInfo cache");
+};
+
 runFindMyDylibPluginTests()
     .then(runRefreshBranchTests)
     .then(runDeviceRefreshTests)
     .then(runLiveModeTests)
+    .then(runAsyncRefreshAndCloudProfileTests)
     .then(() => console.log("PASS: Find My integration tests"))
     .catch(error => {
         console.error(error);

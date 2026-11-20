@@ -43,8 +43,13 @@ export const hasKey = (object: NodeJS.Dict<any>, key: string): boolean => {
     return Object.keys(object).includes(key);
 };
 
-export const buildQrData = (password: string, address: string): string => {
-    return JSON.stringify([password, address ?? '']);
+export const buildQrData = (
+    password: string,
+    address: string,
+    customHeaders?: Record<string, string>
+): string => {
+    const hasHeaders = customHeaders && Object.keys(customHeaders).length > 0;
+    return JSON.stringify(hasHeaders ? [password, address ?? '', customHeaders] : [password, address ?? '']);
 };
 
 export const copyToClipboard = async (data: string) => {

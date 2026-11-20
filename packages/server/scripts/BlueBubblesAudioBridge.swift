@@ -93,7 +93,7 @@ func getProcessObjectIDs(matching bundleIDs: Set<String>) -> [AudioObjectID] {
     }
 }
 
-func findOutputDevice(named targetName: String) -> AudioDeviceID? {
+func findDevice(named targetName: String, scope: AudioObjectPropertyScope) -> AudioDeviceID? {
     var addr = AudioObjectPropertyAddress(
         mSelector: kAudioHardwarePropertyDevices,
         mScope: kAudioObjectPropertyScopeGlobal,
@@ -124,7 +124,7 @@ func findOutputDevice(named targetName: String) -> AudioDeviceID? {
         }
         var streamAddr = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyStreamConfiguration,
-            mScope: kAudioDevicePropertyScopeOutput,
+            mScope: scope,
             mElement: kAudioObjectPropertyElementMain
         )
         var sSize: UInt32 = 0
@@ -136,11 +136,38 @@ func findOutputDevice(named targetName: String) -> AudioDeviceID? {
         let abl = raw.assumingMemoryBound(to: AudioBufferList.self)
         if AudioObjectGetPropertyData(dev, &streamAddr, 0, nil, &sSize, abl) == noErr {
             let list = UnsafeMutableAudioBufferListPointer(abl)
-            let outChannels = list.reduce(0) { $0 + Int($1.mNumberChannels) }
-            if outChannels > 0 { return dev }
+            let channels = list.reduce(0) { $0 + Int($1.mNumberChannels) }
+            if channels > 0 { return dev }
         }
     }
     return nil
+}
+
+func getDefaultInputDevice() -> AudioDeviceID? {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var devID: AudioDeviceID = kAudioObjectUnknown
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &devID) == noErr,
+          devID != kAudioObjectUnknown else {
+        return nil
+    }
+    return devID
+}
+
+@discardableResult
+func setDefaultInputDevice(_ deviceID: AudioDeviceID) -> Bool {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var devID = deviceID
+    let size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    return AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, size, &devID) == noErr
 }
 
 func makeOpusFormat() -> AVAudioFormat {
@@ -171,6 +198,8 @@ final class AudioBridge {
     private var tapIOProcID: AudioDeviceIOProcID?
     private var outDeviceID: AudioDeviceID = kAudioObjectUnknown
     private var outIOProcID: AudioDeviceIOProcID?
+    private var savedDefaultInputDeviceID: AudioDeviceID = kAudioObjectUnknown
+    private let inputRestoreLock = NSLock()
 
     private let downlinkRing = FloatRingBuffer()
     private let uplinkRing = FloatRingBuffer()
@@ -192,6 +221,7 @@ final class AudioBridge {
 
     func stop() {
         running = false
+        restoreDefaultInputDevice()
         if let proc = tapIOProcID, aggregateDeviceID != kAudioObjectUnknown {
             AudioDeviceStop(aggregateDeviceID, proc)
             AudioDeviceDestroyIOProcID(aggregateDeviceID, proc)
@@ -205,6 +235,17 @@ final class AudioBridge {
         if let proc = outIOProcID, outDeviceID != kAudioObjectUnknown {
             AudioDeviceStop(outDeviceID, proc)
             AudioDeviceDestroyIOProcID(outDeviceID, proc)
+        }
+    }
+
+    private func restoreDefaultInputDevice() {
+        inputRestoreLock.lock()
+        let saved = savedDefaultInputDeviceID
+        savedDefaultInputDeviceID = kAudioObjectUnknown
+        inputRestoreLock.unlock()
+        if saved != kAudioObjectUnknown {
+            setDefaultInputDevice(saved)
+            fputs("[BlueBubblesAudioBridge] Restored default input device (\(saved))\n", stderr)
         }
     }
 
@@ -224,7 +265,7 @@ final class AudioBridge {
     private func createProcessTap(processObjectIDs: [AudioObjectID]) -> Bool {
         let tapDesc = CATapDescription(stereoMixdownOfProcesses: processObjectIDs)
         tapDesc.name = "BlueBubblesFaceTimeTap"
-        tapDesc.muteBehavior = .unmuted
+        tapDesc.muteBehavior = .mutedWhenTapped
 
         var newTapID: AudioObjectID = kAudioObjectUnknown
         let status = AudioHardwareCreateProcessTap(tapDesc, &newTapID)
@@ -292,9 +333,23 @@ final class AudioBridge {
     }
 
     private func setupUplinkBlackHole() {
-        guard let devID = findOutputDevice(named: "BlackHole 2ch") else {
+        guard let devID = findDevice(named: "BlackHole 2ch", scope: kAudioDevicePropertyScopeOutput) else {
             fputs("[BlueBubblesAudioBridge] Warning: BlackHole 2ch output device not found; uplink audio disabled\n", stderr)
             return
+        }
+        if let inDevID = findDevice(named: "BlackHole 2ch", scope: kAudioDevicePropertyScopeInput),
+           let currentInput = getDefaultInputDevice(),
+           currentInput != inDevID {
+            inputRestoreLock.lock()
+            savedDefaultInputDeviceID = currentInput
+            inputRestoreLock.unlock()
+            if setDefaultInputDevice(inDevID) {
+                fputs("[BlueBubblesAudioBridge] Switched default input device to BlackHole 2ch (\(inDevID)), saved \(currentInput)\n", stderr)
+            } else {
+                inputRestoreLock.lock()
+                savedDefaultInputDeviceID = kAudioObjectUnknown
+                inputRestoreLock.unlock()
+            }
         }
         self.outDeviceID = devID
         var procID: AudioDeviceIOProcID?
@@ -394,6 +449,8 @@ final class AudioBridge {
                 muteLock.lock()
                 isMuted = payload[0] != 0
                 muteLock.unlock()
+            } else if frameType == 0x03, let ch = Character(UnicodeScalar(payload[0])).uppercased().first {
+                pushDtmfTone(digit: ch)
             } else if frameType == 0x01, let decoder = self.decoder {
                 let compBuf = AVAudioCompressedBuffer(format: opusFormat, packetCapacity: 1, maximumPacketSize: Int(length))
                 compBuf.byteLength = UInt32(length)
@@ -423,17 +480,59 @@ final class AudioBridge {
             }
         }
     }
+
+    private func pushDtmfTone(digit: Character) {
+        let freqs: [Character: (Double, Double)] = [
+            "1": (697, 1209), "2": (697, 1336), "3": (697, 1477), "A": (697, 1633),
+            "4": (770, 1209), "5": (770, 1336), "6": (770, 1477), "B": (770, 1633),
+            "7": (852, 1209), "8": (852, 1336), "9": (852, 1477), "C": (852, 1633),
+            "*": (941, 1209), "0": (941, 1336), "#": (941, 1477), "D": (941, 1633),
+        ]
+        guard let (fLow, fHigh) = freqs[digit] else { return }
+        let totalSamples = Int(0.160 * sampleRate) // 160ms @ 48kHz
+        let rampSamples = Int(0.005 * sampleRate)  // 5ms fade-in/out
+        var samples = [Float](repeating: 0, count: totalSamples)
+        for i in 0..<totalSamples {
+            let t = Double(i) / sampleRate
+            var env = 1.0
+            if i < rampSamples {
+                env = Double(i) / Double(rampSamples)
+            } else if i >= totalSamples - rampSamples {
+                env = Double(totalSamples - 1 - i) / Double(rampSamples)
+            }
+            samples[i] = Float(0.25 * env * (sin(2.0 * .pi * fLow * t) + sin(2.0 * .pi * fHigh * t)))
+        }
+        samples.withUnsafeBufferPointer { bp in
+            if let base = bp.baseAddress {
+                uplinkRing.push(base, length: totalSamples)
+            }
+        }
+    }
 }
 
 if CommandLine.arguments.contains("--check") {
     let pids = getProcessObjectIDs(matching: targetBundleIDs)
-    let blackHole = findOutputDevice(named: "BlackHole 2ch") != nil
+    let blackHole = findDevice(named: "BlackHole 2ch", scope: kAudioDevicePropertyScopeOutput) != nil
     let out = "{\"ok\":true,\"processTapSupported\":true,\"blackHoleFound\":\(blackHole),\"targetProcessCount\":\(pids.count)}\n"
     FileHandle.standardOutput.write(Data(out.utf8))
     exit(0)
 }
 
 let bridge = AudioBridge()
-signal(SIGTERM) { _ in exit(0) }
-signal(SIGINT) { _ in exit(0) }
+let sigQueue = DispatchQueue(label: "com.bluebubbles.audiobridge.signals")
+signal(SIGTERM, SIG_IGN)
+signal(SIGINT, SIG_IGN)
+let termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: sigQueue)
+termSource.setEventHandler {
+    bridge.stop()
+    exit(0)
+}
+termSource.resume()
+let intSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: sigQueue)
+intSource.setEventHandler {
+    bridge.stop()
+    exit(0)
+}
+intSource.resume()
 bridge.start()
+bridge.stop()

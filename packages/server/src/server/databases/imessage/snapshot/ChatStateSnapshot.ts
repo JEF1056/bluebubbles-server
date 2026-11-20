@@ -46,21 +46,7 @@ export function compareDecimalStrings(a: string, b: string): number {
     return a < b ? -1 : 1;
 }
 
-/**
- * Lightweight state used by the live poller. Message work is restricted to
- * Apple's indexed unread candidates; this avoids aggregating the message table
- * while still detecting reads that do not move the chat-level pointer.
- *
- * A message only counts as unread when it is also newer than the chat's read
- * pointer. Messages can advance the pointer without flipping is_read on every
- * row (observed after reading on an iPhone), and iOS renders its badge from the
- * pointer, so a row that is older than the pointer is read as far as the user
- * is concerned. Without this, such a chat reports unread indefinitely.
- *
- * The exception is a row that is unread yet keeps a read date: that is "Mark
- * as Unread". Apple flips is_read back but leaves both date_read and the chat
- * pointer where they were, so the pointer test alone would hide it.
- */
+// Excludes rows older than chat.last_read_message_timestamp (iOS badge pointer), unless date_read > 0 ("Mark as Unread").
 const UNREAD_MESSAGE_PREDICATE = `
     m.is_read = 0
     AND m.is_from_me = 0

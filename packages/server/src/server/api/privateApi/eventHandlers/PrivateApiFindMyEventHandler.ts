@@ -2,6 +2,7 @@ import { Server } from "@server";
 import * as net from "net";
 import { PrivateApiEventHandler, EventData } from ".";
 import { FindMyFriendLocation } from "@server/api/lib/findmy/types";
+import { enrichFindMyDeviceIcon } from "@server/api/lib/findmy/findMyIcons";
 import { getChangedFindMyDevices, normalizeFindMyDevices, normalizeFindMyFriendLocations } from "@server/api/lib/findmy/utils";
 import { NEW_FINDMY_DEVICE, NEW_FINDMY_LOCATION } from "@server/events";
 import { isEmpty, titleCase, waitMs } from "@server/helpers/utils";
@@ -28,7 +29,7 @@ export class PrivateApiFindMyEventHandler extends Loggable implements PrivateApi
     async handleNewDevices(deviceUpdates: unknown) {
         if (isEmpty(deviceUpdates)) return;
         const rawDevices = Array.isArray(deviceUpdates) ? deviceUpdates : [deviceUpdates];
-        const normalizedDevices = normalizeFindMyDevices(rawDevices);
+        const normalizedDevices = normalizeFindMyDevices(rawDevices).map(enrichFindMyDeviceIcon);
         if (normalizedDevices.length === 0) return;
 
         const previousDevices = Server().findMyDevicesCache.getAll();
@@ -46,24 +47,25 @@ export class PrivateApiFindMyEventHandler extends Loggable implements PrivateApi
         let emittedLocationCount = 0;
         for (const location of updatedLocations) {
             const handle = obfuscatedHandle(location.handle);
+            const statusLabel = titleCase(location.status ?? "unknown");
             const coordinates = location.coordinates;
             if (coordinates == null) {
                 this.log.debug(
-                    `Received FindMy ${titleCase(location.status)} Update Without a Location for Handle: ${handle}`
+                    `Received FindMy ${statusLabel} Update Without a Location for Handle: ${handle}`
                 );
             } else if (coordinates[0] === 0 && coordinates[1] === 0) {
                 this.log.debug(
-                    `Received FindMy ${titleCase(location.status)} (0, 0) Location Update for Handle: ${handle}`
+                    `Received FindMy ${statusLabel} (0, 0) Location Update for Handle: ${handle}`
                 );
             } else {
-                this.log.debug(`Received FindMy ${titleCase(location.status)} Location Update for Handle: ${handle}`);
+                this.log.debug(`Received FindMy ${statusLabel} Location Update for Handle: ${handle}`);
             }
 
             await Server().emitMessage(NEW_FINDMY_LOCATION, location, "normal", false, true);
             emittedLocationCount += 1;
 
             if (emittedLocationCount < updatedLocations.length) {
-                await waitMs(250);
+                await waitMs(40);
             }
         }
     }

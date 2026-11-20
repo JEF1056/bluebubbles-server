@@ -11,17 +11,6 @@ export class MessagePoller extends IMessagePoller {
 
     unsentIds: number[] = [];
 
-    // Apple only allows edits within ~15 minutes and unsends within ~2 minutes of sending,
-    // so a much smaller lookback than a full week is enough to catch those on every tick.
-    static readonly FAST_LOOKBACK_MS = MESSAGE_FAST_LOOKBACK_MS;
-
-    // Periodically we still widen the lookback to a full week so we don't permanently miss
-    // things that can legitimately change well outside the fast window (e.g. a read receipt
-    // or notification flag on an older message).
-    static readonly RECONCILE_LOOKBACK_MS = MESSAGE_RECONCILE_LOOKBACK_MS;
-
-    static readonly RECONCILE_INTERVAL_MS = MESSAGE_RECONCILE_INTERVAL_MS;
-
     lastReconcileAt = 0;
 
     async poll(after: Date): Promise<IMessagePollResult[]> {
@@ -31,8 +20,8 @@ export class MessagePoller extends IMessagePoller {
         // the other dates don't. Because of this, searching is much faster. We can do the
         // filtering after the query.
         const now = Date.now();
-        const dueForReconcile = now - this.lastReconcileAt >= MessagePoller.RECONCILE_INTERVAL_MS;
-        const lookbackMs = dueForReconcile ? MessagePoller.RECONCILE_LOOKBACK_MS : MessagePoller.FAST_LOOKBACK_MS;
+        const dueForReconcile = now - this.lastReconcileAt >= MESSAGE_RECONCILE_INTERVAL_MS;
+        const lookbackMs = dueForReconcile ? MESSAGE_RECONCILE_LOOKBACK_MS : MESSAGE_FAST_LOOKBACK_MS;
         if (dueForReconcile) this.lastReconcileAt = now;
 
         const afterLookback = new Date(after.getTime() - lookbackMs);

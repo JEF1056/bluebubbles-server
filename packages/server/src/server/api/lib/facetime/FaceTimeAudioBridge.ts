@@ -213,6 +213,19 @@ export class FaceTimeAudioBridge extends Loggable {
         this.cleanupSession(payload.callUuid);
     }
 
+    sendDtmf(callUuid: string, digit: string): boolean {
+        const session = this.sessions.get(callUuid);
+        if (!session?.process?.stdin?.writable) return false;
+        const char = String(digit ?? "").trim().toUpperCase();
+        if (!/^[0-9*#ABCD]$/.test(char)) return false;
+        const pkt = Buffer.allocUnsafe(6);
+        pkt[0] = 0x03;
+        pkt.writeUInt32BE(1, 1);
+        pkt[5] = char.charCodeAt(0);
+        session.process.stdin.write(pkt);
+        return true;
+    }
+
     handleSocketDisconnect(socketId: string): void {
         for (const [callUuid, session] of this.sessions.entries()) {
             if (session.socketId === socketId) {

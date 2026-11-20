@@ -44,6 +44,7 @@ import { MacOsInterface } from "@server/api/interfaces/macosInterface";
 import { FaceTimeAudioBridge } from "@server/api/lib/facetime/FaceTimeAudioBridge";
 import { getLogger } from "@server/lib/logging/Loggable";
 import { ProxyServices } from "@server/databases/server/constants";
+import { registerForkSocketRoutes } from "./socketForkRoutes";
 
 const unknownError = "Unknown Error. Check server logs!";
 const log = getLogger("SocketRoutes");
@@ -1099,13 +1100,15 @@ export class SocketRoutes {
         socket.on("toggle-chat-read-status", (params, cb): void => {
             // Make sure we have all the required data
             if (!params?.chatGuid) return response(cb, "error", createBadRequestResponse("No chat GUID provided!"));
-            if (params?.status === null)
+            if (typeof params?.status !== "boolean")
                 return response(cb, "error", createBadRequestResponse("No chat status provided!"));
 
             // Send the notification out to all clients
             Server().emitMessage(CHAT_READ_STATUS_CHANGED, {
                 chatGuid: params.chatGuid,
-                status: params.status
+                read: params.status,
+                status: params.status,
+                ...(params.status ? { readAt: Date.now() } : {})
             });
 
             // Return null so Typescript doesn't yell at us
@@ -1217,37 +1220,7 @@ export class SocketRoutes {
             return response(cb, "save-vcf", createSuccessResponse(await GeneralInterface.checkForUpdate()));
         });
 
-        socket.on("ft-bridge-offer", async (params): Promise<void> => {
-            try {
-                await FaceTimeAudioBridge.getInstance().handleOffer(socket, params);
-            } catch (ex: any) {
-                log.debug(`ft-bridge-offer failed: ${ex?.message ?? ex}`);
-            }
-        });
-
-        socket.on("ft-bridge-answer", async (params): Promise<void> => {
-            try {
-                await FaceTimeAudioBridge.getInstance().handleAnswer(socket, params);
-            } catch (ex: any) {
-                log.debug(`ft-bridge-answer failed: ${ex?.message ?? ex}`);
-            }
-        });
-
-        socket.on("ft-bridge-ice", async (params): Promise<void> => {
-            try {
-                await FaceTimeAudioBridge.getInstance().handleIce(params);
-            } catch (ex: any) {
-                log.debug(`ft-bridge-ice failed: ${ex?.message ?? ex}`);
-            }
-        });
-
-        socket.on("ft-bridge-mute", (params): void => {
-            FaceTimeAudioBridge.getInstance().handleMute(params);
-        });
-
-        socket.on("ft-bridge-hangup", (params): void => {
-            FaceTimeAudioBridge.getInstance().handleHangup(params);
-        });
+        registerForkSocketRoutes(socket, log);
 
         socket.on("disconnect", reason => {
             FaceTimeAudioBridge.getInstance().handleSocketDisconnect(socket.id);

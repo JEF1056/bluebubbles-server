@@ -192,3 +192,74 @@ export const setZrokToken = async (token: string) => {
 export const disableZrok = async () => {
     return await ipcRenderer.invoke('disable-zrok');
 };
+
+export type UTagStatus = {
+    enabled: boolean;
+    signedIn: boolean;
+    email?: string | null;
+    tagCount: number;
+    lastSync?: number | null;
+    hasPin: boolean;
+    lastError?: string | null;
+};
+
+export type GoogleFindStatus = {
+    enabled: boolean;
+    signedIn: boolean;
+    email?: string | null;
+    e2eeUnlocked: boolean;
+    ownerKeyResetRequired?: boolean;
+    tagCount: number;
+    androidDeviceCount: number;
+    fcmConnected: boolean;
+    lastSync?: number | null;
+    lastError?: string | null;
+};
+
+export const getUtagStatus = async (): Promise<UTagStatus> => {
+    return await ipcRenderer.invoke('utag-get-status');
+};
+
+export const startUtagAuth = async (): Promise<{ ok: boolean; url?: string; error?: string }> => {
+    return await ipcRenderer.invoke('utag-start-auth');
+};
+
+export const completeUtagAuth = async (callbackUrl: string): Promise<UTagStatus> => {
+    return await ipcRenderer.invoke('utag-complete-auth', { callbackUrl });
+};
+
+export const setUtagPin = async (pin: string | null): Promise<UTagStatus> => {
+    return await ipcRenderer.invoke('utag-set-pin', { pin });
+};
+
+export const syncUtagNow = async (): Promise<UTagStatus> => {
+    return await ipcRenderer.invoke('utag-sync-now');
+};
+
+export const disconnectUtag = async (): Promise<UTagStatus> => {
+    return await ipcRenderer.invoke('utag-disconnect');
+};
+
+export const getGfindStatus = async (): Promise<GoogleFindStatus> => {
+    return await ipcRenderer.invoke('gfind-get-status');
+};
+
+export const startGfindAuth = async (): Promise<{ ok: boolean; error?: string }> => {
+    return await ipcRenderer.invoke('gfind-start-auth');
+};
+
+export const completeGfindOauthToken = async (oauthToken: string): Promise<GoogleFindStatus> => {
+    return await ipcRenderer.invoke('gfind-complete-oauth-token', { oauthToken });
+};
+
+export const openGfindVaultUnlock = async (): Promise<{ ok: boolean; error?: string }> => {
+    return await ipcRenderer.invoke('gfind-open-vault-unlock');
+};
+
+export const syncGfindNow = async (): Promise<GoogleFindStatus> => {
+    return await ipcRenderer.invoke('gfind-sync-now');
+};
+
+export const disconnectGfind = async (): Promise<GoogleFindStatus> => {
+    return await ipcRenderer.invoke('gfind-disconnect');
+};

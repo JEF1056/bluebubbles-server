@@ -522,38 +522,27 @@ export class MessageRepository extends Loggable {
         return guid.slice(-36).toLowerCase();
     }
 
-    private getAttributedBodyAttachmentGuids(message: Message): string[] {
-        const guids = new Set<string>();
-        for (const item of message.attributedBody ?? []) {
-            for (const run of item?.runs ?? []) {
-                const guid = run?.attributes?.__kIMFileTransferGUIDAttributeName;
-                if (typeof guid === "string" && guid.length > 0) guids.add(guid);
-            }
-        }
-
-        return Array.from(guids);
-    }
-
     private async addMissingAttachmentsFromAttributedBody(messages: Message[]): Promise<void> {
         const pending: Array<{ message: Message; normalizedGuid: string }> = [];
         const lookupGuids = new Set<string>();
 
         for (const message of messages) {
-            const guids = this.getAttributedBodyAttachmentGuids(message);
-            if (guids.length === 0) continue;
+            const guids = new Set<string>();
+            for (const item of message.attributedBody ?? []) {
+                for (const run of item?.runs ?? []) {
+                    const guid = run?.attributes?.__kIMFileTransferGUIDAttributeName;
+                    if (typeof guid === "string" && guid.length > 0) guids.add(guid);
+                }
+            }
+            if (guids.size === 0) continue;
 
             if (!message.attachments) message.attachments = [];
 
             for (const guid of guids) {
                 const normalizedGuid = this.normalizeAttachmentGuid(guid);
-                const existing = message.attachments.some(attachment => {
-                    return [attachment.guid, attachment.originalGuid].some(attachmentGuid => {
-                        return (
-                            typeof attachmentGuid === "string" &&
-                            this.normalizeAttachmentGuid(attachmentGuid) === normalizedGuid
-                        );
-                    });
-                });
+                const existing = message.attachments.some(a =>
+                    [a.guid, a.originalGuid].some(g => typeof g === "string" && this.normalizeAttachmentGuid(g) === normalizedGuid)
+                );
                 if (existing) continue;
 
                 pending.push({ message, normalizedGuid });
@@ -566,33 +555,27 @@ export class MessageRepository extends Loggable {
 
         const guidList = Array.from(lookupGuids);
         const query = this.db.getRepository(Attachment).createQueryBuilder("attachment");
-        if (isMinHighSierra) {
-            query.where("attachment.guid IN (:...guids) OR attachment.originalGuid IN (:...guids)", {
-                guids: guidList
-            });
-        } else {
-            query.where("attachment.guid IN (:...guids)", { guids: guidList });
-        }
+        query.where(
+            isMinHighSierra
+                ? "attachment.guid IN (:...guids) OR attachment.originalGuid IN (:...guids)"
+                : "attachment.guid IN (:...guids)",
+            { guids: guidList }
+        );
 
-        const fetched = await query.getMany();
         const attachmentMap = new Map<string, Attachment>();
-        for (const attachment of fetched) {
-            if (attachment.guid) {
-                const norm = this.normalizeAttachmentGuid(attachment.guid);
+        for (const attachment of await query.getMany()) {
+            for (const raw of [attachment.guid, attachment.originalGuid]) {
+                if (!raw) continue;
+                const norm = this.normalizeAttachmentGuid(raw);
                 if (!attachmentMap.has(norm)) attachmentMap.set(norm, attachment);
-            }
-            if (attachment.originalGuid) {
-                const normOrig = this.normalizeAttachmentGuid(attachment.originalGuid);
-                if (!attachmentMap.has(normOrig)) attachmentMap.set(normOrig, attachment);
             }
         }
 
         for (const { message, normalizedGuid } of pending) {
             const attachment = attachmentMap.get(normalizedGuid);
-            if (!attachment) continue;
-
-            const alreadyAdded = message.attachments.some(item => item.ROWID === attachment.ROWID);
-            if (!alreadyAdded) message.attachments.push(attachment);
+            if (attachment && !message.attachments.some(item => item.ROWID === attachment.ROWID)) {
+                message.attachments.push(attachment);
+            }
         }
     }
 
