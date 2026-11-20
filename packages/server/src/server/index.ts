@@ -1231,7 +1231,7 @@ class BlueBubblesServer extends EventEmitter {
                     await this.fcm?.sendNotification(
                         devices.map(device => device.identifier),
                         { type, data: notifData },
-                        type === CHAT_READ_STATUS_CHANGED ? "high" : priority
+                        type === CHAT_READ_STATUS_CHANGED && data?.read ? "high" : priority
                     );
                 }
             }

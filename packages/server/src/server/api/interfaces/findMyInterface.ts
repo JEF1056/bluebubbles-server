@@ -60,7 +60,7 @@ export class FindMyInterface {
         nextDevices: FindMyDevice[]
     ): Promise<void> {
         for (const device of getChangedFindMyDevices(previousDevices, nextDevices)) {
-            await Server().emitMessage?.(NEW_FINDMY_DEVICE, device, "normal", false, true);
+            await Server().emitMessage?.(NEW_FINDMY_DEVICE, enrichFindMyDeviceIcon(device), "normal", false, true);
         }
     }
 
@@ -170,10 +170,10 @@ export class FindMyInterface {
         };
 
         const tasks: Array<Promise<unknown>> = [refreshApple()];
-        if (enableUtag) {
+        if (enableUtag && !targetId) {
             tasks.push(utagService.refreshDevices(targetId, { force: options?.force }));
         }
-        if (enableGfind) {
+        if (enableGfind && !targetId) {
             tasks.push(gfindService.refreshDevices(targetId, { force: options?.force }));
         }
 

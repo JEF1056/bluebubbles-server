@@ -370,6 +370,30 @@ assert.equal(resolveFindMyDevicesPrivateApiTarget({ isMinSequoia: true }), FIND_
 
 let activeServer;
 let openedFindMyCommands = [];
+const findMyInterfaceExtraMocks = {
+    "@server/api/lib/utag": {
+        utagService: {
+            getCachedDevices: () => [],
+            refreshDevices: async () => [],
+            ringTag: async () => {},
+            getBleSpec: async () => null
+        }
+    },
+    "@server/api/lib/gfind": {
+        gfindService: {
+            getCachedDevices: () => [],
+            refreshDevices: async () => [],
+            ringDevice: async () => {},
+            getBleSpec: async () => null
+        }
+    },
+    "@server/api/lib/findmy/findMyIcons": {
+        enrichFindMyDeviceIcon: d => d,
+        findDeviceForIconLookup: () => null,
+        resolveFindMyDeviceIconBytes: async () => null
+    }
+};
+
 const loadFindMyInterface = environment => {
     return loadTypeScriptModule("../src/server/api/interfaces/findMyInterface.ts", {
         "@server": { Server: () => activeServer },
@@ -388,7 +412,8 @@ const loadFindMyInterface = environment => {
             hideFindMyFriends: () => ""
         },
         "@server/api/lib/findmy/utils": findMyUtilities,
-        "@server/api/lib/findmy/privateApiSupport": findMyPrivateApiSupport
+        "@server/api/lib/findmy/privateApiSupport": findMyPrivateApiSupport,
+        ...findMyInterfaceExtraMocks
     }).FindMyInterface;
 };
 
@@ -702,7 +727,7 @@ const runDeviceRefreshTests = async () => {
         }
     });
     devices = await FindMyInterface.refreshDevices();
-    assert.deepEqual(openedFindMyCommands, ["/usr/bin/open findmy://devices"]);
+    assert.deepEqual(openedFindMyCommands, ["/usr/bin/open -g findmy://devices"]);
     assert.equal(observations.helperCalls, 1);
     assert.equal(observations.replacements, 1);
     assert.equal(observations.updates, 0);
@@ -916,6 +941,7 @@ const runDeviceRefreshTests = async () => {
             net: {},
             ".": {},
             "@server/api/lib/findmy/utils": findMyUtilities,
+            "@server/api/lib/findmy/findMyIcons": findMyInterfaceExtraMocks["@server/api/lib/findmy/findMyIcons"],
             "@server/events": {
                 NEW_FINDMY_DEVICE: "new-findmy-device",
                 NEW_FINDMY_LOCATION: "new-findmy-location"
@@ -1116,7 +1142,8 @@ const runLiveModeTests = async () => {
         "@server/api/lib/findmy/privateApiSupport": {
             resolveFindMyFriendsPrivateApiTarget: () => "com.apple.findmy",
             resolveFindMyDevicesPrivateApiTarget: () => "com.apple.findmy"
-        }
+        },
+        ...findMyInterfaceExtraMocks
     });
 
     const startRes = await FindMyInterface.startLiveLocation("alice@example.com", { idleTimeoutMs: 25 });
@@ -1144,6 +1171,7 @@ const runLiveModeTests = async () => {
             net: {},
             ".": {},
             "@server/api/lib/findmy/utils": findMyUtilities,
+            "@server/api/lib/findmy/findMyIcons": findMyInterfaceExtraMocks["@server/api/lib/findmy/findMyIcons"],
             "@server/events": {
                 NEW_FINDMY_DEVICE: "new-findmy-device",
                 NEW_FINDMY_LOCATION: "new-findmy-location"
@@ -1351,7 +1379,8 @@ const runAsyncRefreshAndCloudProfileTests = async () => {
         "@server/helpers/utils": { waitMs: async ms => new Promise(r => setTimeout(r, ms)) },
         "../apple/scripts": {},
         "@server/api/lib/findmy/utils": findMyUtilities,
-        "@server/api/lib/findmy/privateApiSupport": findMyPrivateApiSupport
+        "@server/api/lib/findmy/privateApiSupport": findMyPrivateApiSupport,
+        ...findMyInterfaceExtraMocks
     });
 
     const refreshed = await FindMyInterface.refreshFriends(false, { handle: "alice@example.com", force: true });

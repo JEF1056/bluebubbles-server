@@ -45,6 +45,7 @@ export interface GoogleFindServiceDeps {
     reverseGeocodeFn?: (lat: number, lon: number) => Promise<TrackerGeocodedAddress | null>;
     emitDevice?: (device: FindMyDevice) => void;
     isEnabled?: () => boolean;
+    hasActiveClients?: () => boolean;
     pollIntervalMs?: number;
     locateTimeoutMs?: number;
     minLocateIntervalMs?: number;
@@ -70,6 +71,17 @@ function defaultIsEnabled(): boolean {
         const { Server } = require("@server");
         const val = Server()?.repo?.getConfig?.("enable_gfind");
         return val === undefined ? true : Boolean(val);
+    } catch {
+        return true;
+    }
+}
+
+function defaultHasActiveClients(): boolean {
+    try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const { Server } = require("@server");
+        const size = Server()?.httpService?.socketServer?.sockets?.sockets?.size;
+        return size == null || size > 0;
     } catch {
         return true;
     }
@@ -106,6 +118,7 @@ export class GoogleFindService {
     private lastLocateAt = new Map<string, number>();
     private pendingWaiters = new Set<PendingLocateWaiter>();
     private pollTimer: NodeJS.Timeout | null = null;
+    private locateSkipped = false;
     private lastSyncAt: number | null = null;
     private lastError: string | null = null;
     private unsubscribeFcm: (() => void) | null = null;
@@ -202,7 +215,19 @@ export class GoogleFindService {
     }
 
     async completeOAuthToken(oauthToken: string, emailHint?: string | null): Promise<GoogleFindStatus & { kdi: string }> {
-        await this.auth.exchangeOAuthToken(oauthToken, emailHint);
+        const prev = this.auth.getState();
+        const prevEmail = prev.email;
+        const prevAas = prev.aasToken;
+        const next = await this.auth.exchangeOAuthToken(oauthToken, emailHint);
+        const sameEmail = Boolean(prevEmail && next.email && prevEmail.toLowerCase() === next.email.toLowerCase());
+        if ((prevEmail || prevAas) && !sameEmail) {
+            this.stop();
+            this.recordsById.clear();
+            this.cachedDevices = [];
+            this.lastLocateAt.clear();
+            this.lastSyncAt = null;
+            this.locateSkipped = false;
+        }
         this.lastError = null;
         this.start();
         return {
@@ -240,6 +265,7 @@ export class GoogleFindService {
         this.lastLocateAt.clear();
         this.lastSyncAt = null;
         this.lastError = null;
+        this.locateSkipped = false;
     }
 
     getCachedDevices(): FindMyDevice[] {
@@ -294,7 +320,10 @@ export class GoogleFindService {
         const canonicId = normalizeGfindId(deviceId);
         const existing = this.getRecord(canonicId);
         const deviceType = existing?.novaDeviceType ?? NovaDeviceType.SPOT_DEVICE;
-        const fcmRegistrationId = this.auth.getState().fcmToken ?? undefined;
+        let fcmRegistrationId = this.auth.getState().fcmToken ?? undefined;
+        if (!fcmRegistrationId && this.isEnabled()) {
+            fcmRegistrationId = (await this.fcm.ensureReady(5_000).catch(() => null)) ?? undefined;
+        }
         await this.client.ringDevice({
             canonicId,
             action,
@@ -368,7 +397,7 @@ export class GoogleFindService {
                 for (const record of this.recordsById.values()) {
                     const key = record.canonicId.toLowerCase();
                     const nowMs = this.now();
-                    if (nowMs - (this.lastLocateAt.get(key) ?? 0) < minInterval) continue;
+                    if (!options?.force && nowMs - (this.lastLocateAt.get(key) ?? 0) < minInterval) continue;
                     this.lastLocateAt.set(key, nowMs);
                     const requestUuid = newUuid();
                     const handle = canWaitFcm ? this.createFcmWaiter(record.canonicId, requestUuid) : null;
@@ -405,6 +434,12 @@ export class GoogleFindService {
         }
     }
 
+    onClientConnected(): void {
+        if (!this.locateSkipped) return;
+        this.locateSkipped = false;
+        void this.pollAllDevices();
+    }
+
     private async pollAllDevices(): Promise<void> {
         if (!this.isEnabled() || !this.auth.isSignedIn()) return;
         try {
@@ -412,6 +447,13 @@ export class GoogleFindService {
             await this.applyMetadataList(metadataList, true);
             this.lastSyncAt = this.now();
             this.lastError = null;
+
+            // Active locates wake trackers; skip them on passive polls when no clients are connected.
+            if (!(this.deps.hasActiveClients ?? defaultHasActiveClients)()) {
+                this.locateSkipped = true;
+                return;
+            }
+            this.locateSkipped = false;
 
             const fcmToken = this.auth.getState().fcmToken ?? undefined;
             const minInterval = this.deps.minLocateIntervalMs ?? MIN_LOCATE_INTERVAL_MS;
@@ -482,6 +524,7 @@ export class GoogleFindService {
 
     private async applyMetadataList(metadataList: ProtoDeviceMetadata[], replaceAll: boolean): Promise<void> {
         const previousDevices = this.cachedDevices;
+        const startRecords = new Map(this.recordsById);
         const ownerKey = this.auth.getOwnerKey();
         const ownerKeyVersion = this.auth.getOwnerKeyVersion();
 
@@ -523,6 +566,13 @@ export class GoogleFindService {
 
         if (sawMismatch) {
             this.auth.setOwnerKeyMismatch(true);
+        }
+
+        // Preserve updates (e.g., FCM fixes) that landed while reverse geocoding awaited.
+        for (const [key, live] of this.recordsById) {
+            if (live !== startRecords.get(key) && nextMap.has(key)) {
+                nextMap.set(key, live);
+            }
         }
 
         this.recordsById = nextMap;

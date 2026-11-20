@@ -1939,7 +1939,18 @@ test("GoogleFindService.refreshDevices({ force: true }) bypasses minLocateInterv
         service.auth.getState = () => ({ fcmToken: "fcm-tok-1" });
         service.fcm.isConnected = () => false;
         service.fcm.ensureReady = async () => null;
-        service.client.listDevices = async () => [];
+        service.client.listDevices = async type => {
+            if (type === gfind.NovaDeviceType.SPOT_DEVICE) return [];
+            return [
+                {
+                    userDefinedDeviceName: "Pixel 10",
+                    identifierInformation: {
+                        type: gfind.IdentifierInformationType.IDENTIFIER_ANDROID,
+                        phoneInformation: { canonicIds: ["6a5d987b-0000-225b-89c6-14c14ef20e10"] }
+                    }
+                }
+            ];
+        };
         service.client.locateDevice = async params => {
             locateCalls.push(params);
             return params.requestUuid ?? "req-1";
@@ -1978,6 +1989,346 @@ test("GoogleFindService.refreshDevices({ force: true }) bypasses minLocateInterv
         assert.equal(ringCalls[0].action, "start");
         assert.equal(ringCalls[1].action, "stop");
         assert.equal(ringCalls[0].fcmRegistrationId, "fcm-tok-1");
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+test("GoogleFindService (G1) skips passive locate when 0 sockets connected and locates on client connect, while (G2) preserves concurrent FCM updates", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gfind-g1g2-"));
+    try {
+        let activeClients = false;
+        let fakeNow = 1_700_000_000_000;
+        const locateIds = [];
+        let releaseGeocode;
+        let geocodeHold = new Promise(resolve => {
+            releaseGeocode = resolve;
+        });
+        let blockGeocode = false;
+
+        const service = new gfind.GoogleFindService({
+            authDeps: { trackerDeps: makeMemoryTrackerDeps(tmpDir) },
+            now: () => fakeNow,
+            hasActiveClients: () => activeClients,
+            minLocateIntervalMs: 10_000,
+            locateTimeoutMs: 50,
+            isEnabled: () => true,
+            emitDevice: () => {},
+            reverseGeocodeFn: async (lat, lon) => {
+                if (blockGeocode) {
+                    await geocodeHold;
+                }
+                return { label: `${lat},${lon}` };
+            }
+        });
+        service.auth.isSignedIn = () => true;
+        service.auth.getState = () => ({ fcmToken: "fcm-tok-g1" });
+        service.fcm.isConnected = () => false;
+        service.fcm.ensureReady = async () => null;
+        service.client.listDevices = async type => {
+            if (type === gfind.NovaDeviceType.SPOT_DEVICE) return [];
+            return [
+                {
+                    userDefinedDeviceName: "Pixel G1",
+                    identifierInformation: {
+                        type: gfind.IdentifierInformationType.IDENTIFIER_ANDROID,
+                        phoneInformation: { canonicIds: ["android-g1"] }
+                    },
+                    information: {
+                        reports: [
+                            {
+                                timestampSeconds: 1730001000,
+                                geoLocation: {
+                                    accuracy: 15,
+                                    unencryptedLocation: { latitude: 37.1, longitude: -122.1 }
+                                }
+                            }
+                        ]
+                    }
+                }
+            ];
+        };
+        service.client.locateDevice = async params => {
+            locateIds.push(params.canonicId);
+            return params.requestUuid ?? "req-g1";
+        };
+
+        // G1: passive pollAllDevices skips locateDevice when 0 clients connected
+        await service["pollAllDevices"]();
+        assert.equal(locateIds.length, 0);
+        assert.equal(service["locateSkipped"], true);
+
+        // Explicit refreshDevices still locates even with 0 active clients
+        await service.refreshDevices();
+        assert.deepEqual(locateIds, ["android-g1"]);
+
+        // Another passive poll with 0 clients sets locateSkipped=true again; onClientConnected runs locate when cooldown allows
+        locateIds.length = 0;
+        await service["pollAllDevices"]();
+        assert.equal(locateIds.length, 0);
+        assert.equal(service["locateSkipped"], true);
+
+        activeClients = true;
+        fakeNow += 15_000;
+        service.onClientConnected();
+        await new Promise(r => setTimeout(r, 30));
+        assert.deepEqual(locateIds, ["android-g1"]);
+        assert.equal(service["locateSkipped"], false);
+
+        // G2: applyMetadataList preserves a newer FCM fix that arrives while reverseGeocodeFn awaits
+        blockGeocode = true;
+        const listPromise = service["applyMetadataList"](
+            [
+                {
+                    userDefinedDeviceName: "Pixel G1",
+                    identifierInformation: {
+                        type: gfind.IdentifierInformationType.IDENTIFIER_ANDROID,
+                        phoneInformation: { canonicIds: ["android-g1"] }
+                    },
+                    information: {
+                        reports: [
+                            {
+                                timestampSeconds: 1730001500,
+                                geoLocation: {
+                                    accuracy: 20,
+                                    unencryptedLocation: { latitude: 37.2, longitude: -122.2 }
+                                }
+                            }
+                        ]
+                    }
+                }
+            ],
+            true
+        );
+        await new Promise(r => setImmediate(r));
+
+        blockGeocode = false;
+        await service["handleFcmEvent"]({
+            persistentId: "p-g2",
+            deviceUpdate: {
+                deviceMetadata: {
+                    userDefinedDeviceName: "Pixel G1",
+                    identifierInformation: {
+                        type: gfind.IdentifierInformationType.IDENTIFIER_ANDROID,
+                        phoneInformation: { canonicIds: ["android-g1"] }
+                    },
+                    information: {
+                        reports: [
+                            {
+                                timestampSeconds: 1730002500,
+                                geoLocation: {
+                                    accuracy: 5,
+                                    unencryptedLocation: { latitude: 37.99, longitude: -122.99 }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        });
+        releaseGeocode();
+        await listPromise;
+
+        const dev = service.getCachedDevices().find(d => d.identifier === "android-g1");
+        assert.ok(dev?.location);
+        assert.ok(Math.abs(dev.location.latitude - 37.99) < 1e-5);
+        service.disconnect();
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+test("GoogleFind Auth/Client (S2-11) and FCM single-flight + stale socket guard (S2-10)", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gfind-s2-"));
+    try {
+        const trackerDeps = makeMemoryTrackerDeps(tmpDir);
+        const service = new gfind.GoogleFindService({
+            authDeps: {
+                trackerDeps,
+                httpPost: async () => Buffer.from("Email=second@example.com\nToken=aas_et/SECOND\n", "utf8")
+            },
+            trackerDeps,
+            isEnabled: () => true,
+            emitDevice: () => {}
+        });
+        const auth = service["auth"];
+        auth.load();
+        auth["state"] = {
+            ...auth["state"],
+            email: "first@example.com",
+            aasToken: "aas_et/FIRST",
+            androidId: "111",
+            securityToken: "222",
+            fcmToken: "fcm-old",
+            ownerKeyHex: "aa".repeat(32),
+            ownerKeyVersion: 7,
+            ownerKeyMismatch: true,
+            persistentIds: ["pid-1"]
+        };
+        service.recordsById.set("dev-1", {
+            deviceId: "gfind:dev-1",
+            canonicId: "dev-1",
+            novaDeviceType: gfind.NovaDeviceType.SPOT_DEVICE,
+            isSpotAccessory: true,
+            isEarbuds: false,
+            rotationExponent: 10,
+            curve: "secp160r1",
+            eik: null,
+            ringKey: null,
+            device: { id: "gfind:dev-1", name: "Old Tag" }
+        });
+        service["cachedDevices"] = [{ id: "gfind:dev-1", name: "Old Tag" }];
+
+        await service.completeOAuthToken("oauth2_4/test", "second@example.com");
+        assert.equal(auth.getState().email, "second@example.com");
+        assert.equal(auth.getState().ownerKeyHex, null);
+        assert.equal(auth.getState().ownerKeyVersion, null);
+        assert.equal(auth.getState().ownerKeyMismatch, false);
+        assert.equal(auth.getState().fcmToken, null);
+        assert.deepEqual(auth.getState().persistentIds, []);
+        assert.equal(service.recordsById.size, 0);
+        assert.deepEqual(service.getCachedDevices(), []);
+
+        // S2-11: gRPC error 16 / UNAUTHENTICATED triggers Spot auth retry
+        let spotTokenCalls = 0;
+        let eidCalls = 0;
+        const client = new gfind.GoogleFindClient(
+            {
+                getServiceToken: async svc => {
+                    if (svc === "spot") {
+                        spotTokenCalls += 1;
+                        return `spot-tok-${spotTokenCalls}`;
+                    }
+                    return "adm-tok";
+                }
+            },
+            {
+                spotGrpcCall: async () => {
+                    eidCalls += 1;
+                    if (eidCalls === 1) throw new Error("Spot gRPC error 16: UNAUTHENTICATED");
+                    return Buffer.from([0, 0, 0, 0, 0]);
+                }
+            }
+        );
+        await client.getEidInfoForE2eeDevices();
+        assert.equal(spotTokenCalls, 2);
+        assert.equal(eidCalls, 2);
+
+        // S2-10: concurrent ensureReady() calls dedupe registration + connection, and stale socket events are ignored
+        let regCalls = 0;
+        const sockets = [];
+        const fcm = new gfind.GoogleFindFcmClient(auth, {
+            httpPost: async url => {
+                if (url.includes("/c2dm/register3")) {
+                    regCalls += 1;
+                    await new Promise(r => setTimeout(r, 15));
+                    return "token=gcm_s2";
+                }
+                if (url.includes("firebaseinstallations")) return JSON.stringify({ authToken: { token: "fis_s2" } });
+                return JSON.stringify({ token: "fcm_s2" });
+            },
+            connectTls: () => {
+                const sock = new Duplex({ read() {}, write(_c, _e, cb) { cb(); } });
+                sock.destroy = () => {
+                    sock.destroyed = true;
+                    return sock;
+                };
+                sockets.push(sock);
+                setTimeout(() => sock.emit("secureConnect"), 15);
+                return sock;
+            }
+        });
+        const [tok1, tok2] = await Promise.all([fcm.ensureReady(100), fcm.ensureReady(100)]);
+        assert.equal(tok1, "fcm_s2");
+        assert.equal(tok2, "fcm_s2");
+        assert.equal(regCalls, 1);
+        assert.equal(sockets.length, 1);
+
+        // Simulate a stale socket whose close fires after a newer socket is installed
+        const firstSock = sockets[0];
+        const newerSock = new Duplex({ read() {}, write(_c, _e, cb) { cb(); } });
+        newerSock.destroy = () => { newerSock.destroyed = true; return newerSock; };
+        fcm["socket"] = newerSock;
+        firstSock.emit("close");
+        assert.equal(fcm["socket"], newerSock);
+        assert.equal(fcm["reconnectTimer"], null);
+        fcm.stop();
+        service.disconnect();
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+test("GoogleFindService.refreshDevices({ force: true }) bypasses minLocateIntervalMs on untargeted refresh and ringDevice ensures FCM", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gfind-force-refresh-"));
+    try {
+        let fakeNow = 1_700_000_000_000;
+        const locateCalls = [];
+        const ringCalls = [];
+        let ensureReadyCalls = 0;
+        const service = new gfind.GoogleFindService({
+            authDeps: { trackerDeps: makeMemoryTrackerDeps(tmpDir) },
+            now: () => fakeNow,
+            minLocateIntervalMs: 60_000,
+            locateTimeoutMs: 50,
+            isEnabled: () => true,
+            emitDevice: () => undefined
+        });
+        service.auth.isSignedIn = () => true;
+        service.auth.getState = () => ({ fcmToken: null });
+        service.fcm.isConnected = () => false;
+        service.fcm.ensureReady = async () => {
+            ensureReadyCalls += 1;
+            return "fcm-ready-tok";
+        };
+        service.client.listDevices = async type => {
+            if (type === gfind.NovaDeviceType.SPOT_DEVICE) return [];
+            return [
+                {
+                    userDefinedDeviceName: "Pixel 10",
+                    identifierInformation: {
+                        type: gfind.IdentifierInformationType.IDENTIFIER_ANDROID,
+                        phoneInformation: { canonicIds: ["6a5d987b-0000-225b-89c6-14c14ef20e10"] }
+                    }
+                }
+            ];
+        };
+        service.client.locateDevice = async req => {
+            locateCalls.push(req);
+            return req.requestUuid ?? "req-1";
+        };
+        service.client.ringDevice = async req => {
+            ringCalls.push(req);
+            return "ring-req-1";
+        };
+        service.recordsById.set("6a5d987b-0000-225b-89c6-14c14ef20e10", {
+            deviceId: "gfind:6a5d987b-0000-225b-89c6-14c14ef20e10",
+            canonicId: "6a5d987b-0000-225b-89c6-14c14ef20e10",
+            novaDeviceType: gfind.NovaDeviceType.ANDROID_DEVICE,
+            isSpotAccessory: false,
+            isEarbuds: false,
+            rotationExponent: 10,
+            curve: "secp160r1",
+            eik: null,
+            ringKey: null,
+            device: { id: "gfind:6a5d987b-0000-225b-89c6-14c14ef20e10", name: "Pixel 10" }
+        });
+
+        await service.refreshDevices();
+        assert.equal(locateCalls.length, 1);
+
+        fakeNow += 2_000;
+        await service.refreshDevices();
+        assert.equal(locateCalls.length, 1, "Cooldown skips untargeted locate without force");
+
+        await service.refreshDevices(undefined, { force: true });
+        assert.equal(locateCalls.length, 2, "Untargeted force refresh bypasses minLocateIntervalMs");
+
+        ensureReadyCalls = 0;
+        await service.ringDevice("gfind:6a5d987b-0000-225b-89c6-14c14ef20e10", "start", "all");
+        assert.equal(ensureReadyCalls, 1);
+        assert.equal(ringCalls[0].fcmRegistrationId, "fcm-ready-tok");
+        service.disconnect();
     } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
     }

@@ -665,7 +665,11 @@ export class FaceTimeSession extends Loggable {
                         this.status !== FaceTimeSessionStatus.ANSWERED &&
                         (this.status as FaceTimeSessionStatus) !== FaceTimeSessionStatus.DISCONNECTED
                     ) {
-                        await this.leaveCall();
+                        try {
+                            await this.leaveCall();
+                        } catch (err) {
+                            this.log.debug(`admitSelf timeout leaveCall error: ${err}`);
+                        }
                         this.invalidate("admission_timeout");
                         FaceTimeSessionManager().broadcastUpdate(this, true);
                         reject("Failed to admit self into FaceTime call!. No join requests detected in 2 minutes.");
@@ -714,28 +718,72 @@ export class FaceTimeSession extends Loggable {
     async answerWithServer(): Promise<void> {
         this.log.info(`Answering Call: ${this.callUuid}`);
 
-        // Initialize the listener
-        const waiter = this.waitForAnswer();
+        // Initialize the listener before answering so fast events aren't missed
+        const abortController = new AbortController();
+        const waiter = this.waitForAnswer(abortController.signal);
+        // Prevent an unobserved rejection if answerCall() throws before waiter is awaited
+        waiter.catch(() => {});
 
         // Answer the call
-        await Server().privateApi.facetime.answerCall(this.callUuid);
+        try {
+            await Server().privateApi.facetime.answerCall(this.callUuid);
+        } catch (err) {
+            abortController.abort(err);
+            throw err;
+        }
 
         // Wait for the listener to receive the answered event
         await waiter;
     }
 
-    private async waitForAnswer(): Promise<void> {
-        await new Promise<void>((resolve, reject) => {
-            const onAnswered = () => {
-                clearTimeout(timer);
-                resolve();
-            };
-            const timer = setTimeout(() => {
-                this.removeListener("answered", onAnswered);
-                reject(new Error("Timed out waiting for FaceTime call to connect!"));
-            }, 1000 * 30);
-            this.once("answered", onAnswered);
-        });
+    private async waitForAnswer(signal?: AbortSignal): Promise<void> {
+        if (this.status === FaceTimeSessionStatus.DISCONNECTED) {
+            throw new Error("FaceTime call disconnected before answering!");
+        }
+
+        if (this.status !== FaceTimeSessionStatus.ANSWERED) {
+            await new Promise<void>((resolve, reject) => {
+                let settled = false;
+                const cleanup = () => {
+                    clearTimeout(timer);
+                    this.removeListener("answered", onAnswered);
+                    this.removeListener("disconnected", onDisconnected);
+                    signal?.removeEventListener("abort", onAbort);
+                };
+                const onAnswered = () => {
+                    if (settled) return;
+                    settled = true;
+                    cleanup();
+                    resolve();
+                };
+                const onDisconnected = () => {
+                    if (settled) return;
+                    settled = true;
+                    cleanup();
+                    reject(new Error("FaceTime call disconnected while waiting for answer!"));
+                };
+                const onAbort = () => {
+                    if (settled) return;
+                    settled = true;
+                    cleanup();
+                    reject(signal?.reason instanceof Error ? signal.reason : new Error("FaceTime answer cancelled!"));
+                };
+                const timer = setTimeout(() => {
+                    if (settled) return;
+                    settled = true;
+                    cleanup();
+                    reject(new Error("Timed out waiting for FaceTime call to connect!"));
+                }, 1000 * 30);
+
+                if (signal?.aborted) {
+                    onAbort();
+                    return;
+                }
+                signal?.addEventListener("abort", onAbort, { once: true });
+                this.once("answered", onAnswered);
+                this.once("disconnected", onDisconnected);
+            });
+        }
 
         // Wait 4 seconds to prevent crashing on Sonoma (and potentially other environments).
         // 1 second is too short. 3 seconds will work 75% of the time. 4 seconds for good measure.

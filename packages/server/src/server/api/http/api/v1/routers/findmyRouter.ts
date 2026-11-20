@@ -185,6 +185,12 @@ export class FindMyRouter {
                 data: { deviceId, action, component: component ?? null }
             }).send();
         } catch (ex: any) {
+            if (ex instanceof BadRequest) throw ex;
+            if (typeof ex?.status === "number" && ex.status >= 400 && ex.status < 500) {
+                throw new BadRequest({
+                    error: ex?.message ?? ex.toString()
+                });
+            }
             throw new ServerError({
                 message: "Failed to ring tracker device!",
                 error: ex?.message ?? ex.toString()

@@ -9,7 +9,7 @@ import {
     reverseGeocode,
     writeEncryptedJson
 } from "@server/api/lib/findmy/trackerCommon";
-import { FmeKeyPair, UTagClient, UTagTokens } from "./utagClient";
+import { FmeKeyPair, UTagClient, UTagHttpError, UTagTokens } from "./utagClient";
 import {
     SamsungEntryPoint,
     buildSamsungSignInUrl,
@@ -29,6 +29,7 @@ import {
 const UTAG_STORE_FILE = "utag-auth.enc.json";
 const DEFAULT_POLL_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_COOLDOWN_MS = 10 * 1000;
+const DEFAULT_SEARCH_STOP_MS = 60 * 1000;
 
 interface UTagPersistedState {
     deviceId: string;
@@ -56,6 +57,7 @@ export interface UTagServiceDeps {
     emitDevice?: (device: FindMyDevice) => Promise<void> | void;
     pollIntervalMs?: number;
     cooldownMs?: number;
+    searchStopDelayMs?: number;
 }
 
 const defaultEmitDevice = async (device: FindMyDevice): Promise<void> => {
@@ -77,6 +79,8 @@ export class UTagService {
     private pollTimer: NodeJS.Timeout | null = null;
     private refreshInFlight: Promise<FindMyDevice[]> | null = null;
     private lastRefreshByDevice = new Map<string, number>();
+    private searchStopTimers = new Map<string, { timer: NodeJS.Timeout; stop: () => void }>();
+    private needsPinTagIds = new Set<string>();
     private lastSyncAt: number | null = null;
     private lastError: string | null = null;
     private needsPin = false;
@@ -91,12 +95,14 @@ export class UTagService {
     private readonly emitDevice: (device: FindMyDevice) => Promise<void> | void;
     private readonly pollIntervalMs: number;
     private readonly cooldownMs: number;
+    private readonly searchStopDelayMs: number;
 
     constructor(deps?: UTagServiceDeps) {
         this.storageDeps = deps?.storageDeps;
         this.emitDevice = deps?.emitDevice ?? defaultEmitDevice;
         this.pollIntervalMs = deps?.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
         this.cooldownMs = deps?.cooldownMs ?? DEFAULT_COOLDOWN_MS;
+        this.searchStopDelayMs = deps?.searchStopDelayMs ?? DEFAULT_SEARCH_STOP_MS;
         this.client =
             deps?.client ??
             new UTagClient(null, {
@@ -239,6 +245,7 @@ export class UTagService {
                 iv: current.keyPair.iv
             });
             this.needsPin = false;
+            this.needsPinTagIds.clear();
         }
         this.savePersisted({ ...current, pin: trimmed });
         return this.getStatus();
@@ -252,6 +259,7 @@ export class UTagService {
         this.lastSyncAt = null;
         this.lastError = null;
         this.needsPin = false;
+        this.needsPinTagIds.clear();
         this.persisted = null;
         this.client.setTokens(null);
         deleteEncryptedJson(UTAG_STORE_FILE, this.storageDeps);
@@ -276,6 +284,22 @@ export class UTagService {
             clearInterval(this.pollTimer);
             this.pollTimer = null;
         }
+        for (const { timer, stop } of [...this.searchStopTimers.values()]) {
+            clearTimeout(timer);
+            stop();
+        }
+    }
+
+    private armSearchStop(installedAppId: string, deviceId: string): void {
+        const existing = this.searchStopTimers.get(deviceId);
+        if (existing) clearTimeout(existing.timer);
+        const stop = () => {
+            this.searchStopTimers.delete(deviceId);
+            void this.client.setSearchingStatus(installedAppId, deviceId, false).catch(() => undefined);
+        };
+        const timer = setTimeout(stop, this.searchStopDelayMs);
+        timer.unref?.();
+        this.searchStopTimers.set(deviceId, { timer, stop });
     }
 
     getCachedDevices(): FindMyDevice[] {
@@ -291,7 +315,11 @@ export class UTagService {
             }
         }
 
-        if (this.refreshInFlight) return this.refreshInFlight;
+        if (this.refreshInFlight) {
+            if (!rawTarget) return this.refreshInFlight;
+            await this.refreshInFlight.catch(() => undefined);
+            return this.refreshDevices(targetDeviceId, options);
+        }
 
         this.refreshInFlight = (async (): Promise<FindMyDevice[]> => {
             const state = this.ensureLoaded();
@@ -302,7 +330,6 @@ export class UTagService {
                 const installedAppId = await this.client.getFmeInstalledAppId();
                 const privateKey = this.getPrivateKey();
                 const prevDevices = this.cachedDevices;
-                let anyNeedsPin = false;
                 let lastGeoError: string | null = null;
                 const nextDevices: FindMyDevice[] = [];
                 const nextTagsById = new Map<string, SmartThingsTagDevice>();
@@ -320,6 +347,7 @@ export class UTagService {
                     if (rawTarget === tag.deviceId) {
                         await this.client.setSearchingStatus(installedAppId, tag.deviceId, true).catch(() => undefined);
                         this.lastRefreshByDevice.set(tag.deviceId, Date.now());
+                        this.armSearchStop(installedAppId, tag.deviceId);
                     }
 
                     let geoRes = null;
@@ -342,7 +370,8 @@ export class UTagService {
                     }
                     const effectiveKey = this.getPrivateKey(geoRes?.keyPair) ?? privateKey;
                     const { coords, needsPin } = resolveGeoCoordinates(geoRes?.geo ?? null, effectiveKey);
-                    if (needsPin) anyNeedsPin = true;
+                    if (needsPin) this.needsPinTagIds.add(tag.deviceId);
+                    else this.needsPinTagIds.delete(tag.deviceId);
 
                     const geocoded = coords
                         ? await reverseGeocode(coords.latitude, coords.longitude, this.storageDeps)
@@ -370,9 +399,13 @@ export class UTagService {
                     nextDevices.push(mapped);
                 }
 
+                for (const id of this.needsPinTagIds) {
+                    if (!nextTagsById.has(id)) this.needsPinTagIds.delete(id);
+                }
+
                 this.cachedTagsById = nextTagsById;
                 this.cachedDevices = nextDevices;
-                this.needsPin = anyNeedsPin;
+                this.needsPin = this.needsPinTagIds.size > 0;
                 this.lastSyncAt = Date.now();
                 this.lastError = lastGeoError;
 
@@ -394,7 +427,20 @@ export class UTagService {
     }
 
     async ringDevice(deviceId: string, action: "start" | "stop"): Promise<void> {
+        this.ensureLoaded();
         const rawId = deviceId.startsWith("utag:") ? deviceId.slice(5) : deviceId;
+        let tag = this.cachedTagsById.get(rawId);
+        if (!tag && this.client.getTokens()) {
+            const tags = await this.client.getSmartTagDevices().catch(() => [] as SmartThingsTagDevice[]);
+            for (const t of tags) this.cachedTagsById.set(t.deviceId, t);
+            tag = this.cachedTagsById.get(rawId);
+        }
+        if (tag && (tag.bleD2D as any)?.metadata?.remoteRing?.enabled !== true) {
+            throw new UTagHttpError(
+                "SmartTag remote ring is disabled for this tag; ring it over Bluetooth via SmartThings / uTag on Android.",
+                400
+            );
+        }
         const installedAppId = await this.client.getFmeInstalledAppId();
         await this.client.ringTag(installedAppId, rawId, action);
     }

@@ -329,6 +329,8 @@ export class GoogleFindFcmClient {
     private heartbeatTimer: NodeJS.Timeout | null = null;
     private heartbeatWatchdog: NodeJS.Timeout | null = null;
     private lastStreamIdReceived = 0;
+    private registerInFlight: Promise<string> | null = null;
+    private connectInFlight: Promise<void> | null = null;
     private listeners = new Set<(event: FcmNotificationEvent) => void>();
 
     constructor(auth: GoogleFindAuthManager, deps: GoogleFindFcmDeps = {}) {
@@ -391,88 +393,97 @@ export class GoogleFindFcmClient {
     async ensureRegistered(): Promise<string> {
         const state = this.auth.getState();
         if (state.fcmToken) return state.fcmToken;
+        if (this.registerInFlight) return this.registerInFlight;
 
-        const checkin = await this.auth.ensureCheckin();
-        const keys = this.auth.getOrCreateFcmKeys();
+        this.registerInFlight = (async () => {
+            const latest = this.auth.getState();
+            if (latest.fcmToken) return latest.fcmToken;
 
-        // 1. GCM register for WebPush subtype
-        const gcmForm = new URLSearchParams({
-            app: "org.chromium.linux",
-            "X-subtype": `wp:${ADM_PACKAGE}#${randomUuidV4()}`,
-            device: checkin.androidId.toString(),
-            sender: GCM_SERVER_KEY_B64
-        });
-        const gcmText = await this.postText(C2DM_REGISTER_URL, gcmForm.toString(), {
-            Authorization: `AidLogin ${checkin.androidId.toString()}:${checkin.securityToken.toString()}`,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "Android-GCM/1.5 (generic_x86 QP1A.190711.020)"
-        });
-        const gcmMatch = gcmText.match(/token=([^\s]+)/);
-        if (!gcmMatch || !gcmMatch[1]?.trim() || /Error=/i.test(gcmText)) {
-            throw new Error(`GCM registration failed: ${sanitizeFcmBody(gcmText)}`);
-        }
-        const gcmToken = gcmMatch[1].trim();
+            const checkin = await this.auth.ensureCheckin();
+            const keys = this.auth.getOrCreateFcmKeys();
 
-        // 2. Firebase Installations API
-        const installHeaders = {
-            "Content-Type": "application/json",
-            "x-firebase-client": Buffer.from(JSON.stringify({ heartbeats: [], version: 2 })).toString("base64"),
-            "x-goog-api-key": FCM_API_KEY,
-            "X-Android-Package": ADM_PACKAGE,
-            "X-Android-Cert": ADM_CERT_SHA1
-        };
-        const installText = await this.postText(
-            FIS_INSTALL_URL,
-            JSON.stringify({
-                appId: FCM_APP_ID,
-                authVersion: "FIS_v2",
-                fid: generateFirebaseFid(),
-                sdkVersion: "w:0.6.6"
-            }),
-            installHeaders
-        );
-        let fisAuthToken = "";
-        try {
-            const installJson = JSON.parse(installText) as { authToken?: { token?: string } };
-            fisAuthToken = String(installJson?.authToken?.token ?? "").trim();
-        } catch {
-            throw new Error(`Firebase installation returned invalid JSON: ${sanitizeFcmBody(installText)}`);
-        }
-        if (!fisAuthToken) {
-            throw new Error(`Firebase installation missing authToken: ${sanitizeFcmBody(installText)}`);
-        }
+            // 1. GCM register for WebPush subtype
+            const gcmForm = new URLSearchParams({
+                app: "org.chromium.linux",
+                "X-subtype": `wp:${ADM_PACKAGE}#${randomUuidV4()}`,
+                device: checkin.androidId.toString(),
+                sender: GCM_SERVER_KEY_B64
+            });
+            const gcmText = await this.postText(C2DM_REGISTER_URL, gcmForm.toString(), {
+                Authorization: `AidLogin ${checkin.androidId.toString()}:${checkin.securityToken.toString()}`,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "Android-GCM/1.5 (generic_x86 QP1A.190711.020)"
+            });
+            const gcmMatch = gcmText.match(/token=([^\s]+)/);
+            if (!gcmMatch || !gcmMatch[1]?.trim() || /Error=/i.test(gcmText)) {
+                throw new Error(`GCM registration failed: ${sanitizeFcmBody(gcmText)}`);
+            }
+            const gcmToken = gcmMatch[1].trim();
 
-        // 3. FCM WebPush Registration API
-        const regText = await this.postText(
-            FCM_REGISTER_URL,
-            JSON.stringify({
-                web: {
-                    auth: toBase64Url(Buffer.from(keys.authSecretB64, "base64")),
-                    endpoint: `https://fcm.googleapis.com/fcm/send/${gcmToken}`,
-                    p256dh: toBase64Url(Buffer.from(keys.publicKeyB64, "base64"))
-                }
-            }),
-            {
+            // 2. Firebase Installations API
+            const installHeaders = {
                 "Content-Type": "application/json",
+                "x-firebase-client": Buffer.from(JSON.stringify({ heartbeats: [], version: 2 })).toString("base64"),
                 "x-goog-api-key": FCM_API_KEY,
-                "x-goog-firebase-installations-auth": fisAuthToken,
                 "X-Android-Package": ADM_PACKAGE,
                 "X-Android-Cert": ADM_CERT_SHA1
+            };
+            const installText = await this.postText(
+                FIS_INSTALL_URL,
+                JSON.stringify({
+                    appId: FCM_APP_ID,
+                    authVersion: "FIS_v2",
+                    fid: generateFirebaseFid(),
+                    sdkVersion: "w:0.6.6"
+                }),
+                installHeaders
+            );
+            let fisAuthToken = "";
+            try {
+                const installJson = JSON.parse(installText) as { authToken?: { token?: string } };
+                fisAuthToken = String(installJson?.authToken?.token ?? "").trim();
+            } catch {
+                throw new Error(`Firebase installation returned invalid JSON: ${sanitizeFcmBody(installText)}`);
             }
-        );
-        let fcmToken = "";
-        try {
-            const regJson = JSON.parse(regText) as { token?: string };
-            fcmToken = String(regJson?.token ?? "").trim();
-        } catch {
-            throw new Error(`FCM registration returned invalid JSON: ${sanitizeFcmBody(regText)}`);
-        }
-        if (!fcmToken) {
-            throw new Error(`FCM registration missing token: ${sanitizeFcmBody(regText)}`);
-        }
+            if (!fisAuthToken) {
+                throw new Error(`Firebase installation missing authToken: ${sanitizeFcmBody(installText)}`);
+            }
 
-        this.auth.setFcmToken(fcmToken);
-        return fcmToken;
+            // 3. FCM WebPush Registration API
+            const regText = await this.postText(
+                FCM_REGISTER_URL,
+                JSON.stringify({
+                    web: {
+                        auth: toBase64Url(Buffer.from(keys.authSecretB64, "base64")),
+                        endpoint: `https://fcm.googleapis.com/fcm/send/${gcmToken}`,
+                        p256dh: toBase64Url(Buffer.from(keys.publicKeyB64, "base64"))
+                    }
+                }),
+                {
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": FCM_API_KEY,
+                    "x-goog-firebase-installations-auth": fisAuthToken,
+                    "X-Android-Package": ADM_PACKAGE,
+                    "X-Android-Cert": ADM_CERT_SHA1
+                }
+            );
+            let fcmToken = "";
+            try {
+                const regJson = JSON.parse(regText) as { token?: string };
+                fcmToken = String(regJson?.token ?? "").trim();
+            } catch {
+                throw new Error(`FCM registration returned invalid JSON: ${sanitizeFcmBody(regText)}`);
+            }
+            if (!fcmToken) {
+                throw new Error(`FCM registration missing token: ${sanitizeFcmBody(regText)}`);
+            }
+
+            this.auth.setFcmToken(fcmToken);
+            return fcmToken;
+        })().finally(() => {
+            this.registerInFlight = null;
+        });
+        return this.registerInFlight;
     }
 
     start(): void {
@@ -531,44 +542,54 @@ export class GoogleFindFcmClient {
 
     private async connectOnce(): Promise<void> {
         if (!this.running) return;
-        try {
-            const checkin = await this.auth.ensureCheckin();
-            if (!this.running) return;
-            await this.ensureRegistered().catch(() => undefined);
-            if (!this.running) return;
+        if (this.connectInFlight) return this.connectInFlight;
+        this.connectInFlight = (async () => {
+            try {
+                const checkin = await this.auth.ensureCheckin();
+                if (!this.running) return;
+                await this.ensureRegistered().catch(() => undefined);
+                if (!this.running) return;
 
-            const sock = this.deps.connectTls
-                ? this.deps.connectTls(MCS_HOST, MCS_PORT)
-                : tls.connect({ host: MCS_HOST, port: MCS_PORT, servername: MCS_HOST });
+                this.destroySocket();
+                const sock = this.deps.connectTls
+                    ? this.deps.connectTls(MCS_HOST, MCS_PORT)
+                    : tls.connect({ host: MCS_HOST, port: MCS_PORT, servername: MCS_HOST });
 
-            this.socket = sock;
-            this.reader = new McsFrameReader(true);
-            this.lastStreamIdReceived = 0;
+                this.socket = sock;
+                this.reader = new McsFrameReader(true);
+                this.lastStreamIdReceived = 0;
 
-            const onConnect = () => {
-                if (!this.running || this.socket !== sock) return;
-                const state = this.auth.getState();
-                const loginFrame = encodeMcsLoginRequest({
-                    androidId: checkin.androidId,
-                    securityToken: checkin.securityToken,
-                    receivedPersistentIds: state.persistentIds.slice(-50)
+                const onConnect = () => {
+                    if (!this.running || this.socket !== sock) return;
+                    const state = this.auth.getState();
+                    const loginFrame = encodeMcsLoginRequest({
+                        androidId: checkin.androidId,
+                        securityToken: checkin.securityToken,
+                        receivedPersistentIds: state.persistentIds.slice(-50)
+                    });
+                    sock.write(Buffer.concat([Buffer.from([MCS_VERSION]), loginFrame]));
+                };
+
+                sock.once("secureConnect", onConnect);
+                sock.on("data", chunk => {
+                    if (this.socket !== sock) return;
+                    this.handleChunk(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
                 });
-                sock.write(Buffer.concat([Buffer.from([MCS_VERSION]), loginFrame]));
-            };
-
-            sock.once("secureConnect", onConnect);
-            sock.on("data", chunk => {
-                this.handleChunk(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-            });
-            sock.on("error", () => {
+                sock.on("error", () => {
+                    if (this.socket !== sock) return;
+                    this.handleDisconnect();
+                });
+                sock.on("close", () => {
+                    if (this.socket !== sock) return;
+                    this.handleDisconnect();
+                });
+            } catch {
                 this.handleDisconnect();
-            });
-            sock.on("close", () => {
-                this.handleDisconnect();
-            });
-        } catch {
-            this.handleDisconnect();
-        }
+            }
+        })().finally(() => {
+            this.connectInFlight = null;
+        });
+        return this.connectInFlight;
     }
 
     private handleDisconnect(): void {

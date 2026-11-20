@@ -1,13 +1,9 @@
 import type { DataSource } from "typeorm";
+import { UNREAD_MESSAGE_PREDICATE } from "../snapshot/ChatStateSnapshot";
 
 /**
- * Counts the incoming messages in a chat that are still awaiting a read.
- *
- * Only real messages count. `item_type != 0` rows are system events (group
- * renames, participant changes) and rows with an `associated_message_type` are
- * tapbacks and edits. Apple badges none of them,
- * but they keep `is_read = 0` indefinitely, so counting them leaves a chat
- * permanently unread.
+ * Counts the incoming messages in a chat that are still awaiting a read,
+ * using the same predicate as ChatStateSnapshot so live and snapshot read states agree.
  */
 export function buildChatUnreadCountQuery(): string {
     return `
@@ -15,11 +11,7 @@ export function buildChatUnreadCountQuery(): string {
             COUNT(DISTINCT c.ROWID) AS chat_count,
             SUM(
                 CASE
-                    WHEN m.is_read = 0
-                        AND m.date_read = 0
-                        AND m.item_type = 0
-                        AND COALESCE(m.associated_message_type, 0) = 0
-                        AND m.is_from_me = 0
+                    WHEN ${UNREAD_MESSAGE_PREDICATE}
                     THEN 1
                     ELSE 0
                 END

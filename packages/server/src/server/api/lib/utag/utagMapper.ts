@@ -188,8 +188,9 @@ export const mapSmartTagToFindMyDevice = (
             TRACKER_PROVIDER: "utag",
             CAN_RING: true,
             CAN_FIND_NEARBY: true,
+            HAS_BLE_RING: true,
             SUPPORTS_UWB: supportsUwb,
-            UTAG_REMOTE_RING: true
+            UTAG_REMOTE_RING: (device.bleD2D as any)?.metadata?.remoteRing?.enabled === true
         } as unknown as Record<string, boolean>
     };
 };

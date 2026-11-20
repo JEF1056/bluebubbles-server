@@ -47,7 +47,7 @@ export function compareDecimalStrings(a: string, b: string): number {
 }
 
 // Excludes rows older than chat.last_read_message_timestamp (iOS badge pointer), unless date_read > 0 ("Mark as Unread").
-const UNREAD_MESSAGE_PREDICATE = `
+export const UNREAD_MESSAGE_PREDICATE = `
     m.is_read = 0
     AND m.is_from_me = 0
     AND m.item_type = 0

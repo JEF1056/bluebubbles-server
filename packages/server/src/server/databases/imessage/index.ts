@@ -349,7 +349,9 @@ export class MessageRepository extends Loggable {
         // Add pagination params
         query.orderBy(orderBy, sort);
         query.skip(offset);
-        query.take(limit);
+        if (limit !== null && limit !== undefined) {
+            query.take(limit);
+        }
 
         const [messages, totalCount] = withCount
             ? await query.getManyAndCount()
@@ -433,7 +435,9 @@ export class MessageRepository extends Loggable {
         // Add pagination params
         query.orderBy(orderBy, sort);
         query.skip(offset);
-        query.take(limit);
+        if (limit !== null && limit !== undefined) {
+            query.take(limit);
+        }
 
         const [sql, parameters] = query.getQueryAndParameters();
         const results = await this.db.query(sql, parameters);

@@ -15,6 +15,7 @@ import { FileSystem } from "@server/fileSystem";
 import { Loggable } from "@server/lib/logging/Loggable";
 
 const DEFAULT_ORPHAN_TIMEOUT_MS = 30_000;
+const DEFAULT_DISCONNECT_TIMEOUT_MS = 15_000;
 const OPUS_PAYLOAD_TYPE = 111;
 const OPUS_SAMPLES_PER_FRAME = 960; // 20ms @ 48kHz
 
@@ -51,6 +52,8 @@ export class FaceTimeAudioBridge extends Loggable {
     sessions: Map<string, BridgeSession> = new Map();
 
     orphanTimeoutMs: number = DEFAULT_ORPHAN_TIMEOUT_MS;
+
+    disconnectTimeoutMs: number = DEFAULT_DISCONNECT_TIMEOUT_MS;
 
     static getInstance(): FaceTimeAudioBridge {
         if (!FaceTimeAudioBridge.instance) {
@@ -123,16 +126,36 @@ export class FaceTimeAudioBridge extends Loggable {
         });
 
         pc.connectionStateChange.subscribe(state => {
+            if (this.sessions.get(callUuid) !== session) return;
             if (state === "connected") {
                 this.clearOrphanTimer(session);
+            } else if (state === "disconnected") {
+                this.armOrphanTimer(session, this.disconnectTimeoutMs);
             } else if (state === "failed" || state === "closed") {
                 this.cleanupSession(callUuid);
             }
         });
 
-        await pc.setRemoteDescription({ sdp: payload.sdp, type: payload.type ?? "offer" });
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
+        let answer;
+        try {
+            await pc.setRemoteDescription({ sdp: payload.sdp, type: payload.type ?? "offer" });
+            answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+        } catch (err) {
+            if (this.sessions.get(callUuid) === session) {
+                this.cleanupSession(callUuid);
+            } else {
+                try {
+                    pc.close().catch(() => {});
+                } catch {
+                    // Ignore close errors
+                }
+            }
+            throw err;
+        }
+
+        // Superseded or cleaned up while negotiating: whoever removed us already closed pc.
+        if (this.sessions.get(callUuid) !== session) return;
 
         socket.emit("ft-bridge-answer", {
             callUuid,
@@ -257,12 +280,13 @@ export class FaceTimeAudioBridge extends Loggable {
         }
     }
 
-    private armOrphanTimer(session: BridgeSession): void {
+    private armOrphanTimer(session: BridgeSession, timeoutMs = this.orphanTimeoutMs): void {
         this.clearOrphanTimer(session);
         session.orphanTimer = setTimeout(() => {
+            if (this.sessions.get(session.callUuid) !== session) return;
             this.log.info(`Cleaning up orphaned audio bridge session: ${session.callUuid}`);
             this.cleanupSession(session.callUuid);
-        }, this.orphanTimeoutMs);
+        }, timeoutMs);
         if (typeof session.orphanTimer.unref === "function") {
             session.orphanTimer.unref();
         }

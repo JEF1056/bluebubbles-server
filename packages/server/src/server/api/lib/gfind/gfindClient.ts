@@ -219,7 +219,8 @@ export class GoogleFindClient {
         try {
             resFrame = await grpcCall(SPOT_GRPC_PATH, frame, token);
         } catch (err: any) {
-            if (String(err?.message ?? "").includes("401")) {
+            const msg = String(err?.message ?? "");
+            if (/\b401\b/.test(msg) || /\berror 16\b/i.test(msg) || /UNAUTHENTICATED/i.test(msg)) {
                 token = await this.auth.getServiceToken("spot", true);
                 resFrame = await grpcCall(SPOT_GRPC_PATH, frame, token);
             } else {

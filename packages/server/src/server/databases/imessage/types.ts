@@ -1,7 +1,7 @@
 export type DBMessageParams = {
     chatGuid?: string;
     offset?: number;
-    limit?: number;
+    limit?: number | null;
     after?: Date | number;
     before?: Date | number;
     withChats?: boolean;

@@ -990,6 +990,21 @@ test("UTagOAuthWindow avoids custom-scheme webRequest filters and intercepts ms-
     await new Promise(r => setImmediate(r));
     assert.equal(prevented, true);
     assert.deepEqual(callbacks2, ["ms-app://s-1-15-2-test?code=def"]);
+
+    // 3. S2-17: setWindowOpenHandler denies non-ms-app:// popups and intercepts ms-app:// popups while denying
+    assert.equal(typeof win2.windowOpenHandler, "function");
+    assert.deepEqual(win2.windowOpenHandler({ url: "https://evil.example/popup" }), { action: "deny" });
+    const callbacks3 = [];
+    UTagOAuthWindow.open({
+        url: "https://account.samsung.com/accounts/ANDROIDSDK/signInGate?foo=pop",
+        onCallbackUrl: async url => {
+            callbacks3.push(url);
+        }
+    });
+    const win3 = createdWindows[2];
+    assert.deepEqual(win3.windowOpenHandler({ url: "ms-app://s-1-15-2-test?code=popup" }), { action: "deny" });
+    await new Promise(r => setImmediate(r));
+    assert.deepEqual(callbacks3, ["ms-app://s-1-15-2-test?code=popup"]);
 });
 
 test("utagMapper propagates SmartThings coloredIcon as iconUrl and iconCategory=tracker", () => {
@@ -1109,6 +1124,293 @@ test("UTagClient.ringTag surfaces FME inner resultCode >= 400 errors and UTagSer
         assert.equal(listCalls, 2, "force: true should bypass cooldown");
         const ble = service.getBleSpec("utag:tag-force-1");
         assert.deepEqual(ble.expectedPrivacyIdsHex, ["aabbccddeeff0011"]);
+        service.disconnect();
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+test("UTagService (U1) auto-stops searching after timer & on disconnect, (U2) queues targeted refresh and preserves needsPin, (S2-18) guards empty userId and 403 retries", async () => {
+    const { UTagClient, UTagHttpError } = loadTsModule("server/api/lib/utag/utagClient.ts");
+    const utagServiceMod = loadTsModule("server/api/lib/utag/utagService.ts");
+    const common = loadTsModule("server/api/lib/findmy/trackerCommon.ts");
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "utag-u1u2-"));
+
+    try {
+        // S2-18: empty userId skips setShareableMembers, and 403 is remembered per session until setTokens changes
+        let shareCalls = 0;
+        let termsCalls = 0;
+        let geoMode = "terms403";
+        const s2MockFetch = async (url, init) => {
+            const u = String(url);
+            if (u === "https://api.smartthings.com/installedapps/fme-s2/execute") {
+                const body = JSON.parse(init?.body ?? "{}");
+                const uri = body?.parameters?.uri;
+                const extraUri = body?.parameters?.extraUri ?? "";
+                if (uri === "/user/options") {
+                    termsCalls += 1;
+                    return new Response(JSON.stringify({ statusCode: 403, message: { resultCode: 403 } }), { status: 200 });
+                }
+                if (uri === "/trackerapi" && extraUri.includes("/shareable/members")) {
+                    shareCalls += 1;
+                    return new Response(JSON.stringify({ statusCode: 403, message: { resultCode: 403 } }), { status: 200 });
+                }
+                if (uri === "/trackers/geolocation") {
+                    if (geoMode === "terms403") {
+                        return new Response(JSON.stringify({ statusCode: 403, message: { resultCode: 403 } }), { status: 200 });
+                    }
+                    return new Response(
+                        JSON.stringify({ statusCode: 200, message: { items: [{ deviceId: "tag-s2", resultCode: 403 }] } }),
+                        { status: 200 }
+                    );
+                }
+            }
+            throw new Error(`Unexpected S2-18 URL: ${u}`);
+        };
+        const s2Client = new UTagClient(null, { fetchFn: s2MockFetch });
+        s2Client.setTokens({
+            userAuthToken: "u1",
+            iotToken: "i1",
+            expiresAt: Date.now() + 3600_000,
+            authServerUrl: "https://us-auth2.samsungosp.com",
+            deviceId: "dev1",
+            userId: ""
+        });
+        await s2Client.setShareableMembers("fme-s2", "tag-s2", "   ");
+        assert.equal(shareCalls, 0, "Empty userId must skip setShareableMembers");
+
+        await assert.rejects(() => s2Client.getTagGeolocation("fme-s2", "tag-s2"), UTagHttpError);
+        await assert.rejects(() => s2Client.getTagGeolocation("fme-s2", "tag-s2"), UTagHttpError);
+        assert.equal(termsCalls, 1, "403 on setTermsAgreed must be remembered for the session");
+
+        geoMode = "share403";
+        s2Client.setTokens({
+            userAuthToken: "u2",
+            iotToken: "i2",
+            expiresAt: Date.now() + 3600_000,
+            authServerUrl: "https://us-auth2.samsungosp.com",
+            deviceId: "dev1",
+            userId: "user-s2"
+        });
+        await assert.rejects(() => s2Client.getTagGeolocation("fme-s2", "tag-s2"), UTagHttpError);
+        await s2Client.getTagGeolocation("fme-s2", "tag-s2");
+        assert.equal(shareCalls, 1, "403 on setShareableMembers must be remembered for the device/session");
+
+        // U1 + U2 on UTagService
+        const searchEvents = [];
+        const geoRequests = [];
+        let holdTag1Geo = null;
+        let releaseTag1Geo = null;
+
+        const uMockFetch = async (url, init) => {
+            const u = String(url);
+            if (u.startsWith("https://client.smartthings.com/devices")) {
+                return new Response(
+                    JSON.stringify({
+                        items: [
+                            { deviceId: "tag-1", label: "Tag One", ocfDeviceType: "x.com.st.d.tag" },
+                            { deviceId: "tag-2", label: "Tag Two", ocfDeviceType: "x.com.st.d.tag" }
+                        ]
+                    }),
+                    { status: 200 }
+                );
+            }
+            if (u === "https://api.smartthings.com/installedapps?allowed=true") {
+                return new Response(
+                    JSON.stringify({
+                        items: [{ installedAppId: "fme-u", ui: { pluginId: "com.samsung.android.plugin.fme" } }]
+                    }),
+                    { status: 200 }
+                );
+            }
+            if (u === "https://api.smartthings.com/installedapps/fme-u/execute") {
+                const body = JSON.parse(init?.body ?? "{}");
+                const uri = body?.parameters?.uri;
+                const extraUri = body?.parameters?.extraUri ?? "";
+                const stDids = body?.parameters?.stDids;
+                if (uri === "/trackerapi" && extraUri.endsWith("/searchingstatus")) {
+                    const m = extraUri.match(/\/trackers\/([^/]+)\/searchingstatus/);
+                    const innerBody = JSON.parse(
+                        Buffer.from(body?.parameters?.encodedBody ?? "", "base64").toString("utf8") || "{}"
+                    );
+                    searchEvents.push({ deviceId: m?.[1], searching: innerBody?.searchingStatus === "searching" });
+                    return new Response(JSON.stringify({ statusCode: 200, message: { resultCode: 200 } }), { status: 200 });
+                }
+                if (uri === "/trackers/geolocation") {
+                    geoRequests.push(stDids);
+                    if (stDids === "tag-1" && holdTag1Geo) {
+                        await holdTag1Geo;
+                    }
+                    if (stDids === "tag-1") {
+                        return new Response(
+                            JSON.stringify({
+                                statusCode: 200,
+                                message: {
+                                    items: [
+                                        {
+                                            deviceId: "tag-1",
+                                            geolocations: [{ latitude: "enc-lat", longitude: "enc-lon", timeStamp: Date.now() }]
+                                        }
+                                    ]
+                                }
+                            }),
+                            { status: 200 }
+                        );
+                    }
+                    return new Response(
+                        JSON.stringify({
+                            statusCode: 200,
+                            message: {
+                                items: [{ deviceId: "tag-2", geolocations: [] }]
+                            }
+                        }),
+                        { status: 200 }
+                    );
+                }
+                return new Response(JSON.stringify({ statusCode: 200, message: {} }), { status: 200 });
+            }
+            throw new Error(`Unexpected U1/U2 URL: ${u}`);
+        };
+
+        const storageDeps = {
+            baseDir: tmpDir,
+            safeStorage: {
+                isEncryptionAvailable: () => true,
+                encryptString: s => Buffer.from(s, "utf8"),
+                decryptString: b => b.toString("utf8")
+            },
+            fetchFn: uMockFetch
+        };
+        const service = new utagServiceMod.UTagService({
+            storageDeps,
+            fetchFn: uMockFetch,
+            cooldownMs: 60_000,
+            searchStopDelayMs: 30,
+            emitDevice: () => {}
+        });
+        common.writeEncryptedJson(
+            "utag-auth.enc.json",
+            {
+                deviceId: "dev-u",
+                tokens: {
+                    userAuthToken: "u",
+                    iotToken: "i",
+                    expiresAt: Date.now() + 3600_000,
+                    authServerUrl: "https://us-auth2.samsungosp.com",
+                    deviceId: "dev-u",
+                    userId: "user-u"
+                }
+            },
+            storageDeps
+        );
+
+        // U2: start an untargeted refresh and hold tag-1 geo; a concurrent targeted refresh for tag-2 must NOT be dropped,
+        // and tag-2's non-PIN geo must NOT clobber tag-1's needsPin=true.
+        holdTag1Geo = new Promise(resolve => {
+            releaseTag1Geo = resolve;
+        });
+        const fullPromise = service.refreshDevices();
+        await new Promise(r => setTimeout(r, 15));
+        const targetedPromise = service.refreshDevices("utag:tag-2", { force: true });
+        holdTag1Geo = null;
+        releaseTag1Geo();
+        await Promise.all([fullPromise, targetedPromise]);
+
+        // geoRequests should contain tag-1, tag-2 (from full), then tag-2 again (from queued targeted refresh)
+        assert.deepEqual(geoRequests, ["tag-1", "tag-2", "tag-2"]);
+        assert.equal(service.getStatus().needsPin, true, "Targeted tag-2 refresh must not clobber global needsPin");
+
+        // U1: targeted refresh armed setSearchingStatus(true) and auto-disarms to false after searchStopDelayMs
+        assert.deepEqual(searchEvents, [{ deviceId: "tag-2", searching: true }]);
+        await new Promise(r => setTimeout(r, 60));
+        assert.deepEqual(searchEvents, [
+            { deviceId: "tag-2", searching: true },
+            { deviceId: "tag-2", searching: false }
+        ]);
+
+        // U1: disconnect() flushes pending stop before deleting tokens and does not double-fire
+        searchEvents.length = 0;
+        await service.refreshDevices("utag:tag-2", { force: true });
+        assert.deepEqual(searchEvents, [{ deviceId: "tag-2", searching: true }]);
+        service.disconnect();
+        await new Promise(r => setTimeout(r, 50));
+        assert.deepEqual(searchEvents, [
+            { deviceId: "tag-2", searching: true },
+            { deviceId: "tag-2", searching: false }
+        ]);
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+test("UTagService.ringDevice rejects BLE-only tags when remoteRing.enabled !== true and mapper reflects remoteRing", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "utag-ring-guard-"));
+    const ringCalls = [];
+    try {
+        const { mapSmartTagToFindMyDevice } = loadTsModule("server/api/lib/utag/utagMapper.ts");
+        const { UTagService } = loadTsModule("server/api/lib/utag/utagService.ts", {
+            "@server": { Server: () => ({ emitMessage: () => {} }) }
+        });
+
+        const mappedDisabled = mapSmartTagToFindMyDevice(
+            {
+                deviceId: "tag-ble-only",
+                label: "BLE Tag",
+                bleD2D: { metadata: { remoteRing: { enabled: false } } }
+            },
+            { coords: { latitude: 37.7, longitude: -122.4, lastUpdateTime: Date.now() } }
+        );
+        assert.equal(mappedDisabled.features.CAN_RING, true);
+        assert.equal(mappedDisabled.features.HAS_BLE_RING, true);
+        assert.equal(mappedDisabled.features.UTAG_REMOTE_RING, false);
+
+        const mappedEnabled = mapSmartTagToFindMyDevice(
+            {
+                deviceId: "tag-remote-ok",
+                label: "Remote Tag",
+                bleD2D: { metadata: { remoteRing: { enabled: true } } }
+            },
+            { coords: { latitude: 37.7, longitude: -122.4, lastUpdateTime: Date.now() } }
+        );
+        assert.equal(mappedEnabled.features.UTAG_REMOTE_RING, true);
+
+        const mockClient = {
+            setTokens: () => undefined,
+            getTokens: () => ({ accessToken: "tok" }),
+            getSmartTagDevices: async () => [
+                {
+                    deviceId: "tag-ble-only",
+                    label: "BLE Tag",
+                    bleD2D: { metadata: { remoteRing: { enabled: false } } }
+                },
+                {
+                    deviceId: "tag-remote-ok",
+                    label: "Remote Tag",
+                    bleD2D: { metadata: { remoteRing: { enabled: true } } }
+                }
+            ],
+            getFmeInstalledAppId: async () => "fme-app",
+            ringTag: async (appId, deviceId, action) => {
+                ringCalls.push({ appId, deviceId, action });
+            }
+        };
+        const service = new UTagService({
+            storageDeps: {
+                baseDir: tmpDir,
+                safeStorage: { isEncryptionAvailable: () => false }
+            },
+            client: mockClient,
+            emitDevice: () => undefined
+        });
+
+        await assert.rejects(
+            () => service.ringDevice("utag:tag-ble-only", "start"),
+            err => err?.name === "UTagHttpError" && err?.status === 400
+        );
+        assert.equal(ringCalls.length, 0);
+
+        await service.ringDevice("utag:tag-remote-ok", "start");
+        assert.deepEqual(ringCalls, [{ appId: "fme-app", deviceId: "tag-remote-ok", action: "start" }]);
     } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
     }

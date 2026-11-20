@@ -7,7 +7,8 @@ import { Loggable } from "@server/lib/logging/Loggable";
 import { ProcessSpawner } from "@server/lib/ProcessSpawner";
 
 const APP_HIDE_DELAY_MS = 5000;
-const FAILURE_BUDGET_RESET_INTERVAL_MS = 15000;
+const HEALTHY_UPTIME_RESET_MS = 30000;
+const FAILURE_BUDGET_RESET_INTERVAL_MS = HEALTHY_UPTIME_RESET_MS;
 const MAX_CONSECUTIVE_FAILURES = 5;
 const PROCESS_RESTART_DELAY_MS = 1000;
 
@@ -117,12 +118,14 @@ export abstract class DylibPlugin extends Loggable {
             this.log.debug(`Injecting ${this.name} DYLIB...`);
 
             while (this.consecutiveFailureCount < MAX_CONSECUTIVE_FAILURES) {
+                let attemptStartedAt = Date.now();
                 try {
                     await this.stopParentProcess();
                     await waitMs(PROCESS_RESTART_DELAY_MS);
 
                     if (this.stopRequested || !this.isEnabled) return;
 
+                    attemptStartedAt = Date.now();
                     const parentProcess = new ProcessSpawner({
                         command: parentExecutablePath,
                         args: [],
@@ -145,7 +148,12 @@ export abstract class DylibPlugin extends Loggable {
 
                     await parentProcessExit;
                     this.log.debug(`${this.name} parent process exited; restarting`);
-                    this.consecutiveFailureCount = 0;
+                    if (Date.now() - attemptStartedAt >= HEALTHY_UPTIME_RESET_MS) {
+                        this.consecutiveFailureCount = 0;
+                    } else {
+                        this.consecutiveFailureCount += 1;
+                        this.lastFailureAt = Date.now();
+                    }
                 } catch (error: any) {
                     this.log.debug(
                         `Detected DYLIB crash for App ${this.parentApp}. Error: ${error?.message ?? String(error)}`

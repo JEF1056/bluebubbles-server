@@ -269,8 +269,20 @@ export class GoogleFindAuthManager {
         }
 
         const s = this.load();
+        const nextEmail = parsed.Email || emailHint || null;
+        const sameEmail = Boolean(s.email && nextEmail && s.email.toLowerCase() === nextEmail.toLowerCase());
+        const accountChanged = Boolean((s.email || s.aasToken) && !sameEmail);
+        if (accountChanged) {
+            s.ownerKeyHex = null;
+            s.ownerKeyVersion = null;
+            s.ownerKeyMismatch = false;
+            s.fcmToken = null;
+            s.persistentIds = [];
+            s.email = nextEmail;
+        } else {
+            s.email = nextEmail || s.email || null;
+        }
         s.aasToken = aasToken;
-        s.email = parsed.Email || emailHint || s.email || null;
         s.admToken = null;
         s.spotToken = null;
         this.save();

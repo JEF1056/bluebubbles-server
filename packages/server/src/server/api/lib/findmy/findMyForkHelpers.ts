@@ -565,7 +565,8 @@ export const refreshFindMyDevicesThroughPrivateApi = async (
         throw new Error("The Find My Devices helper is unavailable on this macOS version");
     }
 
-    await deps.execShellCommand("/usr/bin/open findmy://devices");
+    // -g delivers the Find My URL without bringing Find My to the foreground.
+    await deps.execShellCommand("/usr/bin/open -g findmy://devices");
     const helperAvailable = await waitForPrivateApiClient(deps, targetProcessIdentifier);
     if (!helperAvailable) {
         throw new Error("The Find My Devices helper did not connect before the refresh timeout");

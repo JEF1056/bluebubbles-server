@@ -89,9 +89,8 @@ export class UTagOAuthWindow extends Window {
         this.instance.webContents.setWindowOpenHandler(({ url }) => {
             if (url.startsWith("ms-app://")) {
                 this.handleInterceptedUrl(url);
-                return { action: "deny" };
             }
-            return { action: "allow" };
+            return { action: "deny" };
         });
 
         this.instance.webContents.on("did-fail-load", (_event, _errorCode, _errorDescription, validatedURL) => {

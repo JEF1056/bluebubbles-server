@@ -118,6 +118,8 @@ export class UTagClient {
     private tokens: UTagTokens | null = null;
     private fmeInstalledAppId: string | null = null;
     private refreshInFlight: Promise<UTagTokens> | null = null;
+    private termsAgreedDenied = false;
+    private shareableDeniedDevices = new Set<string>();
     private readonly fetchFn: typeof fetch;
     private readonly onTokensUpdated?: (tokens: UTagTokens) => void | Promise<void>;
 
@@ -128,7 +130,13 @@ export class UTagClient {
     }
 
     setTokens(tokens: UTagTokens | null): void {
+        const prevUserId = this.tokens?.userId;
+        const prevAuthToken = this.tokens?.userAuthToken;
         this.tokens = tokens;
+        if (!tokens || tokens.userId !== prevUserId || tokens.userAuthToken !== prevAuthToken) {
+            this.termsAgreedDenied = false;
+            this.shareableDeniedDevices.clear();
+        }
         if (!tokens) this.fmeInstalledAppId = null;
     }
 
@@ -419,7 +427,6 @@ export class UTagClient {
         }
 
         // Best-effort single-device fetch when list endpoint omits bleD2D.privacyId for BLE nearby finding
-        let loggedSampleKeys = false;
         for (const tag of tags) {
             if (tag.bleD2D?.privacyId) continue;
             try {
@@ -427,23 +434,14 @@ export class UTagClient {
                     `${SMARTTHINGS_CLIENT_API}/devices/${encodeURIComponent(tag.deviceId)}`
                 );
                 let bleD2D = detail?.bleD2D ?? detail?.ocf?.bleD2D;
-                let v1Keys: string[] = [];
                 if (!bleD2D) {
                     const v1Detail = await this.authedRequest(
                         `${SMARTTHINGS_API}/devices/${encodeURIComponent(tag.deviceId)}`
                     ).catch(() => null);
-                    v1Keys = v1Detail && typeof v1Detail === "object" ? Object.keys(v1Detail) : [];
                     bleD2D = v1Detail?.bleD2D ?? v1Detail?.ocf?.bleD2D;
                 }
                 if (bleD2D) {
                     tag.bleD2D = bleD2D;
-                }
-                if (!loggedSampleKeys) {
-                    loggedSampleKeys = true;
-                    const meta = bleD2D?.metadata ?? {};
-                    logUtag(
-                        `[UTag] tag meta sample id=${tag.deviceId} poolSize=${meta.privacyIdPoolSize} pidPoolSize=${JSON.stringify(meta.pidPoolSize)} aging=${JSON.stringify(meta.agingCounter)} serverTime=${meta.currentServerTime} updateTime=${meta.updateTime} remoteRing=${JSON.stringify(meta.remoteRing)}`
-                    );
                 }
             } catch {
                 // Non-fatal: cloud location and ringing still work without bleD2D
@@ -560,11 +558,13 @@ export class UTagClient {
     }
 
     async setShareableMembers(installedAppId: string, deviceId: string, userId: string): Promise<void> {
+        const trimmedUserId = userId?.trim();
+        if (!trimmedUserId) return;
         await this.executeFme(installedAppId, {
             method: "POST",
             uri: "/trackerapi",
             extraUri: `/trackers/${encodeURIComponent(deviceId)}/shareable/members`,
-            body: { saGuid: userId }
+            body: { saGuid: trimmedUserId }
         });
     }
 
@@ -604,9 +604,12 @@ export class UTagClient {
         try {
             data = await fetchGeo();
         } catch (err) {
-            if (err instanceof UTagHttpError && err.status === 403) {
+            if (err instanceof UTagHttpError && err.status === 403 && !this.termsAgreedDenied) {
+                // Remember 403 for this session unless agreeing clears it on retry.
+                this.termsAgreedDenied = true;
                 await this.setTermsAgreed(installedAppId);
                 data = await fetchGeo();
+                this.termsAgreedDenied = false;
             } else {
                 throw err;
             }
@@ -623,10 +626,25 @@ export class UTagClient {
         let list: FmeGeolocationEntry[] = [];
         if (Array.isArray(data?.items)) {
             const matchedItem = data.items.find((it: any) => it?.deviceId === deviceId) ?? data.items[0];
-            if (Number(matchedItem?.resultCode) === 403) {
-                await this.setShareableMembers(installedAppId, deviceId, this.tokens?.userId ?? "");
-                data = await fetchGeo();
-                keyPair = pickKeyPair(data) ?? keyPair;
+            const userId = this.tokens?.userId?.trim();
+            if (Number(matchedItem?.resultCode) === 403 && userId && !this.shareableDeniedDevices.has(deviceId)) {
+                this.shareableDeniedDevices.add(deviceId);
+                try {
+                    await this.setShareableMembers(installedAppId, deviceId, userId);
+                    data = await fetchGeo();
+                    keyPair = pickKeyPair(data) ?? keyPair;
+                    const retryItem = Array.isArray(data?.items)
+                        ? data.items.find((it: any) => it?.deviceId === deviceId) ?? data.items[0]
+                        : null;
+                    if (Number(retryItem?.resultCode) !== 403) {
+                        this.shareableDeniedDevices.delete(deviceId);
+                    }
+                } catch (shareErr) {
+                    if (!(shareErr instanceof UTagHttpError && shareErr.status === 403)) {
+                        this.shareableDeniedDevices.delete(deviceId);
+                    }
+                    throw shareErr;
+                }
             }
             const itemAfter =
                 (Array.isArray(data?.items)

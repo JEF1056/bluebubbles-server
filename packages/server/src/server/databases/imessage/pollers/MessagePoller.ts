@@ -4,6 +4,8 @@ import { isEmpty } from "@server/helpers/utils";
 import { Server } from "@server";
 import { MESSAGE_FAST_LOOKBACK_MS, MESSAGE_RECONCILE_INTERVAL_MS, MESSAGE_RECONCILE_LOOKBACK_MS } from "./constants";
 
+const RECONCILE_ROW_LIMIT = 5000;
+
 export class MessagePoller extends IMessagePoller {
     tag = "MessagePoller";
 
@@ -35,8 +37,19 @@ export class MessagePoller extends IMessagePoller {
             withChats: true,
             withAttachments: false,
             withCount: false,
+            // Fast poll relies on the short lookback window; 7d reconcile keeps a safety cap.
+            limit: dueForReconcile ? RECONCILE_ROW_LIMIT : null,
             orderBy: "message.dateCreated"
         });
+        if (dueForReconcile && search.length >= RECONCILE_ROW_LIMIT) {
+            const warnMsg =
+                `MessagePoller 7d reconcile hit ${RECONCILE_ROW_LIMIT}-row cap; older rows in window were skipped`;
+            try {
+                Server().log(warnMsg, "warn");
+            } catch {
+                console.warn(warnMsg);
+            }
+        }
 
         // Filter out messages that aren't within our actual range.
         // Do this here instead of in SQLite to save on performance
@@ -90,6 +103,7 @@ export class MessagePoller extends IMessagePoller {
             const [previouslyUnsentEntries, _] = await this.repo.getMessages({
                 withChats: true,
                 withCount: false,
+                limit: this.unsentIds.length,
                 where: [
                     {
                         statement: `message.ROWID in (${this.unsentIds.join(", ")})`,
@@ -100,8 +114,8 @@ export class MessagePoller extends IMessagePoller {
             results = results.concat(await this.handlePreviouslyUnsent(previouslyUnsentEntries));
         }
 
-        // Handle new unsent messages
-        const unsent = entries.filter(e => !e.isSent);
+        // Handle new unsent messages (only outgoing pending rows can transition to sent/error)
+        const unsent = entries.filter(e => e.isFromMe && !e.isSent && !e.error);
         for (const entry of unsent) {
             if (!this.unsentIds.includes(entry.ROWID)) {
                 this.unsentIds.push(entry.ROWID);
@@ -185,8 +199,8 @@ export class MessagePoller extends IMessagePoller {
 
         // Gather the errored messages
         for (const entry of errored) {
-            const event = this.processMessageEvent(entry);
-            if (!event) continue;
+            // Keep the state cache current; error is not a diffed field in getMessageEvent.
+            this.processMessageEvent(entry);
 
             const success = await Server().messageManager.reject("message-send-error", entry);
             Server().log(

@@ -44,6 +44,7 @@ import { MacOsInterface } from "@server/api/interfaces/macosInterface";
 import { FaceTimeAudioBridge } from "@server/api/lib/facetime/FaceTimeAudioBridge";
 import { getLogger } from "@server/lib/logging/Loggable";
 import { ProxyServices } from "@server/databases/server/constants";
+import { gfindService } from "@server/api/lib/gfind";
 import { registerForkSocketRoutes } from "./socketForkRoutes";
 
 const unknownError = "Unknown Error. Check server logs!";
@@ -1221,6 +1222,7 @@ export class SocketRoutes {
         });
 
         registerForkSocketRoutes(socket, log);
+        gfindService.onClientConnected();
 
         socket.on("disconnect", reason => {
             FaceTimeAudioBridge.getInstance().handleSocketDisconnect(socket.id);

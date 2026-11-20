@@ -145,6 +145,14 @@ test("refreshDevices routes targeted utag: and gfind: refreshes directly", async
     await FindMyInterface.refreshDevices({ deviceId: "gfind:spot1" });
     assert.equal(calls.appleRefresh, 0);
     assert.deepEqual(calls.gfindRefresh, ["gfind:spot1"]);
+
+    // M4: Apple-targeted refresh must not trigger utag or gfind refreshes
+    calls.utagRefresh.length = 0;
+    calls.gfindRefresh.length = 0;
+    await FindMyInterface.refreshDevices({ deviceId: "apple-1" });
+    assert.equal(calls.appleRefresh, 1);
+    assert.deepEqual(calls.utagRefresh, []);
+    assert.deepEqual(calls.gfindRefresh, []);
 });
 
 test("full refresh uses Promise.allSettled so offline Apple helper does not fail trackers", async () => {
