@@ -78,26 +78,20 @@ export class FaceTimeInterface {
         }
 
         const result = await Server().privateApi.facetime.startCall(addresses, video, isTelephony);
-        const callUuid = result?.data?.call_uuid ?? result?.data?.callUUID;
-        if (!callUuid) {
+        const uniqueProxyIdentifier: string | null =
+            result?.data?.unique_proxy_identifier ?? result?.data?.uniqueProxyIdentifier ?? null;
+        const rawCallUuid = result?.data?.call_uuid ?? result?.data?.callUUID ?? uniqueProxyIdentifier;
+        if (!rawCallUuid) {
             throw new Error(result?.data?.error ?? "Failed to start FaceTime call: helper did not return call_uuid!");
         }
 
         const pregeneratedUrl: string | null = result?.data?.url ?? null;
-        const call = {
-            call_uuid: callUuid,
-            callUuid,
-            status: result?.data?.status ?? "outgoing",
-            is_video: video,
-            is_telephony: isTelephony,
-            address: addresses[0],
-            group_uuid: result?.data?.group_uuid ?? null
-        };
 
-        let session = FaceTimeSessionManager().findSession(callUuid);
+        let session = FaceTimeSessionManager().findSession(rawCallUuid, uniqueProxyIdentifier);
         if (!session) {
             session = new FaceTimeSession({
-                callUuid,
+                callUuid: rawCallUuid,
+                uniqueProxyIdentifier,
                 status: FaceTimeSessionStatus.OUTGOING,
                 url: pregeneratedUrl,
                 address: addresses[0],
@@ -108,6 +102,14 @@ export class FaceTimeInterface {
                 isTelephony
             });
         } else {
+            if (!session.callUuid) {
+                session.callUuid = rawCallUuid;
+            }
+            if (uniqueProxyIdentifier && !session.uniqueProxyIdentifier) {
+                session.uniqueProxyIdentifier = uniqueProxyIdentifier;
+            }
+            session.registerIdentifier(rawCallUuid);
+            session.registerIdentifier(uniqueProxyIdentifier);
             if (session.status === FaceTimeSessionStatus.UNKNOWN) {
                 session.status = FaceTimeSessionStatus.OUTGOING;
             }
@@ -119,6 +121,16 @@ export class FaceTimeInterface {
             session.isAudio = !video || isTelephony;
             session.isTelephony = isTelephony;
         }
+        const callUuid = session.callUuid || rawCallUuid;
+        const call = {
+            call_uuid: callUuid,
+            callUuid,
+            status: result?.data?.status ?? "outgoing",
+            is_video: video,
+            is_telephony: isTelephony,
+            address: addresses[0],
+            group_uuid: result?.data?.group_uuid ?? null
+        };
         if (result?.data?.group_uuid && !session.conversationGroupUuid) {
             session.conversationGroupUuid = result.data.group_uuid;
         }

@@ -57,6 +57,7 @@ export type SerializedFaceTimeSession = {
 
 export type FaceTimeSessionInit = {
     callUuid?: string | null;
+    uniqueProxyIdentifier?: string | null;
     conversationUuid?: string | null;
     addToManager?: boolean;
     status?: FaceTimeSessionStatus;
@@ -90,6 +91,10 @@ export class FaceTimeSession extends Loggable {
     conversationUuid: string;
 
     callUuid: string;
+
+    uniqueProxyIdentifier: string | null = null;
+
+    callUuidAliases: Set<string> = new Set();
 
     url: string;
 
@@ -173,6 +178,7 @@ export class FaceTimeSession extends Loggable {
 
     constructor({
         callUuid = null,
+        uniqueProxyIdentifier = null,
         conversationUuid = null,
         addToManager = true,
         status = FaceTimeSessionStatus.UNKNOWN,
@@ -205,6 +211,10 @@ export class FaceTimeSession extends Loggable {
         this.startedAt = this.createdAt;
         this.updatedAt = this.createdAt;
         this.callUuid = callUuid;
+        this.uniqueProxyIdentifier = uniqueProxyIdentifier;
+        this.registerIdentifier(this.callUuid);
+        this.registerIdentifier(this.uniqueProxyIdentifier);
+        this.registerIdentifier(this.uuid);
         this.conversationUuid = conversationUuid;
         this.status = status;
         this.url = url;
@@ -356,8 +366,42 @@ export class FaceTimeSession extends Loggable {
         return null;
     }
 
+    registerIdentifier(identifier: string | null | undefined) {
+        const normalized = typeof identifier === "string" ? identifier.trim().toLowerCase() : "";
+        if (normalized) {
+            this.callUuidAliases.add(normalized);
+        }
+    }
+
+    matchesIdentifier(identifier: string | null | undefined): boolean {
+        const normalized = typeof identifier === "string" ? identifier.trim().toLowerCase() : "";
+        if (!normalized) return false;
+        return (
+            (this.callUuid ?? "").toLowerCase() === normalized ||
+            (this.uuid ?? "").toLowerCase() === normalized ||
+            (this.uniqueProxyIdentifier ?? "").toLowerCase() === normalized ||
+            this.callUuidAliases.has(normalized)
+        );
+    }
+
     update(session: FaceTimeSession) {
         let changed = false;
+
+        // macOS 26.4+ TUProxyCall may emit uniqueProxyIdentifier first and populate a distinct
+        // callUUID later on answer; keep this.callUuid stable for clients while aliasing both IDs.
+        if (session.callUuid && !this.callUuid) {
+            this.callUuid = session.callUuid;
+            changed = true;
+        }
+        if (session.uniqueProxyIdentifier && !this.uniqueProxyIdentifier) {
+            this.uniqueProxyIdentifier = session.uniqueProxyIdentifier;
+            changed = true;
+        }
+        this.registerIdentifier(session.callUuid);
+        this.registerIdentifier(session.uniqueProxyIdentifier);
+        for (const alias of session.callUuidAliases ?? []) {
+            this.registerIdentifier(alias);
+        }
 
         if (session.address && !this.address) {
             this.address = session.address;
@@ -960,8 +1004,11 @@ export class FaceTimeSession extends Loggable {
             event?.ended_reason ?? null,
             endedError
         );
+        const uniqueProxyIdentifier = event?.unique_proxy_identifier ?? event?.uniqueProxyIdentifier ?? null;
+        const resolvedCallUuid = event?.call_uuid ?? event?.callUUID ?? uniqueProxyIdentifier ?? null;
         const session = new FaceTimeSession({
-            callUuid: event?.call_uuid ?? null,
+            callUuid: resolvedCallUuid,
+            uniqueProxyIdentifier,
             conversationUuid: event?.conversation_uuid ?? null,
             url: event?.conversation_link ?? event?.url ?? null,
             addToManager,

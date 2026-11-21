@@ -26,15 +26,18 @@ export class PrivateApiFaceTimeStatusHandler extends Loggable implements Private
     async handleStandard(data: EventData) {
         const eventData = data?.data ?? {};
         const statusId = eventData.call_status ?? eventData.status_id;
-        const callUuid = eventData.call_uuid ?? null;
+        const uniqueProxyIdentifier = eventData.unique_proxy_identifier ?? eventData.uniqueProxyIdentifier ?? null;
+        const callUuid = eventData.call_uuid ?? eventData.callUUID ?? uniqueProxyIdentifier ?? null;
         const rawAddress = eventData.handle?.value ?? null;
 
         // Keep tracked sessions (e.g. outbound calls) synced even when facetime_calling is disabled.
-        const existingSession = callUuid ? FaceTimeSessionManager().findSession(callUuid) : null;
+        const existingSession = FaceTimeSessionManager().findSession(callUuid, uniqueProxyIdentifier);
         if (existingSession) {
             existingSession.update(FaceTimeSession.fromEvent(eventData));
             if (existingSession.status === FaceTimeSessionStatus.DISCONNECTED) {
-                FaceTimeAudioBridge.getInstance().cleanupSession(callUuid);
+                const bridge = FaceTimeAudioBridge.getInstance();
+                if (existingSession.callUuid) bridge.cleanupSession(existingSession.callUuid);
+                if (callUuid && callUuid !== existingSession.callUuid) bridge.cleanupSession(callUuid);
             }
             FaceTimeSessionManager().broadcastUpdate(existingSession);
             return;
@@ -57,7 +60,8 @@ export class PrivateApiFaceTimeStatusHandler extends Loggable implements Private
     async handleCalling(data: EventData) {
         const eventData = data?.data ?? {};
         const statusId = eventData.call_status ?? eventData.status_id;
-        const callUuid = eventData.call_uuid ?? null;
+        const uniqueProxyIdentifier = eventData.unique_proxy_identifier ?? eventData.uniqueProxyIdentifier ?? null;
+        const callUuid = eventData.call_uuid ?? eventData.callUUID ?? uniqueProxyIdentifier ?? null;
         const rawAddress = eventData.handle?.value ?? null;
 
         let serializedHandle = null;
@@ -74,7 +78,7 @@ export class PrivateApiFaceTimeStatusHandler extends Loggable implements Private
         const incomingSession = FaceTimeSession.fromEvent(eventData, false);
         incomingSession.handle = serializedHandle;
 
-        let session = callUuid ? FaceTimeSessionManager().findSession(callUuid) : null;
+        let session = FaceTimeSessionManager().findSession(callUuid, uniqueProxyIdentifier);
         let isNew = false;
         if (session) {
             session.update(incomingSession);
@@ -88,18 +92,18 @@ export class PrivateApiFaceTimeStatusHandler extends Loggable implements Private
                 session.answeredAt = new Date();
                 session.touch();
             }
-            this.log.info(`FaceTime call answered (Call UUID: ${callUuid})`);
+            this.log.info(`FaceTime call answered (Call UUID: ${session.callUuid ?? callUuid})`);
         } else if (statusId === FaceTimeSessionStatus.OUTGOING) {
-            this.log.info(`Outgoing FaceTime call to ${rawAddress ?? "unknown"} (Call UUID: ${callUuid})`);
+            this.log.info(`Outgoing FaceTime call to ${rawAddress ?? "unknown"} (Call UUID: ${session.callUuid ?? callUuid})`);
         } else if (statusId === FaceTimeSessionStatus.INCOMING) {
             if (!isNew || eventData.is_outgoing) {
                 return;
             }
-            this.log.info(`Incoming FaceTime call from ${rawAddress ?? "unknown"} (Call UUID: ${callUuid})`);
+            this.log.info(`Incoming FaceTime call from ${rawAddress ?? "unknown"} (Call UUID: ${session.callUuid ?? callUuid})`);
         } else if (session.status === FaceTimeSessionStatus.DISCONNECTED) {
-            if (callUuid) {
-                FaceTimeAudioBridge.getInstance().cleanupSession(callUuid);
-            }
+            const bridge = FaceTimeAudioBridge.getInstance();
+            if (session.callUuid) bridge.cleanupSession(session.callUuid);
+            if (callUuid && callUuid !== session.callUuid) bridge.cleanupSession(callUuid);
             if (rawAddress) {
                 this.log.info(
                     `FaceTime call disconnected with ${rawAddress}` +

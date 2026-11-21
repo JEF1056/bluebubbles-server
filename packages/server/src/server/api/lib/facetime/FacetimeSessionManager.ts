@@ -16,19 +16,18 @@ class FaceTimeSessionManagerSingleton {
 
     private lastBroadcastSignatures: Map<string, string> = new Map();
 
-    findSession(callUuid: string): FaceTimeSession {
-        if (!callUuid) return null;
-        const normalized = callUuid.toLowerCase();
-        return this.sessions.find(
-            session =>
-                (session.callUuid ?? "").toLowerCase() === normalized ||
-                (session.uuid ?? "").toLowerCase() === normalized
+    findSession(callUuid: string, ...aliases: Array<string | null | undefined>): FaceTimeSession {
+        const candidates = [callUuid, ...aliases].filter(
+            (id): id is string => typeof id === "string" && id.trim().length > 0
+        );
+        if (candidates.length === 0) return null;
+        return (
+            this.sessions.find(session => candidates.some(id => session.matchesIdentifier(id))) ?? null
         );
     }
 
     addSession(session: FaceTimeSession): boolean {
-        const lookupKey = session?.callUuid || session?.uuid;
-        const existingSession = lookupKey ? this.findSession(lookupKey) : null;
+        const existingSession = this.findSession(session?.callUuid, session?.uniqueProxyIdentifier, session?.uuid);
         const isNew = !existingSession;
 
         if (existingSession) {
