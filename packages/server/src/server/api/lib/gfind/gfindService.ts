@@ -209,6 +209,7 @@ export class GoogleFindService {
             clearInterval(this.pollTimer);
             this.pollTimer = null;
         }
+        this.locateSkipped = false;
         for (const w of this.pendingWaiters) {
             clearTimeout(w.timer);
             w.resolve(false);
@@ -345,6 +346,7 @@ export class GoogleFindService {
     }
 
     async refreshDevices(targetDeviceId?: string, options?: { force?: boolean }): Promise<FindMyDevice[]> {
+        this.locateSkipped = false;
         if (!this.auth.isSignedIn()) {
             return this.cachedDevices;
         }
@@ -469,23 +471,28 @@ export class GoogleFindService {
     }
 
     onClientConnected(): void {
-        if (!this.locateSkipped) return;
+        if (!this.pollTimer || !this.locateSkipped) return;
         this.locateSkipped = false;
         void this.pollAllDevices();
     }
 
     private async pollAllDevices(): Promise<void> {
         if (!this.isEnabled() || !this.auth.isSignedIn()) return;
-        if (!(this.deps.hasActiveClients ?? defaultHasActiveClients)()) {
+        const hasClients = (this.deps.hasActiveClients ?? defaultHasActiveClients)();
+        if (!hasClients && this.cachedDevices.length > 0) {
             this.locateSkipped = true;
             return;
         }
-        this.locateSkipped = false;
         try {
             const metadataList = await this.client.listDevices();
             await this.applyMetadataList(metadataList, true);
             this.lastSyncAt = this.now();
             this.lastError = null;
+            if (!hasClients) {
+                this.locateSkipped = true;
+                return;
+            }
+            this.locateSkipped = false;
 
             const fcmToken = this.auth.getState().fcmToken ?? undefined;
             const minInterval = this.deps.minLocateIntervalMs ?? MIN_LOCATE_INTERVAL_MS;

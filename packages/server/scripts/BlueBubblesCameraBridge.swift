@@ -453,14 +453,13 @@ final class H264Decoder {
         }
 
         lock.lock()
+        defer { lock.unlock() }
         if invalidated {
-            lock.unlock()
             return
         }
         if let sps = latestSPS, let pps = latestPPS {
             if decompressionSession == nil || sps != activeSPS || pps != activePPS {
                 if !configureSession(sps: sps, pps: pps) {
-                    lock.unlock()
                     return
                 }
             }
@@ -469,10 +468,8 @@ final class H264Decoder {
         guard !vclNalus.isEmpty,
               let session = decompressionSession,
               let fmtDesc = formatDescription else {
-            lock.unlock()
             return
         }
-        lock.unlock()
 
         var avccData = Data()
         avccData.reserveCapacity(accessUnit.count + vclNalus.count * 4)

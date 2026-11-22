@@ -289,15 +289,15 @@ final class AudioBridge {
             guard let self = self else { return }
             var delay: TimeInterval = 0.5
             var elapsed: TimeInterval = 0
-            let maxWait: TimeInterval = 60.0
+            var loggedSlowWait = false
             while self.running && self.tapID == kAudioObjectUnknown {
                 let procIDs = getProcessObjectIDs(matching: targetBundleIDs)
                 if !procIDs.isEmpty, self.createProcessTap(processObjectIDs: procIDs) {
                     return
                 }
-                if elapsed >= maxWait {
-                    fputs("[BlueBubblesAudioBridge] Timed out waiting for FaceTime audio process tap after \(Int(maxWait))s\n", stderr)
-                    return
+                if !loggedSlowWait && elapsed >= 60.0 {
+                    loggedSlowWait = true
+                    fputs("[BlueBubblesAudioBridge] Still waiting for FaceTime audio process tap after 60s; continuing retry every 5s\n", stderr)
                 }
                 Thread.sleep(forTimeInterval: delay)
                 elapsed += delay

@@ -9,6 +9,7 @@ export type ProcessSpawnerConstructorArgs = {
     verbose?: boolean;
     onOutput?: ((data: any) => void) | null;
     onExit?: ((code: number) => void) | null;
+    onMaxRetriesExhausted?: (() => void) | null;
     logTag?: string | null;
     restartOnNonZeroExit?: boolean;
     restartOnNonZeroExitCondition?: ((code: number) => boolean) | null;
@@ -62,6 +63,8 @@ export class ProcessSpawner extends Loggable {
 
     onExit: ((code: number) => void) | null;
 
+    onMaxRetriesExhausted: (() => void) | null;
+
     private _output: ProcessSpawnerOutput[] = [];
 
     private restartTimer: NodeJS.Timeout | null = null;
@@ -104,6 +107,7 @@ export class ProcessSpawner extends Loggable {
         verbose = false,
         onOutput = null,
         onExit = null,
+        onMaxRetriesExhausted = null,
         logTag = null,
         restartOnNonZeroExit = false,
         restartOnNonZeroExitCondition = null,
@@ -119,6 +123,7 @@ export class ProcessSpawner extends Loggable {
         this.verbose = verbose;
         this.onOutput = onOutput;
         this.onExit = onExit;
+        this.onMaxRetriesExhausted = onMaxRetriesExhausted;
         this.restartOnNonZeroExit = restartOnNonZeroExit;
         this.restartOnNonZeroExitCondition = restartOnNonZeroExitCondition;
         this.storeOutput = storeOutput;
@@ -241,6 +246,7 @@ export class ProcessSpawner extends Loggable {
                 }
                 if (this.retryCount >= MAX_RESTART_RETRIES) {
                     this.log.warn(`Max restart retries (${MAX_RESTART_RETRIES}) reached for ${this.command}; not restarting.`);
+                    this.onMaxRetriesExhausted?.();
                     return;
                 }
 

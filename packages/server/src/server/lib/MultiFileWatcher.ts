@@ -16,7 +16,7 @@ export class MultiFileWatcher extends EventEmitter {
 
     private readonly filePaths: string[];
 
-    private watchers: fs.FSWatcher[] = [];
+    private watchers = new Map<string, fs.FSWatcher>();
 
     private previousStats: Record<string, FileStat> = {};
 
@@ -32,35 +32,67 @@ export class MultiFileWatcher extends EventEmitter {
     }
 
     private watchFile(filePath: string) {
-        // Load the initial stats if the file exists
-        if (fs.existsSync(filePath)) {
-            this.previousStats[filePath] = fs.statSync(filePath);
+        const existing = this.watchers.get(filePath);
+        if (existing) {
+            existing.close();
+            this.watchers.delete(filePath);
         }
+
+        if (!fs.existsSync(filePath)) {
+            this.emit("error", new Error(`Watched file does not exist: ${filePath}`));
+            return;
+        }
+
+        // Load the initial stats if the file exists
+        this.previousStats[filePath] = fs.statSync(filePath);
 
         const watcher = fs.watch(filePath, { encoding: "utf8", persistent: false, recursive: false });
         watcher.on("change", async (eventType, _) => {
+            if (eventType === "rename") {
+                try {
+                    const prevStat = this.previousStats[filePath];
+                    this.watchFile(filePath);
+                    if (fs.existsSync(filePath)) {
+                        const currentStat = await fs.promises.stat(filePath);
+                        this.emit("change", {
+                            filePath,
+                            prevStat: prevStat ? { ...prevStat } : undefined,
+                            currentStat: { ...currentStat }
+                        });
+                        this.previousStats[filePath] = currentStat;
+                    }
+                } catch (err) {
+                    this.emit("error", err);
+                }
+                return;
+            }
             if (eventType !== "change") return;
 
-            const currentStat = await fs.promises.stat(filePath);
-            this.emit("change", {
-                filePath,
-                prevStat: { ...this.previousStats[filePath] },
-                currentStat: { ...currentStat }
-            });
+            try {
+                const currentStat = await fs.promises.stat(filePath);
+                this.emit("change", {
+                    filePath,
+                    prevStat: { ...this.previousStats[filePath] },
+                    currentStat: { ...currentStat }
+                });
 
-            this.previousStats[filePath] = currentStat;
+                this.previousStats[filePath] = currentStat;
+            } catch (err) {
+                this.emit("error", err);
+            }
         });
 
         watcher.on("error", error => {
             this.emit("error", error);
         });
 
-        this.watchers.push(watcher);
+        this.watchers.set(filePath, watcher);
     }
 
     stop() {
-        for (const watcher of this.watchers) {
+        for (const watcher of this.watchers.values()) {
             watcher.close();
         }
+        this.watchers.clear();
     }
 }

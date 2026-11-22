@@ -12,7 +12,7 @@ export class CaffeinateService extends Loggable {
 
     isCaffeinated = false;
 
-    childProc: ChildProcessWithoutNullStreams;
+    childProc: ChildProcessWithoutNullStreams | null;
 
     /**
      * Runs caffeinate until the current process is killed
@@ -25,15 +25,17 @@ export class CaffeinateService extends Loggable {
         // -i: Create an assertion to prevent the system from idle sleeping.
         // -s: Create an assertion to prevent the system from sleeping
         // -w: Waits for the process with the specified pid to exit.
-        this.childProc = spawn("caffeinate", ["-i", "-s", "-w", myPid.toString()], { detached: true });
-        this.log.info(`Spawned Caffeinate with PID: ${this.childProc.pid}`);
+        const proc = spawn("caffeinate", ["-i", "-s", "-w", myPid.toString()], { detached: true });
+        this.childProc = proc;
+        this.log.info(`Spawned Caffeinate with PID: ${proc.pid}`);
         this.isCaffeinated = true;
 
-        // Setup listeners
-        this.childProc.on("close", this.handleChildClose);
-        this.childProc.on("exit", this.handleChildClose);
-        this.childProc.on("disconnect", this.handleChildClose);
-        this.childProc.on("error", this.handleChildClose);
+        // Setup listeners bound to this specific child so stale close events cannot clear a newer child
+        const onChildClose = () => this.onClose(proc);
+        proc.on("close", onChildClose);
+        proc.on("exit", onChildClose);
+        proc.on("disconnect", onChildClose);
+        proc.on("error", onChildClose);
     }
 
     /**
@@ -51,20 +53,17 @@ export class CaffeinateService extends Loggable {
                 this.log.error(`Failed to kill caffeinate process! ${ex.message}`);
             } finally {
                 this.isCaffeinated = false;
+                this.childProc = null;
             }
         }
     }
 
-    private readonly handleChildClose = (msg: any) => {
-        this.onClose(msg);
-    };
-
     /**
      * Method to let us know that the caffeinate process has ended
-     *
-     * @param _ The message returned by the EventEmitter
      */
-    private onClose(msg: any) {
+    private onClose(proc: ChildProcessWithoutNullStreams) {
+        if (proc !== this.childProc) return;
         this.isCaffeinated = false;
+        this.childProc = null;
     }
 }

@@ -113,8 +113,15 @@ export class FindMyInterface {
 
         const enableUtag = Boolean(Server().repo?.getConfig("enable_utag"));
         const enableGfind = Boolean(Server().repo?.getConfig("enable_gfind"));
-        const utagDevices = enableUtag ? utagService.getCachedDevices() : [];
-        const gfindDevices = enableGfind ? gfindService.getCachedDevices() : [];
+        let utagDevices = enableUtag ? utagService.getCachedDevices() : [];
+        if (enableUtag && utagDevices.length === 0) {
+            utagDevices = await utagService.refreshDevices().catch(() => []);
+        }
+        let gfindDevices = enableGfind ? gfindService.getCachedDevices() : [];
+        if (enableGfind && gfindDevices.length === 0) {
+            await gfindService.refreshDevices().catch(() => []);
+            gfindDevices = gfindService.getCachedDevices();
+        }
 
         if (appleDevices == null && !enableUtag && !enableGfind) {
             return null;

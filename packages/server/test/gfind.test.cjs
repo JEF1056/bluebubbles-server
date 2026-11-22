@@ -2070,8 +2070,12 @@ test("GoogleFindService (G1) skips passive locate when 0 sockets connected and l
 
         activeClients = true;
         fakeNow += 15_000;
+        const dummyTimer = setInterval(() => {}, 60_000);
+        dummyTimer.unref?.();
+        service["pollTimer"] = dummyTimer;
         service.onClientConnected();
         await new Promise(r => setTimeout(r, 30));
+        service.stop();
         assert.deepEqual(locateIds, ["android-g1"]);
         assert.equal(service["locateSkipped"], false);
 

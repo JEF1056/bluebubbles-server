@@ -233,10 +233,10 @@ final class VideoBridge: NSObject, SCStreamOutput, SCStreamDelegate {
     private var activeWindowID: CGWindowID?
     private var running = true
     private var acquiring = false
+    private var reacquireScheduled = false
+    private var reacquireWorkItem: DispatchWorkItem?
     private var reacquireDelay: TimeInterval = 0.5
-    private var reacquireElapsed: TimeInterval = 0
     private let maxReacquireDelay: TimeInterval = 5.0
-    private let maxReacquireWait: TimeInterval = 60.0
 
     func start() {
         log("Starting FaceTime video downlink bridge")
@@ -268,6 +268,9 @@ final class VideoBridge: NSObject, SCStreamOutput, SCStreamDelegate {
     func stop() {
         stateQueue.async {
             self.running = false
+            self.reacquireWorkItem?.cancel()
+            self.reacquireWorkItem = nil
+            self.reacquireScheduled = false
             self.teardownCaptureLocked()
             exit(0)
         }
@@ -314,19 +317,18 @@ final class VideoBridge: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func scheduleReacquireLocked() {
-        guard running else { return }
-        if reacquireElapsed >= maxReacquireWait {
-            log("Timed out waiting to reacquire FaceTime window after \(Int(maxReacquireWait))s; stopping")
-            running = false
-            teardownCaptureLocked()
-            exit(0)
-        }
+        guard running, !reacquireScheduled else { return }
+        reacquireScheduled = true
         let delay = reacquireDelay
-        reacquireElapsed += delay
         reacquireDelay = min(maxReacquireDelay, reacquireDelay * 2.0)
-        stateQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
-            self?.acquireLoop()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.reacquireScheduled = false
+            self.reacquireWorkItem = nil
+            self.acquireLoop()
         }
+        reacquireWorkItem = workItem
+        stateQueue.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
     private func selectFaceTimeWindow(from windows: [SCWindow]) -> SCWindow? {
@@ -385,8 +387,10 @@ final class VideoBridge: NSObject, SCStreamOutput, SCStreamDelegate {
                     self.teardownCaptureLocked()
                     self.scheduleReacquireLocked()
                 } else {
+                    self.reacquireWorkItem?.cancel()
+                    self.reacquireWorkItem = nil
+                    self.reacquireScheduled = false
                     self.reacquireDelay = 0.5
-                    self.reacquireElapsed = 0
                     log("Capturing FaceTime window \(window.windowID) at \(dims.width)x\(dims.height)")
                 }
             }

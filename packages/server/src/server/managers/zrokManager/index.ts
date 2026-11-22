@@ -37,7 +37,7 @@ export class ZrokManager extends Loggable {
             return await this.connectHandler();
         } catch (ex) {
             this.log.error(`Failed to run Zrok daemon! ${ex.toString()}`);
-            this.emit("error", ex);
+            this.handleError(ex);
         }
 
         return null;
@@ -152,7 +152,11 @@ export class ZrokManager extends Loggable {
     }
 
     handleError(chunk: any) {
-        this.emit("error", chunk);
+        if (this.listenerCount("error") > 0) {
+            this.emit("error", chunk);
+        } else {
+            this.log.error(typeof chunk === "string" ? chunk : chunk?.message ?? String(chunk));
+        }
     }
 
     static async getInvite(email: string): Promise<void> {

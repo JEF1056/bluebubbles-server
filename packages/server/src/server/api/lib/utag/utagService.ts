@@ -102,6 +102,7 @@ export class UTagService {
     private lastSyncAt: number | null = null;
     private lastError: string | null = null;
     private needsPin = false;
+    private pollSkipped = false;
     private pendingAuth: {
         state: string;
         codeVerifier: string;
@@ -294,12 +295,21 @@ export class UTagService {
     start(): void {
         if (this.pollTimer) return;
         const state = this.ensureLoaded();
-        if (state.tokens?.iotToken && this.hasActiveClients()) {
-            void this.refreshDevices().catch(() => undefined);
+        if (state.tokens?.iotToken) {
+            if (this.hasActiveClients()) {
+                this.pollSkipped = false;
+                void this.refreshDevices().catch(() => undefined);
+            } else {
+                this.pollSkipped = true;
+            }
         }
         this.pollTimer = setInterval(() => {
-            if (this.ensureLoaded().tokens?.iotToken && this.hasActiveClients()) {
+            if (!this.ensureLoaded().tokens?.iotToken) return;
+            if (this.hasActiveClients()) {
+                this.pollSkipped = false;
                 void this.refreshDevices().catch(() => undefined);
+            } else {
+                this.pollSkipped = true;
             }
         }, this.pollIntervalMs);
         this.pollTimer.unref?.();
@@ -307,7 +317,8 @@ export class UTagService {
 
     onClientConnected(): void {
         if (!this.pollTimer || !this.ensureLoaded().tokens?.iotToken) return;
-        if (this.cachedDevices.length === 0) {
+        if (this.cachedDevices.length === 0 || this.pollSkipped) {
+            this.pollSkipped = false;
             void this.refreshDevices().catch(() => undefined);
         }
     }

@@ -538,6 +538,7 @@ class BlueBubblesServer extends EventEmitter {
      *
      */
     async startServices(): Promise<void> {
+        this.isStopping = false;
         try {
             this.logger.info("Starting HTTP service...");
             this.httpService.initialize();

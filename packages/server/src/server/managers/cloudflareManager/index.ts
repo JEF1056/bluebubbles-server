@@ -36,7 +36,7 @@ export class CloudflareManager extends Loggable {
             return this.connectHandler();
         } catch (ex) {
             this.log.error(`Failed to run Cloudflare daemon! ${ex.toString()}`);
-            this.emit("error", ex);
+            this.emitError(ex);
         }
 
         return null;
@@ -89,6 +89,13 @@ export class CloudflareManager extends Loggable {
                     onOutput: (data) => this.handleData(data),
                     restartOnNonZeroExit: true,
                     restartOnNonZeroExitCondition: (_) => !this.isRateLimited,
+                    onMaxRetriesExhausted: () => {
+                        if (!this.isRestarting) {
+                            this.isRestarting = true;
+                            this.log.debug("Cloudflare ProcessSpawner reached max restart retries. Restarting proxy service...");
+                            this.emit("needs-restart", true);
+                        }
+                    },
                     waitForExit: false,
                     storeOutput: false
                 });
@@ -211,6 +218,10 @@ export class CloudflareManager extends Loggable {
     }
 
     emitError(err: any) {
-        this.emit("error", err);
+        if (this.listenerCount("error") > 0) {
+            this.emit("error", err);
+        } else {
+            this.log.error(typeof err === "string" ? err : err?.message ?? String(err));
+        }
     }
 }
