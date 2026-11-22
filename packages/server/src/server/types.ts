@@ -80,6 +80,16 @@ export type MessageResponse = {
     shareStatus?: number | null;
     shareDirection?: number | null;
     service?: string;
+    translation?: MessageTranslationResponse;
+};
+
+export type MessageTranslationResponse = {
+    text: string;
+    sourceLanguage: string;
+    targetLanguage: string;
+    provider: string;
+    autoTranslated: boolean;
+    dateTranslated: number;
 };
 
 export type HandleResponse = {

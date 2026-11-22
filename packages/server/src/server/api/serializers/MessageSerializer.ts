@@ -98,6 +98,21 @@ export class MessageSerializer {
             }
         }
 
+        // Batch-hydrate cached translations for incoming messages
+        try {
+            const cachedTranslations = await Server()?.translationService?.getCachedForMessages(messages);
+            if (cachedTranslations && cachedTranslations.size > 0) {
+                for (let i = 0; i < messages.length; i++) {
+                    const translation = cachedTranslations.get(messages[i]?.guid);
+                    if (translation) {
+                        messageResponses[i].translation = translation;
+                    }
+                }
+            }
+        } catch (ex: any) {
+            Server()?.log(`Failed to hydrate message translations: ${ex?.message ?? String(ex)}`, "debug");
+        }
+
         if (config.enforceMaxSize) {
             const strData = JSON.stringify(messageResponses);
             const len = Buffer.byteLength(strData, "utf8");

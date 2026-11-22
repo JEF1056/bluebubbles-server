@@ -490,6 +490,8 @@ export class ChatInterface {
         if (!success) {
             throw new Error(`Failed to delete chat! Chat still exists. (GUID: ${theChat.guid})`);
         }
+
+        await Server()?.translationService?.deleteForChat(theChat.guid);
     }
 
     static async setGroupChatIcon(chat: Chat, iconPath: string | null): Promise<void> {
@@ -663,6 +665,7 @@ export class ChatInterface {
 
     static async deleteChatMessage(chat: Chat, message: Message): Promise<void> {
         await Server().privateApi.chat.deleteMessage(chat.guid, message.guid);
+        await Server()?.translationService?.deleteForMessage(message.guid);
     }
 
     static async canShareContactInfo(chatGuid: string): Promise<boolean> {

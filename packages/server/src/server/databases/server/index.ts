@@ -4,7 +4,17 @@ import { EventEmitter } from "events";
 import { DataSource } from "typeorm";
 import { Server } from "@server";
 import { isEmpty, isNotEmpty } from "@server/helpers/utils";
-import { Config, Alert, Device, Queue, Webhook, Contact, ContactAddress, ScheduledMessage } from "./entity";
+import {
+    Config,
+    Alert,
+    Device,
+    Queue,
+    Webhook,
+    Contact,
+    ContactAddress,
+    ScheduledMessage,
+    MessageTranslation
+} from "./entity";
 import { DEFAULT_DB_ITEMS } from "./constants";
 import {
     DEFAULT_WEBHOOK_SECURITY_OPTIONS,
@@ -13,6 +23,7 @@ import {
 import { ContactTables1654432080899 } from "./migrations/1654432080899-ContactTables";
 import { ScheduledMessageTable1665083072000 } from "./migrations/1665083072000-ScheduledMessageTable";
 import { WebhookSecurityOptions1792972800000 } from "./migrations/1792972800000-WebhookSecurityOptions";
+import { MessageTranslationTable1793059200000 } from "./migrations/1793059200000-MessageTranslationTable";
 
 export type ServerConfig = { [key: string]: Date | string | boolean | number };
 export type ServerConfigChange = { prevConfig: ServerConfig; nextConfig: ServerConfig };
@@ -48,11 +59,22 @@ export class ServerRepository extends EventEmitter {
             name: "config",
             type: "better-sqlite3",
             database: dbPath,
-            entities: [Config, Alert, Device, Queue, Webhook, Contact, ContactAddress, ScheduledMessage],
+            entities: [
+                Config,
+                Alert,
+                Device,
+                Queue,
+                Webhook,
+                Contact,
+                ContactAddress,
+                ScheduledMessage,
+                MessageTranslation
+            ],
             migrations: [
                 ContactTables1654432080899,
                 ScheduledMessageTable1665083072000,
-                WebhookSecurityOptions1792972800000
+                WebhookSecurityOptions1792972800000,
+                MessageTranslationTable1793059200000
             ],
             migrationsRun: !shouldSync,
             migrationsTableName: "migrations",
@@ -121,6 +143,13 @@ export class ServerRepository extends EventEmitter {
      */
     scheduledMessages() {
         return this.db.getRepository(ScheduledMessage);
+    }
+
+    /**
+     * Get the message translations repo
+     */
+    messageTranslations() {
+        return this.db.getRepository(MessageTranslation);
     }
 
     private async loadConfig() {

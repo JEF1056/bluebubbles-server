@@ -42,6 +42,8 @@ import { FindMyRouter } from "./routers/findmyRouter";
 import { getLogger } from "@server/lib/logging/Loggable";
 import { WebhookRouter } from "./routers/webhookRouter";
 import { WebhookValidator } from "./validators/webhookValidator";
+import { TranslationRouter } from "./routers/translationRouter";
+import { TranslationValidator } from "./validators/translationValidator";
 
 export class HttpRoutes {
     static version = 1;
@@ -582,6 +584,12 @@ export class HttpRoutes {
                     },
                     {
                         method: HttpMethod.POST,
+                        path: ":guid/translate",
+                        validators: [MessageValidator.validateTranslate],
+                        controller: MessageRouter.translateMessage
+                    },
+                    {
+                        method: HttpMethod.POST,
                         path: ":guid/notify",
                         middleware: [...HttpRoutes.protected, PrivateApiMiddleware],
                         controller: MessageRouter.notify
@@ -806,6 +814,29 @@ export class HttpRoutes {
                         method: HttpMethod.DELETE,
                         path: ":id",
                         controller: WebhookRouter.delete
+                    }
+                ]
+            },
+            {
+                name: "Translation",
+                middleware: HttpRoutes.protected,
+                prefix: "translation",
+                routes: [
+                    {
+                        method: HttpMethod.GET,
+                        path: "config",
+                        controller: TranslationRouter.getConfig
+                    },
+                    {
+                        method: HttpMethod.POST,
+                        path: "config",
+                        validators: [TranslationValidator.validateConfig],
+                        controller: TranslationRouter.updateConfig
+                    },
+                    {
+                        method: HttpMethod.DELETE,
+                        path: "cache",
+                        controller: TranslationRouter.clearCache
                     }
                 ]
             }

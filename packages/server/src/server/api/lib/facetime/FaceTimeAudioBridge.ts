@@ -357,7 +357,7 @@ export class FaceTimeAudioBridge extends Loggable {
         return servers;
     }
 
-    private static resolveToolBinary(binaryName: string): string | null {
+    static resolveToolBinary(binaryName: string): string | null {
         const candidates = [
             path.join(FileSystem.resources, "macos", "tools", binaryName),
             path.resolve(__dirname, "../../../../../../appResources/macos/tools", binaryName),

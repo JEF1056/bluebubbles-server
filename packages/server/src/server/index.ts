@@ -31,7 +31,8 @@ import {
     WebhookService,
     ScheduledMessagesService,
     OauthService,
-    ZrokService
+    ZrokService,
+    TranslationService
 } from "@server/services";
 import { EventCache } from "@server/eventCache";
 import { runTerminalScript, openSystemPreferences, startMessages } from "@server/api/apple/scripts";
@@ -168,6 +169,8 @@ class BlueBubblesServer extends EventEmitter {
     webhookService: WebhookService;
 
     oauthService: OauthService;
+
+    translationService: TranslationService;
 
     actionHandler: ActionHandler;
 
@@ -530,6 +533,13 @@ class BlueBubblesServer extends EventEmitter {
             this.scheduledMessages = new ScheduledMessagesService();
         } catch (ex: any) {
             this.logger.error(`Failed to start Scheduled Message service! ${ex?.message ?? String(ex)}}`);
+        }
+
+        try {
+            this.logger.info("Initializing Translation Service...");
+            this.translationService = new TranslationService();
+        } catch (ex: any) {
+            this.logger.error(`Failed to start Translation service! ${ex?.message ?? String(ex)}`);
         }
     }
 
@@ -1427,6 +1437,7 @@ class BlueBubblesServer extends EventEmitter {
             // re-checking the database. Only the two GUIDs are sent: the client
             // already holds the message, and this also goes out over FCM.
             this.logger.info(`Message deleted on Apple [${item.messageGuid}]`);
+            await this.translationService?.deleteForMessage(item.messageGuid);
             await Server().emitMessage(MESSAGE_DELETED, item);
         });
 
@@ -1441,6 +1452,7 @@ class BlueBubblesServer extends EventEmitter {
             // for chats previously observed non-empty), so this can be trusted to
             // mirror Apple's deletion without re-checking the database.
             this.logger.info(`Chat deleted on Apple [${item.guid}]`);
+            await this.translationService?.deleteForChat(item.guid);
             await Server().emitMessage(CHAT_DELETED, {
                 chatGuid: item.guid
             });
@@ -1684,6 +1696,43 @@ class BlueBubblesServer extends EventEmitter {
             true,
             false
         );
+
+        // Auto-translate off the critical NEW_MESSAGE delivery path
+        void this.translationService
+            ?.handleNewMessage(newMessage)
+            .then(async translated => {
+                if (!translated) return;
+                this.httpService?.socketServer.emit(
+                    MESSAGE_UPDATED,
+                    await MessageSerializer.serialize({
+                        message: newMessage,
+                        config: {
+                            parseAttributedBody: true,
+                            parseMessageSummary: true,
+                            parsePayloadData: true,
+                            loadChatParticipants: false,
+                            includeChats: true
+                        }
+                    })
+                );
+                await this.emitMessage(
+                    MESSAGE_UPDATED,
+                    await MessageSerializer.serialize({
+                        message: newMessage,
+                        config: {
+                            loadChatParticipants: false,
+                            includeChats: false
+                        },
+                        isForNotification: true
+                    }),
+                    "normal",
+                    true,
+                    false
+                );
+            })
+            .catch(ex => {
+                this.logger.debug(`Async auto-translate emit failed: ${ex?.message ?? String(ex)}`);
+            });
     }
 
     private async handleUpdatedMessage(item: Message) {
@@ -1697,6 +1746,8 @@ class BlueBubblesServer extends EventEmitter {
         const content = msg.contentString();
         const localeTime = msg.lastUpdateTime?.toLocaleString();
         this.logger.info(`${msg.messageStatus} message from [${from}]: [${content}] - [${localeTime}]`);
+
+        await this.translationService?.handleUpdatedMessage(msg);
 
         // Manually send the message to the socket so we can serialize it with
         // all the extra data

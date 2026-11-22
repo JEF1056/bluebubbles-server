@@ -12,9 +12,11 @@ import { MessagePromiseRejection } from "@server/managers/outgoingMessageManager
 import { MessageSerializer } from "@server/api/serializers/MessageSerializer";
 import { arrayHasOne } from "@server/utils/CollectionUtils";
 import { FileStream, Success } from "../responses/success";
-import { BadRequest, IMessageError, NotFound } from "../responses/errors";
+import { BadRequest, IMessageError, NotFound, ServerError } from "../responses/errors";
 import { parseWithQuery } from "../utils";
 import { isMinVentura } from "@server/env";
+import { MESSAGE_UPDATED } from "@server/events";
+import { cleanTranslatableText } from "@server/services/translationService";
 
 export class MessageRouter {
     static async sentCount(ctx: RouterContext, _: Next) {
@@ -715,6 +717,54 @@ export class MessageRouter {
                     parsePayloadData: true
                 }
             })
+        }).send();
+    }
+
+    static async translateMessage(ctx: RouterContext, _: Next) {
+        const { guid } = ctx.params ?? {};
+        const { targetLanguage, force } = (ctx.request?.body ?? {}) as { targetLanguage?: string; force?: boolean };
+
+        const message = await Server().iMessageRepo.getMessage(guid, true, true);
+        if (!message) throw new NotFound({ error: "Message does not exist!" });
+        if (message.isFromMe) throw new BadRequest({ error: "Only incoming messages can be translated!" });
+        if (
+            message.dateRetracted != null ||
+            message.isFullyUnsent ||
+            isEmpty(cleanTranslatableText(message.universalText(true)))
+        ) {
+            throw new BadRequest({ error: "Message has no translatable text!" });
+        }
+
+        const outcome = await Server().translationService.translateMessage(message, {
+            targetLanguage,
+            force: Boolean(force),
+            autoTranslated: false
+        });
+        if (outcome.status === "failed") {
+            throw new ServerError({
+                message: "Failed to translate message!",
+                error: "Translation provider unavailable"
+            });
+        }
+
+        const serialized = await MessageSerializer.serialize({
+            message,
+            config: {
+                parseAttributedBody: true,
+                parseMessageSummary: true,
+                parsePayloadData: true,
+                loadChatParticipants: false,
+                includeChats: true
+            }
+        });
+
+        if (outcome.status === "translated") {
+            await Server().emitMessage(MESSAGE_UPDATED, serialized);
+        }
+
+        return new Success(ctx, {
+            message: outcome.status === "skipped" ? "No translation needed!" : "Successfully translated message!",
+            data: serialized
         }).send();
     }
 }

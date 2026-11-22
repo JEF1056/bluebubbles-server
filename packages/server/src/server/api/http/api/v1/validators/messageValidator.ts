@@ -298,6 +298,16 @@ export class MessageValidator {
         await next();
     }
 
+    static translateParamRules = {
+        targetLanguage: "string|min:2|max:35",
+        force: "boolean"
+    };
+
+    static async validateTranslate(ctx: RouterContext, next: Next) {
+        ValidateInput(ctx.request?.body ?? {}, MessageValidator.translateParamRules);
+        await next();
+    }
+
     static getEmbeddedMediaRules = {
         guid: "required|string"
     };

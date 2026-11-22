@@ -63,4 +63,7 @@ export const DEFAULT_DB_ITEMS: { [key: string]: () => any } = {
     enable_gfind: () => 0,
     // When disabled, webhooks registered through the REST API may not target local network addresses
     webhook_api_allow_private_addresses: () => 0,
+    auto_translate_enabled: () => 0,
+    translation_target_language: () => "en",
+    translation_cache_max_entries: () => 10000
 };
