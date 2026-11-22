@@ -19,6 +19,8 @@ export abstract class Proxy extends Loggable {
 
     refreshTimer: NodeJS.Timeout = null;
 
+    private restartInFlight: Promise<boolean> | null = null;
+
     /**
      * Determines if we "should" restart the service.
      * This means that we haven't had a recent connection.
@@ -146,6 +148,14 @@ export abstract class Proxy extends Loggable {
      * Helper for restarting the ngrok connection
      */
     async restart(): Promise<boolean> {
+        if (this.restartInFlight) return this.restartInFlight;
+        this.restartInFlight = this.performRestart().finally(() => {
+            this.restartInFlight = null;
+        });
+        return this.restartInFlight;
+    }
+
+    private async performRestart(): Promise<boolean> {
         try {
             await this.disconnect();
         } catch (ex: any) {

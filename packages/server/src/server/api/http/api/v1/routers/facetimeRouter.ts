@@ -10,6 +10,60 @@ import { CallMetadataOptions, FaceTimeInterface } from "@server/api/interfaces/f
 
 const execFileAsync = promisify(execFile);
 
+const BRIDGE_PROBE_CACHE_TTL_MS = 30_000;
+
+type BridgeProbeResult = {
+    binaryFound: boolean;
+    check: Record<string, any>;
+    videoSupported: boolean;
+    videoUplinkSupported: boolean;
+};
+
+let cachedBridgeProbe: { expiresAt: number; value: BridgeProbeResult } | null = null;
+let bridgeProbeInFlight: Promise<BridgeProbeResult> | null = null;
+
+async function getBridgeProbe(): Promise<BridgeProbeResult> {
+    const now = Date.now();
+    if (cachedBridgeProbe && now < cachedBridgeProbe.expiresAt) {
+        return cachedBridgeProbe.value;
+    }
+    if (bridgeProbeInFlight) return bridgeProbeInFlight;
+
+    bridgeProbeInFlight = (async () => {
+        const bin = FaceTimeAudioBridge.resolveHelperBinary();
+        let check: Record<string, any> = {
+            ok: false,
+            processTapSupported: false,
+            blackHoleFound: false,
+            targetProcessCount: 0
+        };
+        if (bin) {
+            try {
+                const { stdout } = await execFileAsync(bin, ["--check"], { timeout: 3000 });
+                check = JSON.parse(stdout.trim());
+            } catch (ex: any) {
+                check.error = ex?.message ?? String(ex);
+            }
+        }
+        const value: BridgeProbeResult = {
+            binaryFound: Boolean(bin),
+            check,
+            videoSupported: FaceTimeAudioBridge.isVideoSupported(),
+            videoUplinkSupported: FaceTimeAudioBridge.isVideoUplinkSupported()
+        };
+        if (value.binaryFound && value.check?.ok === true && !value.check?.error) {
+            cachedBridgeProbe = { expiresAt: Date.now() + BRIDGE_PROBE_CACHE_TTL_MS, value };
+        } else {
+            cachedBridgeProbe = null;
+        }
+        return value;
+    })().finally(() => {
+        bridgeProbeInFlight = null;
+    });
+
+    return bridgeProbeInFlight;
+}
+
 const extractMetadata = (body: Record<string, any> = {}): CallMetadataOptions => {
     const addresses = Array.isArray(body.addresses)
         ? body.addresses.map(String)
@@ -45,7 +99,7 @@ export class FaceTimeRouter {
     static async handoff(ctx: RouterContext, _: Next) {
         const body = (ctx.request.body ?? {}) as Record<string, any>;
         const modeRaw = body.mode;
-        const mode = modeRaw === "video" || modeRaw === "audio" ? modeRaw : undefined;
+        const mode = modeRaw === "video" || modeRaw === "audio" || modeRaw === "video_bridge" ? modeRaw : undefined;
         const data = await FaceTimeInterface.handoff(ctx.params.call_uuid, {
             deviceId: body.deviceId ?? body.device_id,
             deviceName: body.deviceName ?? body.device_name,
@@ -104,23 +158,17 @@ export class FaceTimeRouter {
     }
 
     static async bridgeStatus(ctx: RouterContext, _: Next) {
-        const bin = FaceTimeAudioBridge.resolveHelperBinary();
-        let check: Record<string, any> = { ok: false, processTapSupported: false, blackHoleFound: false, targetProcessCount: 0 };
-        if (bin) {
-            try {
-                const { stdout } = await execFileAsync(bin, ["--check"], { timeout: 3000 });
-                check = JSON.parse(stdout.trim());
-            } catch (ex: any) {
-                check.error = ex?.message ?? String(ex);
-            }
-        }
+        const probe = await getBridgeProbe();
         return new Success(ctx, {
             data: {
-                ...check,
-                binaryFound: Boolean(bin),
+                ...probe.check,
+                binaryFound: probe.binaryFound,
+                videoSupported: probe.videoSupported,
+                videoUplinkSupported: probe.videoUplinkSupported,
                 facetime_calling: Boolean(Server().repo.getConfig("facetime_calling")),
                 helper_connected: Boolean(Server().privateApi?.helper),
-                activeSessions: FaceTimeAudioBridge.getInstance().sessions.size
+                activeSessions: FaceTimeAudioBridge.getInstance().sessions.size,
+                iceServers: FaceTimeAudioBridge.getIceServers()
             }
         }).send();
     }

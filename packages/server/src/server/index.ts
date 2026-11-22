@@ -92,6 +92,7 @@ import { RecoverableMessagePoller } from "./databases/imessage/pollers/Recoverab
 import { obfuscatedHandle } from "./utils/StringUtils";
 import { AutoStartMethods } from "./databases/server/constants";
 import { MacOsInterface } from "./api/interfaces/macosInterface";
+import { FaceTimeAudioBridge } from "./api/lib/facetime/FaceTimeAudioBridge";
 
 const findProcess = require("find-process");
 
@@ -179,6 +180,8 @@ class BlueBubblesServer extends EventEmitter {
     pinnedChatsCache: PinnedChatsCache = new PinnedChatsCache();
 
     iMessageListener: IMessageListener;
+
+    msgCheckInterval: ScheduledService;
 
     hasSetup: boolean;
 
@@ -315,10 +318,13 @@ class BlueBubblesServer extends EventEmitter {
             this.setNotificationCount(this.notificationCount);
         }
 
-        this.emitToUI("new-log", {
-            message,
-            type: type ?? "log"
-        });
+        const isHiddenOrMinimized = this.window?.isVisible?.() === false || this.window?.isMinimized?.() === true;
+        if (!isHiddenOrMinimized) {
+            this.emitToUI("new-log", {
+                message,
+                type: type ?? "log"
+            });
+        }
     }
 
     setNotificationCount(count: number) {
@@ -366,7 +372,9 @@ class BlueBubblesServer extends EventEmitter {
             }
 
             // Set the value
-            this.logger.info(`[ENV] Setting config value ${normalizedKey} to ${value} (persist=${persist})`);
+            const isSecretKey = /password|secret|token|key|passphrase|auth/i.test(normalizedKey);
+            const loggedValue = isSecretKey ? "[REDACTED]" : value;
+            this.logger.info(`[ENV] Setting config value ${normalizedKey} to ${loggedValue} (persist=${persist})`);
             this.repo.setConfig(normalizedKey, value, persist);
         }
     }
@@ -651,12 +659,25 @@ class BlueBubblesServer extends EventEmitter {
             this.logger.error(`Failed to stop Google Find service! ${ex?.message ?? ex}`);
         }
 
+        try {
+            FaceTimeAudioBridge.getInstance().cleanupAllSessions();
+        } catch (ex: any) {
+            this.logger.error(`Failed to stop FaceTime bridge sessions! ${ex?.message ?? ex}`);
+        }
+
         this.logger.info("Finished stopping services...");
     }
 
     async stopServerComponents() {
         this.isStopping = true;
         this.logger.info("Stopping all server components...");
+
+        try {
+            this.msgCheckInterval?.stop();
+            this.msgCheckInterval = undefined;
+        } catch (ex: any) {
+            this.logger.info(`Failed to stop Messages check interval! ${ex?.message ?? ex}`);
+        }
 
         try {
             if (this.networkChecker) this.networkChecker.stop();
@@ -668,6 +689,12 @@ class BlueBubblesServer extends EventEmitter {
             if (this.caffeinate) this.caffeinate.stop();
         } catch (ex: any) {
             this.logger.info(`Failed to stop Caffeinate service! ${ex?.message ?? ex}`);
+        }
+
+        try {
+            this.updater?.stop();
+        } catch (ex: any) {
+            this.logger.info(`Failed to stop Update service! ${ex?.message ?? ex}`);
         }
 
         try {
@@ -911,13 +938,14 @@ class BlueBubblesServer extends EventEmitter {
             this.logger.warn(`Unable to start Messages.app! CLI Error: ${ex?.message ?? String(ex)}`);
         }
 
-        const msgCheckInterval = new ScheduledService(async () => {
+        this.msgCheckInterval?.stop();
+        this.msgCheckInterval = new ScheduledService(async () => {
             try {
                 // This won't start it if it's already open
                 await FileSystem.startMessages();
             } catch (ex: any) {
                 this.logger.info(`Unable to check if Messages.app is running! CLI Error: ${ex?.message ?? String(ex)}`);
-                msgCheckInterval.stop();
+                this.msgCheckInterval?.stop();
             }
         }, 150000); // Make sure messages is open every 2.5 minutes
 
@@ -1816,7 +1844,8 @@ class BlueBubblesServer extends EventEmitter {
         relaunchArgs = [process.execPath, ...relaunchArgs];
 
         // Kick off the restart script
-        FileSystem.executeAppleScript(runTerminalScript(relaunchArgs.join(" ")));
+        const shellQuote = (arg: string) => `'${arg.replace(/'/g, `'\\''`)}'`;
+        FileSystem.executeAppleScript(runTerminalScript(relaunchArgs.map(shellQuote).join(" ")));
 
         // Exit the current instance
         app.exit(0);

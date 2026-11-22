@@ -31,7 +31,7 @@ export class ZrokService extends Proxy {
     async connect(): Promise<string> {
         if (this.connectPromise) {
             this.log.debug("Already connecting to Zrok. Waiting for connection to complete.");
-            await this.connectPromise;
+            return await this.connectPromise;
         }
 
         const token = Server().repo.getConfig("zrok_token") as string;

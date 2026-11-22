@@ -10,7 +10,7 @@ import { Loggable } from "@server/lib/logging/Loggable";
 import { AsyncSingleton } from "@server/lib/decorators/AsyncSingletonDecorator";
 import { AsyncRetryer } from "@server/lib/decorators/AsyncRetryerDecorator";
 import { ProxyServices } from "@server/databases/server/constants";
-import { fitFcmDataPayload } from "./FcmPayload";
+import { fitFcmDataPayload, getFcmAndroidTtlMs } from "./FcmPayload";
 
 const AppName = "BlueBubbles";
 
@@ -458,15 +458,15 @@ export class FCMService extends Loggable {
                 return { responses: [], successCount: 0, failureCount: 0 };
             }
 
+            const ttl = getFcmAndroidTtlMs(fitted);
+
             // Build out the notification message
             const payload: admin.messaging.MulticastMessage = {
                 data: fitted,
                 tokens: devices,
                 android: {
                     priority,
-                    // 24 hour TTL (in milliseconds).
-                    // The Firebase library takes milliseconds, even though the docs say seconds
-                    ttl: 24 * 60 * 60 * 1000
+                    ttl
                 }
             };
 

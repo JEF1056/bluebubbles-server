@@ -20,6 +20,7 @@ import { PrivateApiAddressEventHandler } from "./eventHandlers/PrivateApiAddress
 import { PrivateApiFaceTimeStatusHandler } from "./eventHandlers/PrivateApiFaceTimeStatusHandler";
 import { PrivateApiCloud } from "./apis/PrivateApiCloud";
 import { PrivateApiFaceTime } from "./apis/PrivateApiFaceTime";
+import { ensureCameraHookInstalled } from "@server/api/lib/facetime/FaceTimeCameraHook";
 import { PrivateApiFindMyEventHandler } from "./eventHandlers/PrivateApiFindMyEventHandler";
 import { PrivateApiPinnedChatsEventHandler } from "./eventHandlers/PrivateApiPinnedChatsEventHandler";
 import { Socket } from "../types";
@@ -141,6 +142,11 @@ export class PrivateApiService extends Loggable {
             await this.modeType.install();
             this.mode = new this.modeType();
             await this.mode.start();
+
+            // Install the optional two-way FaceTime camera hook asynchronously so launchd kickstart never blocks startup
+            void ensureCameraHookInstalled().catch(err => {
+                this.log.debug(`FaceTime camera hook setup skipped: ${err?.message ?? String(err)}`);
+            });
         } catch (error: any) {
             this.log.error(`Failed to start Private API: ${error?.message ?? String(error)}`);
             return;
@@ -233,6 +239,7 @@ export class PrivateApiService extends Loggable {
     }
 
     async onEvent(serializedMessage: string, socket: net.Socket): Promise<void> {
+        if (socket.destroyed) return;
         if (!serializedMessage) {
             this.log.info("Received empty data from BlueBubblesHelper");
             return;
@@ -243,6 +250,7 @@ export class PrivateApiService extends Loggable {
             message = JSON.parse(serializedMessage);
         } catch (error) {
             this.log.info(`Failed to decode BlueBubblesHelper data: ${String(error)}`);
+            socket.destroy();
             return;
         }
 
@@ -287,8 +295,12 @@ export class PrivateApiService extends Loggable {
         socket.on("data", (chunk: Buffer | string) => {
             try {
                 for (const serializedMessage of messageBuffer.append(chunk)) {
+                    if (socket.destroyed) break;
                     messageProcessingQueue = messageProcessingQueue
-                        .then(() => this.onEvent(serializedMessage, socket))
+                        .then(() => {
+                            if (socket.destroyed) return;
+                            return this.onEvent(serializedMessage, socket);
+                        })
                         .catch((error: any) => {
                             this.log.warn(`Failed to process Private API message: ${error?.message ?? String(error)}`);
                         });

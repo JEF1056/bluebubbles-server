@@ -82,7 +82,14 @@ export class AppWindow extends Window {
                     FirebaseOAuthWindow.getInstance(details.url).build();
                 }   
             } else {
-                shell.openExternal(details.url);
+                try {
+                    const parsed = new URL(details.url);
+                    if (parsed.protocol === "http:" || parsed.protocol === "https:" || parsed.protocol === "mailto:") {
+                        shell.openExternal(details.url);
+                    }
+                } catch {
+                    // Ignore invalid URLs
+                }
             }
 
             return { action: "deny" };

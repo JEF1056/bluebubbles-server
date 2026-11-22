@@ -68,7 +68,6 @@ export class MacOsInterface {
                 }
 
                 results[i.chat_guid].totals[identifier] = i.media_count;
-                break;
             }
         };
 

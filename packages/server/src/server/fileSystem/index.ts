@@ -510,6 +510,7 @@ export class FileSystem {
     static saveFCMClient(contents: Record<string, any>): void {
         if (FileSystem.usingCustomFcm) {
             Server().log("Not saving FCM client file because custom FCM path is set", "debug");
+            return;
         }
 
         if (!fs.existsSync(FileSystem.fcmDir)) fs.mkdirSync(FileSystem.fcmDir);
@@ -529,6 +530,7 @@ export class FileSystem {
     static saveFCMServer(contents: Record<string, any>): void {
         if (FileSystem.usingCustomFcm) {
             Server().log("Not saving FCM server file because custom FCM path is set", "debug");
+            return;
         }
 
         if (!fs.existsSync(FileSystem.fcmDir)) fs.mkdirSync(FileSystem.fcmDir);
@@ -1060,10 +1062,6 @@ export class FileSystem {
     }
 
     static async lockMacOs(): Promise<void> {
-        const pyPath = path.join(FileSystem.resources, "macos", "tools", "lock_screen_immediately.py");
-        if (!fs.existsSync(pyPath)) throw Error("Lock screen script not found!");
-
-        // No shell, so a resources path containing spaces still resolves to one argument
-        await FileSystem.execFileCommand("python", [pyPath]);
+        await FileSystem.execFileCommand("pmset", ["displaysleepnow"]);
     }
 }

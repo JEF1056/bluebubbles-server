@@ -3,6 +3,7 @@ import { Next } from "koa";
 
 import { isNotEmpty } from "@server/helpers/utils";
 import { BackupsInterface } from "@server/api/interfaces/backupsInterface";
+import { BadRequest } from "../responses/errors";
 import { Success } from "../responses/success";
 
 export class ThemeRouter {
@@ -28,7 +29,11 @@ export class ThemeRouter {
     }
 
     static async get(ctx: RouterContext, _: Next) {
-        const name = ctx.query.name as string;
+        const rawName = ctx.query.name;
+        if (rawName !== undefined && typeof rawName !== "string") {
+            throw new BadRequest({ message: "Invalid name query parameter" });
+        }
+        const name = typeof rawName === "string" ? rawName : undefined;
         let res: any;
 
         if (isNotEmpty(name)) {

@@ -159,43 +159,43 @@ export class MessageRouter {
         if (isMinVentura && privateApiEnabled && isNotEmpty(where)) {
             // Sample statement: message.text LIKE :term COLLATE NOCASE
             // Find any where statement that has message.text <operator> <variable>
-            const textQueries = where.filter((w: any) => w.statement.includes("message.text"));
+            const textQueries = where.filter(
+                (w: any) => typeof w?.statement === "string" && w.statement.includes("message.text")
+            );
             if (textQueries.length === 1) {
                 // Find the variable name
-                const variable = textQueries[0].statement.split(" ")[2].replace(":", "");
-                const operator = textQueries[0].statement.split(" ")[1];
-                const term = textQueries[0].args[variable];
-                
-                // Strip the % wildcards from the start/end
-                const strippedTerm = term.replace(/^%+|%+$/g, "");
+                const parts = textQueries[0].statement.trim().split(/\s+/);
+                const rawVar = parts[2];
+                const variable = typeof rawVar === "string" ? rawVar.replace(/^:/, "") : "";
+                const term = variable ? textQueries[0].args?.[variable] : undefined;
+                if (variable && typeof term === "string") {
+                    // Strip the % wildcards from the start/end
+                    const strippedTerm = term.replace(/^%+|%+$/g, "");
 
-                // Remove the text query from the where clause
-                where = where.filter((w: any) => !w.statement.includes("message.text"));
+                    // Remove the text query from the where clause
+                    where = where.filter(
+                        (w: any) => !(typeof w?.statement === "string" && w.statement.includes("message.text"))
+                    );
 
-                // Set the match type based on the operator
-                // let matchType: 'contains' | 'exact' = 'contains';
-                // if (['=', 'is'].includes(operator.toLowerCase())) {
-                //     matchType = 'exact';
-                // }
+                    // To match the behavior of the DB search, we will use the 'exact' match type.
+                    // Exact match for the Spotlight API actually means "contains".
+                    // A contains match in the Spotlight API tokenizes the search term and matches any token.
+                    const matchType = "contains";
 
-                // To match the behavior of the DB search, we will use the 'exact' match type.
-                // Exact match for the Spotlight API actually means "contains".
-                // A contains match in the Spotlight API tokenizes the search term and matches any token.
-                const matchType = 'contains';
-
-                [messages, totalCount] = await MessageInterface.searchMessagesPrivateApi({
-                    chatGuid,
-                    withChats: withChats || withChatParticipants,
-                    withAttachments,
-                    offset,
-                    limit,
-                    sort,
-                    before,
-                    after,
-                    where: where ?? [],
-                    query: strippedTerm,
-                    matchType
-                });
+                    [messages, totalCount] = await MessageInterface.searchMessagesPrivateApi({
+                        chatGuid,
+                        withChats: withChats || withChatParticipants,
+                        withAttachments,
+                        offset,
+                        limit,
+                        sort,
+                        before,
+                        after,
+                        where: where ?? [],
+                        query: strippedTerm,
+                        matchType
+                    });
+                }
             }
         }
 

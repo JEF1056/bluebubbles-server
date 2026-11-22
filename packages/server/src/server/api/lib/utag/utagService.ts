@@ -30,6 +30,9 @@ const UTAG_STORE_FILE = "utag-auth.enc.json";
 const DEFAULT_POLL_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_COOLDOWN_MS = 10 * 1000;
 const DEFAULT_SEARCH_STOP_MS = 60 * 1000;
+const DEFAULT_SEARCH_POLL_INTERVAL_MS = 2 * 1000;
+const DEFAULT_SEARCH_POLL_CAP_MS = 12 * 1000;
+const DEFAULT_UNTARGETED_SETTLE_MS = 4 * 1000;
 
 interface UTagPersistedState {
     deviceId: string;
@@ -58,7 +61,22 @@ export interface UTagServiceDeps {
     pollIntervalMs?: number;
     cooldownMs?: number;
     searchStopDelayMs?: number;
+    searchPollIntervalMs?: number;
+    searchPollCapMs?: number;
+    untargetedSettleMs?: number;
+    hasActiveClients?: () => boolean;
 }
+
+const defaultHasActiveClients = (): boolean => {
+    try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const { Server } = require("@server");
+        const size = Server()?.httpService?.socketServer?.sockets?.sockets?.size;
+        return size == null || size > 0;
+    } catch {
+        return true;
+    }
+};
 
 const defaultEmitDevice = async (device: FindMyDevice): Promise<void> => {
     try {
@@ -96,6 +114,10 @@ export class UTagService {
     private readonly pollIntervalMs: number;
     private readonly cooldownMs: number;
     private readonly searchStopDelayMs: number;
+    private readonly searchPollIntervalMs: number;
+    private readonly searchPollCapMs: number;
+    private readonly untargetedSettleMs: number;
+    private readonly hasActiveClients: () => boolean;
 
     constructor(deps?: UTagServiceDeps) {
         this.storageDeps = deps?.storageDeps;
@@ -103,6 +125,10 @@ export class UTagService {
         this.pollIntervalMs = deps?.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
         this.cooldownMs = deps?.cooldownMs ?? DEFAULT_COOLDOWN_MS;
         this.searchStopDelayMs = deps?.searchStopDelayMs ?? DEFAULT_SEARCH_STOP_MS;
+        this.searchPollIntervalMs = deps?.searchPollIntervalMs ?? DEFAULT_SEARCH_POLL_INTERVAL_MS;
+        this.searchPollCapMs = deps?.searchPollCapMs ?? DEFAULT_SEARCH_POLL_CAP_MS;
+        this.untargetedSettleMs = deps?.untargetedSettleMs ?? DEFAULT_UNTARGETED_SETTLE_MS;
+        this.hasActiveClients = deps?.hasActiveClients ?? defaultHasActiveClients;
         this.client =
             deps?.client ??
             new UTagClient(null, {
@@ -268,15 +294,22 @@ export class UTagService {
     start(): void {
         if (this.pollTimer) return;
         const state = this.ensureLoaded();
-        if (state.tokens?.iotToken) {
+        if (state.tokens?.iotToken && this.hasActiveClients()) {
             void this.refreshDevices().catch(() => undefined);
         }
         this.pollTimer = setInterval(() => {
-            if (this.ensureLoaded().tokens?.iotToken) {
+            if (this.ensureLoaded().tokens?.iotToken && this.hasActiveClients()) {
                 void this.refreshDevices().catch(() => undefined);
             }
         }, this.pollIntervalMs);
         this.pollTimer.unref?.();
+    }
+
+    onClientConnected(): void {
+        if (!this.pollTimer || !this.ensureLoaded().tokens?.iotToken) return;
+        if (this.cachedDevices.length === 0) {
+            void this.refreshDevices().catch(() => undefined);
+        }
     }
 
     stop(): void {
@@ -288,18 +321,6 @@ export class UTagService {
             clearTimeout(timer);
             stop();
         }
-    }
-
-    private armSearchStop(installedAppId: string, deviceId: string): void {
-        const existing = this.searchStopTimers.get(deviceId);
-        if (existing) clearTimeout(existing.timer);
-        const stop = () => {
-            this.searchStopTimers.delete(deviceId);
-            void this.client.setSearchingStatus(installedAppId, deviceId, false).catch(() => undefined);
-        };
-        const timer = setTimeout(stop, this.searchStopDelayMs);
-        timer.unref?.();
-        this.searchStopTimers.set(deviceId, { timer, stop });
     }
 
     getCachedDevices(): FindMyDevice[] {
@@ -334,69 +355,124 @@ export class UTagService {
                 const nextDevices: FindMyDevice[] = [];
                 const nextTagsById = new Map<string, SmartThingsTagDevice>();
 
-                for (const tag of tags) {
-                    nextTagsById.set(tag.deviceId, tag);
-                    const existing = prevDevices.find(d => d.id === `utag:${tag.deviceId}`);
-                    if (rawTarget && tag.deviceId !== rawTarget) {
-                        if (existing) {
-                            nextDevices.push(existing);
-                            continue;
+                const untargetedForced = !rawTarget && Boolean(options?.force) && tags.length > 0;
+                if (untargetedForced) {
+                    await Promise.all(
+                        tags.map(t => this.client.setSearchingStatus(installedAppId, t.deviceId, true).catch(() => undefined))
+                    );
+                }
+
+                try {
+                    if (untargetedForced && this.untargetedSettleMs > 0) {
+                        await new Promise(r => setTimeout(r, this.untargetedSettleMs));
+                    }
+
+                    for (const tag of tags) {
+                        nextTagsById.set(tag.deviceId, tag);
+                        const existing = prevDevices.find(d => d.id === `utag:${tag.deviceId}`);
+                        if (rawTarget && tag.deviceId !== rawTarget) {
+                            if (existing) {
+                                nextDevices.push(existing);
+                                continue;
+                            }
                         }
-                    }
 
-                    if (rawTarget === tag.deviceId) {
-                        await this.client.setSearchingStatus(installedAppId, tag.deviceId, true).catch(() => undefined);
-                        this.lastRefreshByDevice.set(tag.deviceId, Date.now());
-                        this.armSearchStop(installedAppId, tag.deviceId);
-                    }
-
-                    let geoRes = null;
-                    let geoFailed = false;
-                    try {
-                        geoRes = await this.client.getTagGeolocation(installedAppId, tag.deviceId);
-                    } catch (geoErr: any) {
-                        geoFailed = true;
-                        lastGeoError = geoErr?.message ?? String(geoErr);
-                        console.warn(`[UTagService] Geolocation failed for ${tag.deviceId}: ${lastGeoError}`);
-                    }
-                    if (geoRes?.keyPair && geoRes.keyPair.privateKey && geoRes.keyPair.iv) {
-                        const latest = this.ensureLoaded();
-                        if (
-                            latest.keyPair?.privateKey !== geoRes.keyPair.privateKey ||
-                            latest.keyPair?.iv !== geoRes.keyPair.iv
-                        ) {
-                            this.savePersisted({ ...latest, keyPair: geoRes.keyPair });
+                        let geoRes = null;
+                        let geoFailed = false;
+                        if (rawTarget === tag.deviceId) {
+                            const baseline = existing?.location?.timeStamp ?? existing?.last_updated ?? 0;
+                            await this.client.setSearchingStatus(installedAppId, tag.deviceId, true).catch(() => undefined);
+                            try {
+                                const deadline = Date.now() + this.searchPollCapMs;
+                                while (true) {
+                                    try {
+                                        geoRes = await this.client.getTagGeolocation(installedAppId, tag.deviceId);
+                                        geoFailed = false;
+                                    } catch (geoErr: any) {
+                                        geoFailed = true;
+                                        lastGeoError = geoErr?.message ?? String(geoErr);
+                                        console.warn(`[UTagService] Geolocation failed for ${tag.deviceId}: ${lastGeoError}`);
+                                    }
+                                    const candidateKey = this.getPrivateKey(geoRes?.keyPair) ?? privateKey;
+                                    const candidateCoords = resolveGeoCoordinates(geoRes?.geo ?? null, candidateKey).coords;
+                                    const rawUpdateTime = Number(geoRes?.geo?.lastUpdateTime ?? 0);
+                                    const nextUpdateTime =
+                                        candidateCoords?.lastUpdateTime ?? (Number.isFinite(rawUpdateTime) ? rawUpdateTime : 0);
+                                    if (nextUpdateTime > baseline || Date.now() >= deadline) {
+                                        break;
+                                    }
+                                    const waitMs = Math.min(this.searchPollIntervalMs, Math.max(0, deadline - Date.now()));
+                                    if (waitMs > 0) {
+                                        await new Promise(r => setTimeout(r, waitMs));
+                                    }
+                                }
+                            } finally {
+                                await this.client
+                                    .setSearchingStatus(installedAppId, tag.deviceId, false)
+                                    .catch(() => undefined);
+                            }
+                        } else {
+                            try {
+                                geoRes = await this.client.getTagGeolocation(installedAppId, tag.deviceId);
+                            } catch (geoErr: any) {
+                                geoFailed = true;
+                                lastGeoError = geoErr?.message ?? String(geoErr);
+                                console.warn(`[UTagService] Geolocation failed for ${tag.deviceId}: ${lastGeoError}`);
+                            }
                         }
-                    }
-                    const effectiveKey = this.getPrivateKey(geoRes?.keyPair) ?? privateKey;
-                    const { coords, needsPin } = resolveGeoCoordinates(geoRes?.geo ?? null, effectiveKey);
-                    if (needsPin) this.needsPinTagIds.add(tag.deviceId);
-                    else this.needsPinTagIds.delete(tag.deviceId);
+                        if (geoRes) {
+                            this.lastRefreshByDevice.set(tag.deviceId, Date.now());
+                        }
+                        if (geoRes?.keyPair && geoRes.keyPair.privateKey && geoRes.keyPair.iv) {
+                            const latest = this.ensureLoaded();
+                            if (
+                                latest.keyPair?.privateKey !== geoRes.keyPair.privateKey ||
+                                latest.keyPair?.iv !== geoRes.keyPair.iv
+                            ) {
+                                this.savePersisted({ ...latest, keyPair: geoRes.keyPair });
+                            }
+                        }
+                        const effectiveKey = this.getPrivateKey(geoRes?.keyPair) ?? privateKey;
+                        const { coords, needsPin } = resolveGeoCoordinates(geoRes?.geo ?? null, effectiveKey);
+                        if (needsPin) this.needsPinTagIds.add(tag.deviceId);
+                        else this.needsPinTagIds.delete(tag.deviceId);
 
-                    const geocoded = coords
-                        ? await reverseGeocode(coords.latitude, coords.longitude, this.storageDeps)
-                        : null;
+                        const geocoded = coords
+                            ? await reverseGeocode(coords.latitude, coords.longitude, this.storageDeps)
+                            : null;
 
-                    const mapped = mapSmartTagToFindMyDevice(tag, {
-                        coords,
-                        geocoded,
-                        needsPin,
-                        batteryLevel: geoRes?.geo?.battery as string | number | undefined
-                    });
-                    if (geoFailed && existing?.location) {
-                        mapped.location = existing.location;
-                        mapped.crowdSourcedLocation = existing.crowdSourcedLocation ?? existing.location;
-                        mapped.address = existing.address;
-                        mapped.last_updated = existing.last_updated;
-                        mapped.short_address = existing.short_address ?? existing.address?.label ?? null;
-                        mapped.long_address =
-                            existing.long_address ?? existing.address?.mapItemFullAddress ?? existing.address?.label ?? null;
-                        mapped.street = existing.street ?? existing.address?.streetAddress ?? null;
-                        mapped.city = existing.city ?? existing.address?.locality ?? null;
-                        mapped.state = existing.state ?? existing.address?.stateCode ?? null;
-                        mapped.country = existing.country ?? existing.address?.country ?? null;
+                        const mapped = mapSmartTagToFindMyDevice(tag, {
+                            coords,
+                            geocoded,
+                            needsPin,
+                            batteryLevel: geoRes?.geo?.battery as string | number | undefined
+                        });
+                        if (geoFailed && existing?.location) {
+                            mapped.location = existing.location;
+                            mapped.crowdSourcedLocation = existing.crowdSourcedLocation ?? existing.location;
+                            mapped.address = existing.address;
+                            mapped.last_updated = existing.last_updated;
+                            mapped.short_address = existing.short_address ?? existing.address?.label ?? null;
+                            mapped.long_address =
+                                existing.long_address ??
+                                existing.address?.mapItemFullAddress ??
+                                existing.address?.label ??
+                                null;
+                            mapped.street = existing.street ?? existing.address?.streetAddress ?? null;
+                            mapped.city = existing.city ?? existing.address?.locality ?? null;
+                            mapped.state = existing.state ?? existing.address?.stateCode ?? null;
+                            mapped.country = existing.country ?? existing.address?.country ?? null;
+                        }
+                        nextDevices.push(mapped);
                     }
-                    nextDevices.push(mapped);
+                } finally {
+                    if (untargetedForced) {
+                        await Promise.all(
+                            tags.map(t =>
+                                this.client.setSearchingStatus(installedAppId, t.deviceId, false).catch(() => undefined)
+                            )
+                        );
+                    }
                 }
 
                 for (const id of this.needsPinTagIds) {

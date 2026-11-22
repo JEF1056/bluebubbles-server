@@ -20,15 +20,17 @@ final class FloatRingBuffer {
     private var readIdx = 0
     private var writeIdx = 0
     private var count = 0
-    private let lock = NSLock()
+    private var stopped = false
+    private let signalThreshold: Int
+    private let lock = NSCondition()
 
-    init(capacity: Int = 48_000 * 2) {
+    init(capacity: Int = 48_000 * 2, signalThreshold: Int = 0) {
         self.buf = [Float](repeating: 0, count: capacity)
+        self.signalThreshold = signalThreshold
     }
 
     func push(_ samples: UnsafePointer<Float>, length: Int) {
         lock.lock()
-        defer { lock.unlock() }
         let cap = buf.count
         for i in 0..<length {
             if count == cap {
@@ -39,6 +41,10 @@ final class FloatRingBuffer {
             writeIdx = (writeIdx + 1) % cap
             count += 1
         }
+        if signalThreshold > 0 && count >= signalThreshold {
+            lock.signal()
+        }
+        lock.unlock()
     }
 
     func pop(into dst: UnsafeMutablePointer<Float>, length: Int) -> Int {
@@ -52,6 +58,34 @@ final class FloatRingBuffer {
         }
         count -= n
         return n
+    }
+
+    func popOrWait(into dst: UnsafeMutablePointer<Float>, length: Int, timeout: TimeInterval = 0.5) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        while count < length && !stopped {
+            if !lock.wait(until: deadline) {
+                return 0
+            }
+        }
+        guard !stopped, count >= length else {
+            return 0
+        }
+        let cap = buf.count
+        for i in 0..<length {
+            dst[i] = buf[readIdx]
+            readIdx = (readIdx + 1) % cap
+        }
+        count -= length
+        return length
+    }
+
+    func stop() {
+        lock.lock()
+        stopped = true
+        lock.broadcast()
+        lock.unlock()
     }
 
     var available: Int {
@@ -201,7 +235,7 @@ final class AudioBridge {
     private var savedDefaultInputDeviceID: AudioDeviceID = kAudioObjectUnknown
     private let inputRestoreLock = NSLock()
 
-    private let downlinkRing = FloatRingBuffer()
+    private let downlinkRing = FloatRingBuffer(signalThreshold: frameSamples)
     private let uplinkRing = FloatRingBuffer()
     private var isMuted = false
     private let muteLock = NSLock()
@@ -221,6 +255,7 @@ final class AudioBridge {
 
     func stop() {
         running = false
+        downlinkRing.stop()
         restoreDefaultInputDevice()
         if let proc = tapIOProcID, aggregateDeviceID != kAudioObjectUnknown {
             AudioDeviceStop(aggregateDeviceID, proc)
@@ -250,14 +285,23 @@ final class AudioBridge {
     }
 
     private func setupDownlinkTapWithRetry() {
-        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
+            var delay: TimeInterval = 0.5
+            var elapsed: TimeInterval = 0
+            let maxWait: TimeInterval = 60.0
             while self.running && self.tapID == kAudioObjectUnknown {
                 let procIDs = getProcessObjectIDs(matching: targetBundleIDs)
                 if !procIDs.isEmpty, self.createProcessTap(processObjectIDs: procIDs) {
                     return
                 }
-                Thread.sleep(forTimeInterval: 0.5)
+                if elapsed >= maxWait {
+                    fputs("[BlueBubblesAudioBridge] Timed out waiting for FaceTime audio process tap after \(Int(maxWait))s\n", stderr)
+                    return
+                }
+                Thread.sleep(forTimeInterval: delay)
+                elapsed += delay
+                delay = min(5.0, delay * 2.0)
             }
         }
     }
@@ -396,34 +440,30 @@ final class AudioBridge {
     }
 
     private func startDownlinkEncodeLoop() {
-        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self, let encoder = self.encoder else { return }
             let pcmBuf = AVAudioPCMBuffer(pcmFormat: self.pcmFormat, frameCapacity: AVAudioFrameCount(frameSamples))!
             pcmBuf.frameLength = AVAudioFrameCount(frameSamples)
             let compBuf = AVAudioCompressedBuffer(format: self.opusFormat, packetCapacity: 1, maximumPacketSize: 1500)
 
             while self.running {
-                if self.downlinkRing.available >= frameSamples {
-                    if let chData = pcmBuf.floatChannelData?[0] {
-                        _ = self.downlinkRing.pop(into: chData, length: frameSamples)
+                guard let chData = pcmBuf.floatChannelData?[0] else { break }
+                let popped = self.downlinkRing.popOrWait(into: chData, length: frameSamples, timeout: 0.5)
+                guard popped == frameSamples, self.running else { continue }
+                var fed = false
+                var err: NSError?
+                let status = encoder.convert(to: compBuf, error: &err) { _, outStatus in
+                    if fed {
+                        outStatus.pointee = .noDataNow
+                        return nil
                     }
-                    var fed = false
-                    var err: NSError?
-                    let status = encoder.convert(to: compBuf, error: &err) { _, outStatus in
-                        if fed {
-                            outStatus.pointee = .noDataNow
-                            return nil
-                        }
-                        fed = true
-                        outStatus.pointee = .haveData
-                        return pcmBuf
-                    }
-                    if status != .error && compBuf.byteLength > 0 {
-                        let data = Data(bytes: compBuf.data, count: Int(compBuf.byteLength))
-                        writeStdoutFrame(data)
-                    }
-                } else {
-                    Thread.sleep(forTimeInterval: 0.005)
+                    fed = true
+                    outStatus.pointee = .haveData
+                    return pcmBuf
+                }
+                if status != .error && compBuf.byteLength > 0 {
+                    let data = Data(bytes: compBuf.data, count: Int(compBuf.byteLength))
+                    writeStdoutFrame(data)
                 }
             }
         }

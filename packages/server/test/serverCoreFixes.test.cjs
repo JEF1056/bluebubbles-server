@@ -326,6 +326,124 @@ test("F1 + S2-19: FaceTimeAudioBridge skips spawn when orphaned mid-offer and cl
     assert.equal(pc2.closed, true);
 });
 
+test("FaceTimeAudioBridge: parses optional TURN env vars and returns iceServers in ft-bridge-answer and ft-bridge-config", async () => {
+    const emitted = [];
+    const pcConfigs = [];
+
+    class FakeSubject {
+        subscribe() {}
+    }
+
+    class FakePeerConnection {
+        constructor(config) {
+            this.onIceCandidate = new FakeSubject();
+            this.connectionStateChange = new FakeSubject();
+            pcConfigs.push(config);
+        }
+        addTransceiver() {
+            return { receiver: { track: { onReceiveRtp: new FakeSubject() } } };
+        }
+        async setRemoteDescription() {}
+        async createAnswer() {
+            return { sdp: "v=0-answer", type: "answer" };
+        }
+        async setLocalDescription() {}
+        async close() {}
+    }
+
+    const { FaceTimeAudioBridge } = loadTypeScriptModule(
+        path.join(srcRoot, "api/lib/facetime/FaceTimeAudioBridge.ts"),
+        {
+            child_process: { spawn: () => ({ killed: false, kill: () => {}, stdout: new EventEmitter(), stderr: new EventEmitter(), stdin: new EventEmitter(), on: () => {} }) },
+            fs: { existsSync: () => false },
+            "socket.io": {},
+            werift: {
+                MediaStreamTrack: class {},
+                RTCIceCandidate: class {},
+                RTCPeerConnection: FakePeerConnection,
+                RTCRtpCodecParameters: class {},
+                RtpHeader: class {},
+                RtpPacket: class {}
+            },
+            "@server": { Server: () => null },
+            "@server/fileSystem": { FileSystem: { resources: "/tmp" } },
+            "@server/lib/logging/Loggable": {
+                Loggable: class {
+                    log = { info: () => {}, warn: () => {}, debug: () => {} };
+                }
+            }
+        }
+    );
+
+    const prevUrls = process.env.BB_FACETIME_TURN_URLS;
+    const prevUser = process.env.BB_FACETIME_TURN_USERNAME;
+    const prevCred = process.env.BB_FACETIME_TURN_CREDENTIAL;
+
+    try {
+        delete process.env.BB_FACETIME_TURN_URLS;
+        delete process.env.BB_FACETIME_TURN_USERNAME;
+        delete process.env.BB_FACETIME_TURN_CREDENTIAL;
+        assert.deepEqual(FaceTimeAudioBridge.getIceServers(), [{ urls: "stun:stun.l.google.com:19302" }]);
+
+        process.env.BB_FACETIME_TURN_URLS = "turn:turn.example.com:3478, turns:turn.example.com:5349 ";
+        process.env.BB_FACETIME_TURN_USERNAME = "alice";
+        process.env.BB_FACETIME_TURN_CREDENTIAL = "secret";
+
+        const expectedIceServers = [
+            { urls: "stun:stun.l.google.com:19302" },
+            { urls: "turn:turn.example.com:3478", username: "alice", credential: "secret" },
+            { urls: "turns:turn.example.com:5349", username: "alice", credential: "secret" }
+        ];
+        assert.deepEqual(FaceTimeAudioBridge.getIceServers(), expectedIceServers);
+
+        const bridge = new FaceTimeAudioBridge();
+        const socket = { id: "sock-turn", emit: (evt, data) => emitted.push({ evt, data }) };
+        await bridge.handleOffer(socket, { callUuid: "call-turn", sdp: "v=0-offer" });
+        bridge.cleanupSession("call-turn");
+
+        assert.deepEqual(pcConfigs[0].iceServers, expectedIceServers);
+        const answerEvt = emitted.find(e => e.evt === "ft-bridge-answer");
+        assert.ok(answerEvt);
+        assert.deepEqual(answerEvt.data.iceServers, expectedIceServers);
+
+        const { registerForkSocketRoutes } = loadTypeScriptModule(
+            path.join(srcRoot, "api/http/api/v1/socketForkRoutes.ts"),
+            {
+                "socket.io": {},
+                "@server/api/lib/facetime/FaceTimeAudioBridge": { FaceTimeAudioBridge }
+            }
+        );
+        const handlers = {};
+        registerForkSocketRoutes({ on: (evt, fn) => { handlers[evt] = fn; } }, { debug: () => {} });
+        let configAck = null;
+        handlers["ft-bridge-config"]({}, res => {
+            configAck = res;
+        });
+        assert.deepEqual(configAck, {
+            iceServers: expectedIceServers,
+            videoSupported: false,
+            videoUplinkSupported: false
+        });
+
+        let configAckOneArg = null;
+        handlers["ft-bridge-config"](res => {
+            configAckOneArg = res;
+        });
+        assert.deepEqual(configAckOneArg, {
+            iceServers: expectedIceServers,
+            videoSupported: false,
+            videoUplinkSupported: false
+        });
+    } finally {
+        if (prevUrls === undefined) delete process.env.BB_FACETIME_TURN_URLS;
+        else process.env.BB_FACETIME_TURN_URLS = prevUrls;
+        if (prevUser === undefined) delete process.env.BB_FACETIME_TURN_USERNAME;
+        else process.env.BB_FACETIME_TURN_USERNAME = prevUser;
+        if (prevCred === undefined) delete process.env.BB_FACETIME_TURN_CREDENTIAL;
+        else process.env.BB_FACETIME_TURN_CREDENTIAL = prevCred;
+    }
+});
+
 test("S2-1: emitMessage sets FCM priority 'high' only when chat-read-status-changed has read:true", async () => {
     const fcmCalls = [];
     const noopProxy = new Proxy(function () {}, {
@@ -570,4 +688,261 @@ test("S2-7 + S2-13: FaceTimeSession guards answerWithServer waiter and admitSelf
         process.off("unhandledRejection", onUnhandled);
     }
     assert.equal(unhandled, 0);
+});
+
+test("Wave1 #2: PrivateApiService destroys socket on non-JSON line", async () => {
+    const { JsonLineBuffer } = loadTypeScriptModule(
+        path.join(srcRoot, "api/privateApi/JsonLineBuffer.ts")
+    );
+    const noopClass = class {};
+    const { PrivateApiService } = loadTypeScriptModule(
+        path.join(srcRoot, "api/privateApi/PrivateApiService.ts"),
+        {
+            "async-sema": { Sema: class { acquire() {} release() {} } },
+            "@server/helpers/utils": { clamp: v => v, isEmpty: v => !v, isNotEmpty: v => !!v },
+            "@server/managers/transactionManager/transactionPromise": { TransactionPromise: noopClass, TransactionResult: {} },
+            "@server/managers/transactionManager": { TransactionManager: noopClass },
+            "./Constants": { MAX_PORT: 46000, MIN_PORT: 45000 },
+            "./eventHandlers": {},
+            "./eventHandlers/PrivateApiTypingEventHandler": { PrivateApiTypingEventHandler: noopClass },
+            "./apis/PrivateApiMessage": { PrivateApiMessage: noopClass },
+            "./apis/PrivateApiChat": { PrivateApiChat: noopClass },
+            "./apis/PrivateApiHandle": { PrivateApiHandle: noopClass },
+            "./apis/PrivateApiAttachment": { PrivateApiAttachment: noopClass },
+            "./modes": {},
+            "./modes/ProcessDylibMode": { ProcessDylibMode: noopClass },
+            "./eventHandlers/PrivateApiPingEventHandler": { PrivateApiPingEventHandler: noopClass },
+            "./apis/PrivateApiFindMy": { PrivateApiFindMy: noopClass },
+            "./eventHandlers/PrivateApiAddressEventHandler": { PrivateApiAddressEventHandler: noopClass },
+            "./eventHandlers/PrivateApiFaceTimeStatusHandler": { PrivateApiFaceTimeStatusHandler: noopClass },
+            "./apis/PrivateApiCloud": { PrivateApiCloud: noopClass },
+            "./apis/PrivateApiFaceTime": { PrivateApiFaceTime: noopClass },
+            "@server/api/lib/facetime/FaceTimeCameraHook": { ensureCameraHookInstalled: () => {} },
+            "./eventHandlers/PrivateApiFindMyEventHandler": { PrivateApiFindMyEventHandler: noopClass },
+            "./eventHandlers/PrivateApiPinnedChatsEventHandler": { PrivateApiPinnedChatsEventHandler: noopClass },
+            "../types": {},
+            uuid: { v4: () => "id-1" },
+            "../../lib/logging/Loggable": {
+                Loggable: class extends EventEmitter {
+                    log = { info: () => {}, debug: () => {}, warn: () => {}, error: () => {} };
+                }
+            },
+            "./JsonLineBuffer": { JsonLineBuffer },
+            "./PrivateApiClientSelector": { selectPrivateApiClients: () => [] }
+        }
+    );
+
+    const svc = new PrivateApiService();
+    svc.eventHandlers = [];
+
+    const validSocket = {
+        destroyed: false,
+        destroy() {
+            this.destroyed = true;
+        }
+    };
+    await svc.onEvent(JSON.stringify({ event: "ping" }), validSocket);
+    assert.equal(validSocket.destroyed, false);
+
+    const badSocket = {
+        destroyed: false,
+        destroy() {
+            this.destroyed = true;
+        }
+    };
+    await svc.onEvent("{not-valid-json", badSocket);
+    assert.equal(badSocket.destroyed, true);
+
+    const handledEvents = [];
+    svc.eventHandlers = [{
+        types: ["ping"],
+        async handle(message) {
+            handledEvents.push(message);
+        }
+    }];
+    const smuggleSocket = new EventEmitter();
+    smuggleSocket.destroyed = false;
+    smuggleSocket.destroy = () => {
+        smuggleSocket.destroyed = true;
+    };
+    svc.setupListeners(smuggleSocket);
+    smuggleSocket.emit(
+        "data",
+        Buffer.from('POST / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n{"event":"ping"}\n')
+    );
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.equal(smuggleSocket.destroyed, true);
+    assert.equal(handledEvents.length, 0);
+});
+
+test("Wave1 #4: FileSystem.saveFCMClient and saveFCMServer return early when usingCustomFcm", () => {
+    const fs = require("node:fs");
+    const os = require("node:os");
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "bb-fcm-test-"));
+    try {
+        const { FileSystem } = loadTypeScriptModule(path.join(srcRoot, "fileSystem/index.ts"), {
+            "electron-log": { transports: { file: {} } },
+            electron: { app: { getPath: () => tmpDir, setPath: () => {} } },
+            "read-chunk": { sync: () => Buffer.alloc(0) },
+            "@server": {
+                Server: () => ({
+                    log: () => {},
+                    args: {
+                        "fcm-client": path.join(tmpDir, "custom-client.json"),
+                        "fcm-server": path.join(tmpDir, "custom-server.json")
+                    }
+                })
+            },
+            "@server/helpers/utils": {
+                concatUint8Arrays: a => a,
+                parseMetadataString: () => ({}),
+                isNotEmpty: v => Boolean(v && v.length > 0),
+                isEmpty: v => !v || v.length === 0,
+                safeTrim: s => (s ?? "").trim()
+            },
+            "@server/env": { isMinMonterey: true },
+            "@server/databases/imessage/entity/Attachment": { Attachment: class {} },
+            "../api/apple/scripts": { startMessages: () => "" },
+            "./fileSystemForkHelpers": {
+                convertToPng: async () => {},
+                hasAlpha: async () => false,
+                requestFindMyAutomationPermissions: async () => {}
+            },
+            "./types": { MetadataKeyMap: {} },
+            uuid: { v4: () => "uuid-fcm" }
+        });
+
+        FileSystem.fcmDir = tmpDir;
+        FileSystem.saveFCMClient({ project_id: "x" });
+        FileSystem.saveFCMServer({ type: "service_account" });
+        assert.deepEqual(fs.readdirSync(tmpDir), []);
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+test("Wave1 #5: socketRoutes checks null chunk before deflateSync and emits check-for-server-update", async () => {
+    const handlers = new Map();
+    const emitted = [];
+    const mockSocket = {
+        use: () => {},
+        on: (event, fn) => handlers.set(event, fn),
+        emit: (event, data) => emitted.push({ event, data })
+    };
+
+    const { SocketRoutes } = loadTypeScriptModule(path.join(srcRoot, "api/http/api/v1/socketRoutes.ts"), {
+        fs: { existsSync: () => true },
+        electron: { app: { getVersion: () => "1.0.0" } },
+        "macos-version": () => "14.0",
+        "@server": {
+            Server: () => ({
+                repo: { getConfig: () => false },
+                iMessageRepo: {
+                    getAttachment: async () => ({
+                        filePath: "/tmp/fake-attachment.bin",
+                        transferName: "fake.bin"
+                    })
+                }
+            })
+        },
+        "@server/fileSystem": {
+            FileSystem: {
+                getRealPath: p => p,
+                readFileChunk: () => null
+            }
+        },
+        "@server/helpers/utils": {
+            isEmpty: v => !v || v.length === 0,
+            isNotEmpty: v => Boolean(v && v.length > 0),
+            isValidAddress: () => true,
+            onlyAlphaNumeric: s => s,
+            safeTrim: s => (s ?? "").trim()
+        },
+        "@server/types": {},
+        "@server/api/http/api/v1/responses/types": { ErrorTypes: {}, ResponseFormat: {}, ResponseJson: {} },
+        "@server/databases/imessage/entity/Handle": { Handle: class {} },
+        "@server/databases/imessage/types": {},
+        "@server/databases/imessage/helpers/whereClauseValidator": {
+            validateWhereClauses: () => {},
+            WhereClauseError: class extends Error {}
+        },
+        "@server/api/apple/actions": { ActionHandler: {} },
+        "@server/services/queueService": { QueueItem: {} },
+        "@server/api/interfaces/generalInterface": {
+            GeneralInterface: { checkForUpdate: async () => ({ available: false }) }
+        },
+        "@server/api/interfaces/messageInterface": { MessageInterface: {} },
+        "@server/databases/imessage/helpers/utils": { convertAudio: async () => {} },
+        "./responses": {
+            createSuccessResponse: (data, message) => ({ status: 200, message, data }),
+            createServerErrorResponse: (err, error, msg) => ({ status: 500, message: msg, error: { message: err } }),
+            createBadRequestResponse: msg => ({ status: 400, message: msg }),
+            createNoDataResponse: () => ({ status: 200, message: "No data", data: null })
+        },
+        "@server/api/serializers/MessageSerializer": { MessageSerializer: {} },
+        "@server/events": { CHAT_READ_STATUS_CHANGED: "chat-read-status-changed" },
+        "@server/api/serializers/ChatSerializer": { ChatSerializer: {} },
+        "@server/api/serializers/HandleSerializer": { HandleSerializer: {} },
+        "@server/api/serializers/AttachmentSerializer": { AttachmentSerializer: {} },
+        "@server/api/interfaces/macosInterface": { MacOsInterface: {} },
+        "@server/api/lib/facetime/FaceTimeAudioBridge": { FaceTimeAudioBridge: {} },
+        "@server/lib/logging/Loggable": {
+            getLogger: () => ({ info: () => {}, debug: () => {}, warn: () => {}, error: () => {} })
+        },
+        "@server/databases/server/constants": { ProxyServices: {} },
+        "@server/api/lib/gfind": { gfindService: { onClientConnected: () => {} } },
+        "./socketForkRoutes": { registerForkSocketRoutes: () => {} }
+    });
+
+    SocketRoutes.createRoutes(mockSocket);
+
+    let chunkRes = null;
+    await handlers.get("get-attachment-chunk")(
+        { identifier: "att-1", start: 0, chunkSize: 100, compress: true },
+        res => {
+            chunkRes = res;
+        }
+    );
+    assert.equal(chunkRes?.status, 200);
+    assert.equal(chunkRes?.data, null);
+
+    await handlers.get("check-for-server-update")({});
+    assert.equal(emitted.length, 1);
+    assert.equal(emitted[0].event, "check-for-server-update");
+    assert.equal(emitted[0].data.status, 200);
+});
+
+test("Wave1 #7: MessagePoller handles empty chats and fixes dateDelivered/dateRead precedence", async () => {
+    const { poller, resolved } = createPollerHarness({
+        getMessages: async () => [
+            [
+                makePollerMsg({
+                    ROWID: 101,
+                    guid: "empty-chats-delivered",
+                    isFromMe: true,
+                    isDelivered: true,
+                    chats: [],
+                    dateCreated: new Date(1000),
+                    dateDelivered: new Date(10_500),
+                    dateRead: new Date(10_600)
+                }),
+                makePollerMsg({
+                    ROWID: 102,
+                    guid: "incoming-delivered-ignored",
+                    isFromMe: false,
+                    isDelivered: true,
+                    chats: [{ isGroup: false }],
+                    dateCreated: new Date(1000),
+                    dateDelivered: new Date(10_500)
+                })
+            ],
+            0
+        ]
+    });
+
+    const results = await poller.poll(new Date(10_000));
+    assert.equal(results.length, 1);
+    assert.equal(results[0].data.guid, "empty-chats-delivered");
+    assert.equal(resolved.length, 1);
+    assert.equal(resolved[0].guid, "empty-chats-delivered");
 });

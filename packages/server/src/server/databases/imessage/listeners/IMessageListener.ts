@@ -10,12 +10,17 @@ import { DebounceSubsequentWithWait } from "@server/lib/decorators/DebounceDecor
 import { Server } from "@server";
 
 const DEFAULT_POLL_DEBOUNCE_MS = 500;
+const MIN_POLL_DEBOUNCE_MS = 100;
+const DEFAULT_HEALTHY_POLL_INTERVAL_MS = 15000;
+const WATCHER_ERROR_FALLBACK_POLL_INTERVAL_MS = 1000;
 
-const getPollDebounceMs = (): number => {
+// Cap debounce at DEFAULT_POLL_DEBOUNCE_MS so raising db_poll_interval does not delay fs.watch delivery.
+export const getPollDebounceMs = (): number => {
     const configured = Server()?.repo?.getConfig("db_poll_interval") as number;
-    return typeof configured === "number" && configured >= DEFAULT_POLL_DEBOUNCE_MS
-        ? configured
-        : DEFAULT_POLL_DEBOUNCE_MS;
+    if (typeof configured !== "number" || !Number.isFinite(configured) || configured <= 0) {
+        return DEFAULT_POLL_DEBOUNCE_MS;
+    }
+    return Math.min(DEFAULT_POLL_DEBOUNCE_MS, Math.max(MIN_POLL_DEBOUNCE_MS, configured));
 };
 
 export const getFileStatSignature = async (filePaths: string[]): Promise<string> => {
@@ -61,7 +66,7 @@ export class IMessageListener extends Loggable {
         filePaths,
         repo,
         cache,
-        pollIntervalMs = 1000
+        pollIntervalMs = DEFAULT_HEALTHY_POLL_INTERVAL_MS
     }: {
         filePaths: string[],
         repo: MessageRepository,
@@ -122,6 +127,14 @@ export class IMessageListener extends Loggable {
         this.watcher.on("error", (error) => {
             this.log.error(`Failed to watch database files: ${this.filePaths.join(", ")}`);
             this.log.debug(`Error: ${error}`);
+            if (!this.stopped && this.pollIntervalMs > WATCHER_ERROR_FALLBACK_POLL_INTERVAL_MS) {
+                this.pollIntervalMs = WATCHER_ERROR_FALLBACK_POLL_INTERVAL_MS;
+                if (this.pollTimer) {
+                    clearInterval(this.pollTimer);
+                    this.pollTimer = null;
+                }
+                this.startPollTimer();
+            }
         });
 
         this.watcher.start();

@@ -43,7 +43,31 @@ export class CloudflareManager extends Loggable {
     }
 
     private async connectHandler(): Promise<string> {
-        return new Promise(async (resolve, reject) => {
+        return new Promise<string>(async (resolve, reject) => {
+            let timeout: NodeJS.Timeout | null = null;
+            let settled = false;
+            const onNewUrl = (url: string) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                resolve(url);
+            };
+            const onError = (err: any) => {
+                if (typeof err === "string" && err.includes("Thank you for trying Cloudflare Tunnel.")) return;
+                if (settled) return;
+                settled = true;
+                cleanup();
+                reject(err);
+            };
+            const cleanup = () => {
+                if (timeout) {
+                    clearTimeout(timeout);
+                    timeout = null;
+                }
+                this.off("new-url", onNewUrl);
+                this.off("error", onError);
+            };
+
             try {
                 const port = Server().repo.getConfig("socket_port") as string;
                 if (this.proc && !this.proc?.process?.killed) {
@@ -69,23 +93,24 @@ export class CloudflareManager extends Loggable {
                     storeOutput: false
                 });
 
-                this.on("new-url", url => resolve(url));
-                this.on("error", err => {
-                    // Ignore certain errors
-                    if (typeof err === "string") {
-                        if (err.includes("Thank you for trying Cloudflare Tunnel.")) return;
-                    }
+                this.on("new-url", onNewUrl);
+                this.on("error", onError);
 
-                    reject(err);
-                });
-
-                setTimeout(() => {
+                timeout = setTimeout(() => {
+                    if (settled) return;
+                    settled = true;
+                    cleanup();
                     reject(new Error("Failed to connect to Cloudflare after 2 minutes..."));
                 }, 1000 * 60 * 2); // 2 minutes
+                timeout.unref?.();
 
                 await this.proc.execute();
             } catch (ex) {
-                reject(ex);
+                if (!settled) {
+                    settled = true;
+                    cleanup();
+                    reject(ex);
+                }
             }
         });
     }

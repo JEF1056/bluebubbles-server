@@ -7,6 +7,17 @@ import { isEmpty } from "@server/helpers/utils";
 import { Success } from "../responses/success";
 import { NotFound } from "../responses/errors";
 
+const parseWebhookEvents = (raw: unknown): any => {
+    if (Array.isArray(raw)) return raw;
+    if (typeof raw !== "string") return [];
+    try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        return [];
+    }
+};
+
 export class WebhookRouter {
     static async get(ctx: RouterContext, _: Next) {
         const url = ctx?.request?.query?.url as string;
@@ -15,7 +26,7 @@ export class WebhookRouter {
 
         // Convert the events to a list (from json array)
         for (const webhook of webhooks) {
-            webhook.events = JSON.parse(webhook.events);
+            webhook.events = parseWebhookEvents(webhook.events);
         }
 
         return new Success(ctx, { message: "Successfully fetched webhooks!", data: webhooks }).send();
@@ -26,7 +37,7 @@ export class WebhookRouter {
         const webhook = await Server().repo.addWebhook(url, events, options);
 
         // Convert the events to a list (from json array)
-        webhook.events = JSON.parse(webhook.events);
+        webhook.events = parseWebhookEvents(webhook.events);
 
         return new Success(ctx, { data: webhook, message: "Successfully created webhook!" }).send();
     }

@@ -9,46 +9,54 @@ export class NetworkCheckerService extends Loggable {
 
     isStopped = false;
 
+    private startGeneration = 0;
+
     serviceLoop: ScheduledService;
 
     async start() {
+        this.stop();
+        this.isStopped = false;
+        const generation = ++this.startGeneration;
+
         // Let's get the initial network connection
-        this.online = await NetworkCheckerService.checkNetwork();
+        const online = await NetworkCheckerService.checkNetwork();
+        if (this.isStopped || generation !== this.startGeneration) return;
+        this.online = online;
 
         // Start the service loop
-        this.serviceLoop = new ScheduledService(() => {
-            if (this.isStopped) {
-                this.serviceLoop.stop();
+        this.serviceLoop?.stop();
+        this.serviceLoop = new ScheduledService(async () => {
+            if (this.isStopped || generation !== this.startGeneration) {
+                this.serviceLoop?.stop();
                 return;
             }
 
             // Check the network connection
-            NetworkCheckerService.checkNetwork().then(online => {
-                if (!this.online && online) {
-                    this.emit("status-change", true);
-                } else if (this.online && !online) {
-                    this.emit("status-change", false);
-                }
+            const nextOnline = await NetworkCheckerService.checkNetwork();
+            if (this.isStopped || generation !== this.startGeneration) return;
+            if (!this.online && nextOnline) {
+                this.emit("status-change", true);
+            } else if (this.online && !nextOnline) {
+                this.emit("status-change", false);
+            }
 
-                this.online = online;
-            });
-        }, 60000);
+            this.online = nextOnline;
+        }, 300000);
     }
 
     static async checkNetwork(): Promise<boolean> {
-        return new Promise((resolve, reject) => {
-            dns.resolve("www.google.com", err => {
-                if (err) {
-                    resolve(false);
-                } else {
-                    resolve(true);
-                }
-            });
-        });
+        try {
+            await dns.promises.resolve("www.google.com");
+            return true;
+        } catch {
+            return false;
+        }
     }
 
     stop() {
         this.isStopped = true;
+        this.startGeneration++;
         this.serviceLoop?.stop();
+        this.serviceLoop = undefined;
     }
 }

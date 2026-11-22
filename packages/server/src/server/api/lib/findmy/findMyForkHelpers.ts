@@ -24,6 +24,7 @@ export interface StartFindMyLiveOptions {
 
 export interface FindMyLiveState {
     activeHandle: string | null;
+    activeDisplayName?: string | null;
     idleTimer: NodeJS.Timeout | null;
 }
 
@@ -548,7 +549,8 @@ const clearLiveIdleTimer = (liveState: FindMyLiveState): void => {
 
 export const refreshFindMyDevicesThroughPrivateApi = async (
     deps: FindMyForkHelperDeps,
-    options?: RefreshFindMyDevicesOptions
+    options?: RefreshFindMyDevicesOptions,
+    liveState?: FindMyLiveState
 ): Promise<FindMyDevice[]> => {
     const privateApiEnabled = Boolean(deps.server.repo.getConfig("enable_private_api"));
     if (!privateApiEnabled) {
@@ -565,14 +567,34 @@ export const refreshFindMyDevicesThroughPrivateApi = async (
         throw new Error("The Find My Devices helper is unavailable on this macOS version");
     }
 
-    // -g delivers the Find My URL without bringing Find My to the foreground.
-    await deps.execShellCommand("/usr/bin/open -g findmy://devices");
-    const helperAvailable = await waitForPrivateApiClient(deps, targetProcessIdentifier);
-    if (!helperAvailable) {
-        throw new Error("The Find My Devices helper did not connect before the refresh timeout");
+    // Avoid switching FindMy.app to Devices (which deselects any live-focused person) when the helper is already connected.
+    let result: any;
+    let openedDevicesUrl = false;
+    if (deps.server.privateApi.hasClient(targetProcessIdentifier)) {
+        try {
+            result = await deps.server.privateApi.findmy.refreshDevices(options);
+        } catch {
+            // Fall through to open findmy://devices once so FMDevicesListDataSource gets captured.
+        }
     }
 
-    const result = await deps.server.privateApi.findmy.refreshDevices(options);
+    if (result == null) {
+        // -g delivers the Find My URL without bringing Find My to the foreground.
+        await deps.execShellCommand("/usr/bin/open -g findmy://devices");
+        openedDevicesUrl = true;
+        const helperAvailable = await waitForPrivateApiClient(deps, targetProcessIdentifier);
+        if (!helperAvailable) {
+            throw new Error("The Find My Devices helper did not connect before the refresh timeout");
+        }
+
+        result = await deps.server.privateApi.findmy.refreshDevices(options);
+    }
+
+    if (openedDevicesUrl && liveState?.activeHandle && isFriendsHelperReady(deps)) {
+        void deps.server.privateApi.findmy
+            .startLiveLocation(liveState.activeHandle, liveState.activeDisplayName ?? undefined)
+            .catch((): void => undefined);
+    }
     const refreshResponse = result?.data as FindMyDevicesRefreshResponse | undefined;
     if (!Array.isArray(refreshResponse?.devices)) {
         throw new Error("The Find My Devices helper returned an invalid response");
@@ -759,6 +781,7 @@ export const startFindMyLiveLocation = async (
     }
 
     liveState.activeHandle = trimmedHandle;
+    liveState.activeDisplayName = displayName ?? null;
     clearLiveIdleTimer(liveState);
     const idleTimeoutMs = options?.idleTimeoutMs ?? FIND_MY_LIVE_IDLE_TIMEOUT_MS;
     if (idleTimeoutMs > 0) {
@@ -793,6 +816,7 @@ export const stopFindMyLiveLocation = async (
     if (matchesActive) {
         clearLiveIdleTimer(liveState);
         liveState.activeHandle = null;
+        liveState.activeDisplayName = null;
     }
 
     if (!isFriendsHelperReady(deps)) {

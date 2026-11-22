@@ -134,25 +134,36 @@ export class FindMyInterface {
     static async refreshDevices(options?: RefreshFindMyDevicesOptions): Promise<Array<FindMyDevice> | null> {
         const enableUtag = Boolean(Server().repo?.getConfig("enable_utag"));
         const enableGfind = Boolean(Server().repo?.getConfig("enable_gfind"));
-        const targetId = options?.deviceId;
+        const targetId =
+            typeof options?.deviceId === "string" && options.deviceId.trim().length > 0
+                ? options.deviceId.trim()
+                : undefined;
+        const force = typeof options?.force === "boolean" ? options.force : undefined;
+        const normalizedOptions: RefreshFindMyDevicesOptions | undefined =
+            targetId !== undefined || force !== undefined
+                ? {
+                      ...(targetId !== undefined ? { deviceId: targetId } : {}),
+                      ...(force !== undefined ? { force } : {})
+                  }
+                : undefined;
 
         if (targetId?.startsWith("utag:")) {
             if (enableUtag) {
-                await utagService.refreshDevices(targetId, { force: options?.force });
+                await utagService.refreshDevices(targetId, { force });
             }
             return this.getDevices();
         }
 
         if (targetId?.startsWith("gfind:")) {
             if (enableGfind) {
-                await gfindService.refreshDevices(targetId, { force: options?.force });
+                await gfindService.refreshDevices(targetId, { force });
             }
             return this.getDevices();
         }
 
         const refreshApple = async (): Promise<void> => {
             if (isMinSequoia) {
-                await refreshFindMyDevicesThroughPrivateApi(this.getHelperDeps(), options);
+                await refreshFindMyDevicesThroughPrivateApi(this.getHelperDeps(), normalizedOptions, this.liveState);
                 return;
             }
             await this.refreshUsingFindMyApp();
@@ -171,10 +182,10 @@ export class FindMyInterface {
 
         const tasks: Array<Promise<unknown>> = [refreshApple()];
         if (enableUtag && !targetId) {
-            tasks.push(utagService.refreshDevices(targetId, { force: options?.force }));
+            tasks.push(utagService.refreshDevices(targetId, { force }));
         }
         if (enableGfind && !targetId) {
-            tasks.push(gfindService.refreshDevices(targetId, { force: options?.force }));
+            tasks.push(gfindService.refreshDevices(targetId, { force }));
         }
 
         const results = await Promise.allSettled(tasks);

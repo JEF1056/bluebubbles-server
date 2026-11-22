@@ -30,6 +30,7 @@ import { EventCache } from "@server/eventCache";
 import { CertificateService } from "@server/services/certificateService";
 
 import { HttpRoutes as HttpRoutesV1 } from "./api/v1/httpRoutes";
+import { StickerRouter } from "./api/v2/stickerRouter";
 import { SocketRoutes as SocketRoutesV1 } from "./api/v1/socketRoutes";
 import { ErrorMiddleware } from "./api/v1/middleware/errorMiddleware";
 import { createServerErrorResponse } from "./api/v1/responses";
@@ -257,6 +258,7 @@ export class HttpService extends Loggable {
         // Configure the routing
         const router = new KoaRouter();
         HttpRoutesV1.createRoutes(router);
+        StickerRouter.registerRoutes(router);
 
         // Use the router
         this.koaApp.use(router.routes()).use(router.allowedMethods());
@@ -429,6 +431,7 @@ export class HttpService extends Loggable {
 
     async stop(): Promise<void> {
         this.log.info("Stopping HTTP Service...");
+        this.clearCacheService?.stop();
 
         try {
             await this.closeSocket();

@@ -332,6 +332,7 @@ export class GoogleFindFcmClient {
     private registerInFlight: Promise<string> | null = null;
     private connectInFlight: Promise<void> | null = null;
     private listeners = new Set<(event: FcmNotificationEvent) => void>();
+    private readyWaiters = new Set<() => void>();
 
     constructor(auth: GoogleFindAuthManager, deps: GoogleFindFcmDeps = {}) {
         this.auth = auth;
@@ -358,9 +359,23 @@ export class GoogleFindFcmClient {
         if (this.connected) {
             return this.auth.getState().fcmToken;
         }
-        const deadline = Date.now() + timeoutMs;
-        while (!this.connected && this.running && Date.now() < deadline) {
-            await new Promise(r => setTimeout(r, 100));
+        if (this.running && timeoutMs > 0) {
+            await new Promise<void>(resolve => {
+                let done = false;
+                const finish = () => {
+                    if (done) return;
+                    done = true;
+                    clearTimeout(timer);
+                    this.readyWaiters.delete(finish);
+                    resolve();
+                };
+                const timer = setTimeout(finish, timeoutMs);
+                timer.unref?.();
+                this.readyWaiters.add(finish);
+                if (this.connected || !this.running) {
+                    finish();
+                }
+            });
         }
         return this.auth.getState().fcmToken;
     }
@@ -498,6 +513,13 @@ export class GoogleFindFcmClient {
         this.connected = false;
         this.clearTimers();
         this.destroySocket();
+        this.flushReadyWaiters();
+    }
+
+    private flushReadyWaiters(): void {
+        for (const resolve of [...this.readyWaiters]) {
+            resolve();
+        }
     }
 
     private clearTimers(): void {
@@ -648,6 +670,7 @@ export class GoogleFindFcmClient {
                 }
                 this.connected = true;
                 this.backoffMs = BASE_BACKOFF_MS;
+                this.flushReadyWaiters();
                 this.startHeartbeat();
             } else if (frame.tag === MCS_TAG_HEARTBEAT_PING) {
                 this.socket?.write(encodeMcsHeartbeatAck(undefined, this.lastStreamIdReceived || undefined));

@@ -98,3 +98,48 @@ test("getFileStatSignature detects mtime/size changes and handles missing files"
         fs.rmSync(tmpDir, { recursive: true, force: true });
     }
 });
+
+test("getPollDebounceMs caps at 500ms, floors small positive values, and falls back to 500ms on non-positive/NaN", () => {
+    const noop = () => {};
+    let configured;
+    let serverPresent = true;
+    const { getPollDebounceMs } = loadTsModule(
+        "src/server/databases/imessage/listeners/IMessageListener.ts",
+        {
+            "@server/lib/MultiFileWatcher": { MultiFileWatcher: class {} },
+            "@server/lib/logging/Loggable": { Loggable: class {} },
+            "async-sema": { Sema: class {} },
+            "../pollers": {},
+            "..": {},
+            "@server/helpers/utils": { waitMs: noop },
+            "@server/lib/decorators/DebounceDecorator": { DebounceSubsequentWithWait: () => () => {} },
+            "@server": {
+                Server: () => (serverPresent ? { repo: { getConfig: () => configured } } : null)
+            }
+        }
+    );
+
+    serverPresent = false;
+    assert.equal(getPollDebounceMs(), 500);
+
+    serverPresent = true;
+    for (const invalid of [undefined, NaN, Infinity, -100, 0]) {
+        configured = invalid;
+        assert.equal(getPollDebounceMs(), 500);
+    }
+
+    configured = 10;
+    assert.equal(getPollDebounceMs(), 100);
+
+    configured = 250;
+    assert.equal(getPollDebounceMs(), 250);
+
+    configured = 500;
+    assert.equal(getPollDebounceMs(), 500);
+
+    configured = 1000;
+    assert.equal(getPollDebounceMs(), 500);
+
+    configured = 5000;
+    assert.equal(getPollDebounceMs(), 500);
+});

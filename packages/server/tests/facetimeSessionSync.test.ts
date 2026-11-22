@@ -25,11 +25,19 @@ require.extensions[".ts"] = function (module: any, filename: string) {
 
 // Mock @server and heavy Electron/DB dependencies before importing FaceTime modules.
 const emittedMessages: Array<{ type: string; data: any; priority?: string }> = [];
+const loggedMessages: Array<{ message: string; type?: string }> = [];
 const privateApiCalls: Array<{ method: string; args: any[] }> = [];
 let mockRepoConfig: Record<string, any> = { facetime_calling: true };
 let mockServerEnabled = true;
+let mockConversationState: { data: { conversationCount: number; conversations: any[] } } = {
+    data: { conversationCount: 0, conversations: [] }
+};
+let getHandlesOverride: ((args: { address: string }) => Promise<any>) | null = null;
 
 const mockServerInstance = {
+    log: (message: string, type?: string) => {
+        loggedMessages.push({ message, type });
+    },
     repo: {
         getConfig: (key: string) => mockRepoConfig[key]
     },
@@ -67,13 +75,18 @@ const mockServerInstance = {
             admitAnyPendingMember: async () => {
                 privateApiCalls.push({ method: "admitAnyPendingMember", args: [] });
                 return { data: { admittedCount: 1, admittedParticipants: ["self"] } };
+            },
+            getConversationState: async () => {
+                privateApiCalls.push({ method: "getConversationState", args: [] });
+                return mockConversationState;
             }
         }
     },
     iMessageRepo: {
-        getHandles: async ({ address }: { address: string }) => [
-            [{ address, uncanonicalizedId: address, service: "FaceTime" }]
-        ]
+        getHandles: async (args: { address: string }) =>
+            getHandlesOverride
+                ? getHandlesOverride(args)
+                : [[{ address: args.address, uncanonicalizedId: args.address, service: "FaceTime" }]]
     },
     emitMessage: async (type: string, data: any, priority?: string) => {
         emittedMessages.push({ type, data, priority });
@@ -148,9 +161,12 @@ const { PrivateApiFaceTimeStatusHandler } = require(
 const resetState = () => {
     FaceTimeSessionManager().clearSessions();
     emittedMessages.length = 0;
+    loggedMessages.length = 0;
     privateApiCalls.length = 0;
     mockRepoConfig = { facetime_calling: true };
     mockServerEnabled = true;
+    mockConversationState = { data: { conversationCount: 0, conversations: [] } };
+    getHandlesOverride = null;
 };
 
 test("FaceTimeSession.serialize() returns full backwards-compatible payload and preserves uuid on invalidate()", () => {
@@ -500,4 +516,507 @@ test("callee hanging up while admitted web participant remains ends session and 
                 c.args[2] === "grp-drop-1"
         )
     );
+});
+
+test("handleStandard includes metadata in legacy incoming-facetime and emits ft-call-status-changed on answer/disconnect", async () => {
+    resetState();
+    mockRepoConfig.facetime_calling = false;
+    const handler = new PrivateApiFaceTimeStatusHandler();
+
+    // Untracked ANSWERED event should not emit ft-call-status-changed
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "untracked-call",
+                call_status: FaceTimeSessionStatus.ANSWERED
+            }
+        } as any,
+        null as any
+    );
+    assert.equal(emittedMessages.length, 0);
+
+    // Incoming video FaceTime call
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "legacy-in-1",
+                call_status: FaceTimeSessionStatus.INCOMING,
+                is_outgoing: false,
+                is_sending_video: true,
+                is_sending_audio: false,
+                is_telephony: false,
+                handle: { value: "+15551112222" }
+            }
+        } as any,
+        null as any
+    );
+
+    assert.equal(emittedMessages.length, 1);
+    assert.equal(emittedMessages[0].type, "incoming-facetime");
+    assert.equal(typeof emittedMessages[0].data, "string");
+    const parsed = JSON.parse(emittedMessages[0].data);
+    assert.equal(parsed.caller, "+15551112222");
+    assert.equal(parsed.address, "+15551112222");
+    assert.equal(parsed.uuid, "legacy-in-1");
+    assert.equal(parsed.is_video, true);
+    assert.equal(parsed.is_audio, false);
+    assert.equal(parsed.is_telephony, false);
+    assert.equal(typeof parsed.timestamp, "number");
+
+    // Subsequent ANSWERED event emits ft-call-status-changed {uuid, status_id}
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "legacy-in-1",
+                call_status: FaceTimeSessionStatus.ANSWERED
+            }
+        } as any,
+        null as any
+    );
+    assert.equal(emittedMessages.length, 2);
+    assert.equal(emittedMessages[1].type, "ft-call-status-changed");
+    assert.deepEqual(emittedMessages[1].data, {
+        uuid: "legacy-in-1",
+        status_id: FaceTimeSessionStatus.ANSWERED
+    });
+
+    // Subsequent DISCONNECTED event emits ft-call-status-changed {uuid, status_id} and clears tracking
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "legacy-in-1",
+                call_status: FaceTimeSessionStatus.DISCONNECTED
+            }
+        } as any,
+        null as any
+    );
+    assert.equal(emittedMessages.length, 3);
+    assert.equal(emittedMessages[2].type, "ft-call-status-changed");
+    assert.deepEqual(emittedMessages[2].data, {
+        uuid: "legacy-in-1",
+        status_id: FaceTimeSessionStatus.DISCONNECTED
+    });
+
+    // Duplicate DISCONNECTED after cleanup is ignored
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "legacy-in-1",
+                call_status: FaceTimeSessionStatus.DISCONNECTED
+            }
+        } as any,
+        null as any
+    );
+    assert.equal(emittedMessages.length, 3);
+
+    // Incoming telephony call sets is_telephony: true, is_video: false, is_audio: true
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "legacy-in-tel",
+                call_status: FaceTimeSessionStatus.INCOMING,
+                is_telephony: true,
+                handle: { value: "+15553334444" }
+            }
+        } as any,
+        null as any
+    );
+    assert.equal(emittedMessages.length, 4);
+    const parsedTel = JSON.parse(emittedMessages[3].data);
+    assert.equal(parsedTel.uuid, "legacy-in-tel");
+    assert.equal(parsedTel.address, "+15553334444");
+    assert.equal(parsedTel.is_telephony, true);
+    assert.equal(parsedTel.is_video, false);
+    assert.equal(parsedTel.is_audio, true);
+});
+
+test("Mac leaves after admit, survives duplicate TUCall DISCONNECTED events, and auto-hangs up once everyone leaves", async () => {
+    resetState();
+    const handler = new PrivateApiFaceTimeStatusHandler();
+    const link = "https://facetime.apple.com/join#v=1&p=autoleave";
+    const session = new FaceTimeSession({
+        callUuid: "call-autoleave-1",
+        status: FaceTimeSessionStatus.ANSWERED,
+        url: link,
+        isOutgoing: true,
+        isVideo: true
+    });
+    session.conversationGroupUuid = "grp-autoleave-1";
+    session.conversationMonitorIntervalMs = 15;
+
+    // Room initially occupied by admitted web user + remote callee while Mac is not joined
+    mockConversationState = {
+        data: {
+            conversationCount: 1,
+            conversations: [
+                {
+                    uuid: "conv-autoleave-1",
+                    groupUUID: "grp-autoleave-1",
+                    link,
+                    hasJoined: false,
+                    activeRemoteParticipantCount: 2,
+                    activeLightweightParticipantCount: 1,
+                    activeNonLightweightParticipantCount: 1,
+                    pendingMemberCount: 0
+                }
+            ]
+        }
+    };
+
+    await session.admitAndLeave(500, 10, true);
+    assert.ok(privateApiCalls.some(c => c.method === "setMuted" && c.args[0] === "call-autoleave-1" && c.args[1] === true));
+    assert.ok(privateApiCalls.some(c => c.method === "leaveCall" && c.args[0] === "call-autoleave-1"));
+    assert.equal(session.leftForHandoff, true);
+
+    // Simulate duplicate TUCallCenterCallStatusChanged + VideoCallStatusChanged DISCONNECTED events for the Mac
+    for (let i = 0; i < 2; i++) {
+        await handler.handle(
+            {
+                event: "ft-call-status-changed",
+                data: {
+                    call_uuid: "call-autoleave-1",
+                    call_status: FaceTimeSessionStatus.DISCONNECTED,
+                    disconnected_reason: 1,
+                    active_remote_participants_count: 0,
+                    active_non_lightweight_participants_count: 0
+                }
+            } as any,
+            null as any
+        );
+    }
+    assert.equal(session.status, FaceTimeSessionStatus.ANSWERED, "duplicate Mac disconnect must not end active call");
+
+    // Let monitor observe the occupied room
+    await new Promise(r => setTimeout(r, 40));
+    assert.equal(session.status, FaceTimeSessionStatus.ANSWERED);
+
+    // Now everyone leaves -> conversation disappears from activeConversations
+    mockConversationState = { data: { conversationCount: 0, conversations: [] } };
+    await new Promise(r => setTimeout(r, 120));
+
+    assert.equal(session.status, FaceTimeSessionStatus.DISCONNECTED);
+    assert.equal(session.endedReason, "remote_ended");
+    assert.ok(
+        privateApiCalls.some(
+            c =>
+                c.method === "endAndInvalidateCall" &&
+                c.args[0] === "call-autoleave-1" &&
+                c.args[1] === link &&
+                c.args[2] === "grp-autoleave-1"
+        )
+    );
+});
+
+test("conversation monitor stops safely without hanging up if unjoined conversation is never reported", async () => {
+    resetState();
+    const session = new FaceTimeSession({
+        callUuid: "call-unreported-1",
+        status: FaceTimeSessionStatus.ANSWERED,
+        url: "https://facetime.apple.com/join#v=1&p=unreported",
+        isOutgoing: true,
+        isVideo: true
+    });
+    session.conversationGroupUuid = "grp-unreported-1";
+    session.conversationMonitorIntervalMs = 10;
+    session.hasParticipantCounts = true;
+    session.activeRemoteParticipantsCount = 2;
+
+    // macOS never returns the unjoined conversation in get-conversation-state
+    mockConversationState = { data: { conversationCount: 0, conversations: [] } };
+    session.startConversationMonitor(10);
+
+    await new Promise(r => setTimeout(r, 120));
+    assert.equal(session.status, FaceTimeSessionStatus.ANSWERED);
+    assert.equal(session.conversationMonitorService, null, "monitor should stop after missing limit");
+    assert.equal(
+        privateApiCalls.some(c => c.method === "endAndInvalidateCall"),
+        false,
+        "must not kick/invalidate when unjoined conversation was never observed"
+    );
+});
+
+test("first-seen non-outgoing status 6 surfaces missed/silenced session and throttles DND alert to 1/hr", async () => {
+    resetState();
+    const handler = new PrivateApiFaceTimeStatusHandler();
+
+    // Calling mode: silenced incoming call arrives directly as status 6 (never saw status 4)
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "call-silenced-1",
+                call_status: FaceTimeSessionStatus.DISCONNECTED,
+                is_outgoing: false,
+                disconnected_reason: 21,
+                filtered_out_reason: 6,
+                is_incoming_silenced: true,
+                handle: { value: "+15551112222" }
+            }
+        } as any,
+        null as any
+    );
+
+    const broadcasts = emittedMessages.filter(m => m.type === "ft-call-status-changed");
+    assert.equal(broadcasts.length, 1);
+    assert.equal(broadcasts[0].data.status_id, FaceTimeSessionStatus.DISCONNECTED);
+    assert.equal(broadcasts[0].data.ended_reason, "missed");
+    assert.equal(broadcasts[0].data.silenced_reason, "dnd");
+    assert.equal(loggedMessages.length, 1);
+    assert.equal(loggedMessages[0].type, "warn");
+    assert.match(loggedMessages[0].message, /mirroring or sharing the display/i);
+
+    // Second silenced call within 1 hour emits session broadcast but throttles the server alert
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "call-silenced-2",
+                call_status: FaceTimeSessionStatus.DISCONNECTED,
+                is_outgoing: false,
+                disconnected_reason: 21,
+                filtered_out_reason: 6,
+                is_incoming_silenced: true,
+                handle: { value: "+15553334444" }
+            }
+        } as any,
+        null as any
+    );
+    assert.equal(emittedMessages.filter(m => m.type === "ft-call-status-changed").length, 2);
+    assert.equal(loggedMessages.length, 1, "alert should be throttled to once per hour");
+
+    // Standard mode (facetime_calling=false): first-seen status 6 non-outgoing also surfaces missed session without DND
+    mockRepoConfig.facetime_calling = false;
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "call-missed-std",
+                call_status: FaceTimeSessionStatus.DISCONNECTED,
+                is_outgoing: false,
+                disconnected_reason: 1,
+                filtered_out_reason: 0,
+                is_incoming_silenced: true,
+                handle: { value: "+15556667777" }
+            }
+        } as any,
+        null as any
+    );
+    const stdBroadcast = emittedMessages.at(-1)!;
+    assert.equal(stdBroadcast.type, "ft-call-status-changed");
+    assert.equal(stdBroadcast.data.uuid, "call-missed-std");
+    assert.equal(stdBroadcast.data.ended_reason, "missed");
+    assert.equal(stdBroadcast.data.silenced_reason, null);
+});
+
+test("unanswered incoming disconnects as missed while answered incoming disconnects as remote_ended", async () => {
+    resetState();
+    const handler = new PrivateApiFaceTimeStatusHandler();
+
+    // Incoming -> disconnect without answer -> missed
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "call-unanswered-in",
+                call_status: FaceTimeSessionStatus.INCOMING,
+                is_outgoing: false,
+                handle: { value: "+15550001111" }
+            }
+        } as any,
+        null as any
+    );
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "call-unanswered-in",
+                call_status: FaceTimeSessionStatus.DISCONNECTED,
+                is_outgoing: false,
+                disconnected_reason: 1
+            }
+        } as any,
+        null as any
+    );
+    assert.equal(emittedMessages.at(-1)?.data.ended_reason, "missed");
+
+    // Incoming -> answered -> disconnect -> remote_ended
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "call-answered-in",
+                call_status: FaceTimeSessionStatus.INCOMING,
+                is_outgoing: false,
+                handle: { value: "+15550002222" }
+            }
+        } as any,
+        null as any
+    );
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "call-answered-in",
+                call_status: FaceTimeSessionStatus.ANSWERED,
+                is_outgoing: false
+            }
+        } as any,
+        null as any
+    );
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "call-answered-in",
+                call_status: FaceTimeSessionStatus.DISCONNECTED,
+                is_outgoing: false,
+                disconnected_reason: 1
+            }
+        } as any,
+        null as any
+    );
+    assert.equal(emittedMessages.at(-1)?.data.ended_reason, "remote_ended");
+});
+
+test("handleCalling broadcasts before handle DB lookup and aligns isAudio/isVideo with handleStandard", async () => {
+    resetState();
+    const handler = new PrivateApiFaceTimeStatusHandler();
+
+    let resolveHandles!: (rows: any) => void;
+    getHandlesOverride = () =>
+        new Promise(resolve => {
+            resolveHandles = resolve;
+        });
+
+    const handlePromise = handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "call-fast-broadcast",
+                call_status: FaceTimeSessionStatus.INCOMING,
+                is_outgoing: false,
+                is_video: true,
+                is_sending_audio: true,
+                handle: { value: "+15559990000" }
+            }
+        } as any,
+        null as any
+    );
+
+    // Yield microtasks: broadcastUpdate must have already fired while getHandles is still pending
+    await Promise.resolve();
+    assert.equal(emittedMessages.length, 1, "session should broadcast before DB handle lookup completes");
+    assert.equal(emittedMessages[0].data.is_video, true);
+    assert.equal(emittedMessages[0].data.is_audio, false);
+
+    resolveHandles([[{ address: "+15559990000", uncanonicalizedId: "+15559990000", service: "FaceTime" }]]);
+    await handlePromise;
+    assert.equal(emittedMessages.length, 1, "handle enrichment should not emit a duplicate broadcast");
+    assert.equal(FaceTimeSessionManager().findSession("call-fast-broadcast")?.handle?.address, "+15559990000");
+
+    // Standard mode incoming FaceTime audio call (is_video: false, is_sending_audio: false while ringing)
+    mockRepoConfig.facetime_calling = false;
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "call-std-audio",
+                call_status: FaceTimeSessionStatus.INCOMING,
+                is_outgoing: false,
+                is_video: false,
+                is_sending_audio: false,
+                handle: { value: "+15558887777" }
+            }
+        } as any,
+        null as any
+    );
+    const legacyMsg = JSON.parse(emittedMessages.at(-1)!.data);
+    const fromEventSession = FaceTimeSession.fromEvent({
+        call_uuid: "call-std-audio",
+        call_status: FaceTimeSessionStatus.INCOMING,
+        is_video: false,
+        is_sending_audio: false
+    });
+    assert.equal(legacyMsg.is_video, false);
+    assert.equal(legacyMsg.is_audio, true);
+    assert.equal(fromEventSession.isVideo, legacyMsg.is_video);
+    assert.equal(fromEventSession.isAudio, legacyMsg.is_audio);
+});
+
+test("handoff resets leftForHandoff/handoffLeaveObserved and admitSelf cleans up on disconnect", async () => {
+    resetState();
+    const session = new FaceTimeSession({
+        callUuid: "call-handoff-reset",
+        status: FaceTimeSessionStatus.ANSWERED,
+        url: "https://facetime.apple.com/join#v=1&p=reset1",
+        isOutgoing: true,
+        isVideo: true
+    });
+    session.leftForHandoff = true;
+    session.handoffLeaveObserved = true;
+
+    await FaceTimeInterface.handoff("call-handoff-reset", {
+        deviceId: "android-1",
+        deviceName: "Pixel",
+        mode: "audio"
+    });
+    assert.equal(session.leftForHandoff, false);
+    assert.equal(session.handoffLeaveObserved, false);
+
+    // admitSelf should settle and clear selfAdmissionService immediately on disconnect
+    const admitSession = new FaceTimeSession({
+        callUuid: "call-admit-dc",
+        status: FaceTimeSessionStatus.ANSWERED,
+        isOutgoing: true,
+        isVideo: true
+    });
+    const admitPromise = admitSession.admitSelf(false);
+    admitSession.invalidate("user_ended");
+    await admitPromise;
+    assert.equal(admitSession.selfAdmissionService, null);
+});
+
+test("declining an incoming call preserves ended_reason='declined' on trailing DISCONNECTED without missed broadcast", async () => {
+    resetState();
+    const handler = new PrivateApiFaceTimeStatusHandler();
+
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "call-decline-preserve",
+                call_status: FaceTimeSessionStatus.INCOMING,
+                is_outgoing: false,
+                handle: { value: "+15554445555" }
+            }
+        } as any,
+        null as any
+    );
+
+    await FaceTimeInterface.decline("call-decline-preserve");
+    const afterDeclineCount = emittedMessages.length;
+    assert.equal(emittedMessages.at(-1)?.data.ended_reason, "declined");
+
+    // Trailing macOS helper DISCONNECTED event arrives with disconnected_reason: 1
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "call-decline-preserve",
+                call_status: FaceTimeSessionStatus.DISCONNECTED,
+                is_outgoing: false,
+                disconnected_reason: 1
+            }
+        } as any,
+        null as any
+    );
+
+    assert.equal(FaceTimeSessionManager().findSession("call-decline-preserve")?.endedReason, "declined");
+    assert.equal(emittedMessages.length, afterDeclineCount, "must not emit a second missed broadcast after decline");
 });

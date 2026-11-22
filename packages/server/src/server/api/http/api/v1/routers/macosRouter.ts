@@ -8,8 +8,10 @@ export class MacOsRouter {
     static async lock(ctx: RouterContext, _: Next) {
         try {
             // Let it respond before we lock
-            setTimeout(async () => {
-                await MacOsInterface.lock();
+            setTimeout(() => {
+                MacOsInterface.lock().catch(err => {
+                    console.error(`Failed to lock macOS: ${err?.message ?? String(err)}`);
+                });
             }, 1000);
 
             return new Success(ctx, { message: "Successfully executed lock command!" }).send();

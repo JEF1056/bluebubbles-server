@@ -200,6 +200,10 @@ const guardedLookup = (hostname: string, options: any, callback: (...args: any[]
     dns.lookup(hostname, { ...options, all: true }, (err, addresses: dns.LookupAddress[]) => {
         if (err) return callback(err);
 
+        if (!addresses || addresses.length === 0) {
+            return callback(new WebhookUrlError(`Webhook host "${hostname}" did not resolve to any addresses`));
+        }
+
         const blocked = addresses.find(a => isBlockedAddress(a.address));
         if (blocked) {
             const message = `Webhook host "${hostname}" resolved to a local network address (${blocked.address})`;

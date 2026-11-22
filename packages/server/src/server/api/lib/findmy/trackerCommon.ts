@@ -137,15 +137,33 @@ const loadGeocodeCache = (baseDir: string): Map<string, TrackerGeocodedAddress> 
     return geocodeCache;
 };
 
-const saveGeocodeCache = (baseDir: string, cache: Map<string, TrackerGeocodedAddress>): void => {
+let geocodeSaveTimer: NodeJS.Timeout | null = null;
+let pendingGeocodeSave: { baseDir: string; cache: Map<string, TrackerGeocodedAddress> } | null = null;
+const GEOCODE_SAVE_DEBOUNCE_MS = 2_000;
+
+const flushGeocodeCache = async (baseDir: string, cache: Map<string, TrackerGeocodedAddress>): Promise<void> => {
     try {
-        fs.mkdirSync(baseDir, { recursive: true });
+        await fs.promises.mkdir(baseDir, { recursive: true });
         const cachePath = resolveSafePath(GEOCODE_CACHE_FILE, baseDir);
         const entries = Array.from(cache.entries()).slice(-GEOCODE_CACHE_MAX_ENTRIES);
-        fs.writeFileSync(cachePath, JSON.stringify(entries), { mode: 0o600 });
+        await fs.promises.writeFile(cachePath, JSON.stringify(entries), { mode: 0o600 });
     } catch {
         // Best-effort cache persistence.
     }
+};
+
+const saveGeocodeCache = (baseDir: string, cache: Map<string, TrackerGeocodedAddress>): void => {
+    pendingGeocodeSave = { baseDir, cache };
+    if (geocodeSaveTimer) clearTimeout(geocodeSaveTimer);
+    geocodeSaveTimer = setTimeout(() => {
+        geocodeSaveTimer = null;
+        const pending = pendingGeocodeSave;
+        pendingGeocodeSave = null;
+        if (pending) {
+            void flushGeocodeCache(pending.baseDir, pending.cache);
+        }
+    }, GEOCODE_SAVE_DEBOUNCE_MS);
+    geocodeSaveTimer.unref?.();
 };
 
 const touchLru = (cache: Map<string, TrackerGeocodedAddress>, key: string, value: TrackerGeocodedAddress): void => {

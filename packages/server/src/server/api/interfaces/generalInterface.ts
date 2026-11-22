@@ -25,6 +25,7 @@ export class GeneralInterface {
             local_ipv4s: FileSystem.getLocalIps("IPv4"),
             local_ipv6s: FileSystem.getLocalIps("IPv6"),
             supportsFaceTimeCalls: isMinMonterey,
+            supports_stickers: true,
             lan_proof_key: Server().repo.getConfig("lan_proof_key") as string
         };
     }

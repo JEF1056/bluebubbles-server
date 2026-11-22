@@ -122,6 +122,7 @@ export class FaceTimeInterface {
             session.isTelephony = isTelephony;
         }
         const callUuid = session.callUuid || rawCallUuid;
+        const groupUuid = result?.data?.conversation_group_uuid ?? result?.data?.group_uuid ?? null;
         const call = {
             call_uuid: callUuid,
             callUuid,
@@ -129,10 +130,13 @@ export class FaceTimeInterface {
             is_video: video,
             is_telephony: isTelephony,
             address: addresses[0],
-            group_uuid: result?.data?.group_uuid ?? null
+            group_uuid: groupUuid
         };
-        if (result?.data?.group_uuid && !session.conversationGroupUuid) {
-            session.conversationGroupUuid = result.data.group_uuid;
+        if (groupUuid && !session.conversationGroupUuid) {
+            session.conversationGroupUuid = groupUuid;
+        }
+        if (result?.data?.conversation_uuid && !session.conversationUuid) {
+            session.conversationUuid = result.data.conversation_uuid;
         }
         applyMetadata(session, { deviceId, deviceName, displayName, chatGuid, addresses }, true);
 
@@ -162,7 +166,7 @@ export class FaceTimeInterface {
                 throw err;
             }
         }
-        session.admitAndLeave(90000, 15000, false).catch(() => {});
+        session.admitAndLeave(90000, 15000, true).catch(() => {});
         FaceTimeSessionManager().broadcastUpdate(session);
         return { link: { url }, call, session: session.serialize() };
     }
@@ -211,7 +215,7 @@ export class FaceTimeInterface {
             deviceId = null,
             deviceName = null,
             mode
-        }: { deviceId?: string | null; deviceName?: string | null; mode?: "video" | "audio" } = {}
+        }: { deviceId?: string | null; deviceName?: string | null; mode?: "video" | "audio" | "video_bridge" } = {}
     ): Promise<{ link: string | null; session: SerializedFaceTimeSession }> {
         checkPrivateApiStatus();
         if (!isMinMonterey) throw new Error("Handing off FaceTime calls is only available on macOS Monterey and newer!");
@@ -223,8 +227,10 @@ export class FaceTimeInterface {
 
         if (deviceId) session.activeDeviceId = deviceId;
         if (deviceName) session.activeDeviceName = deviceName;
+        session.leftForHandoff = false;
+        session.handoffLeaveObserved = false;
 
-        const targetMode: "video" | "audio" = mode ?? (session.isTelephony ? "audio" : "video");
+        const targetMode: "video" | "audio" | "video_bridge" = mode ?? (session.isTelephony ? "audio" : "video");
         if (targetMode === "video" && !session.isTelephony) {
             FaceTimeAudioBridge.getInstance().cleanupSession(session.callUuid || session.uuid);
             session.isVideo = true;
@@ -236,6 +242,13 @@ export class FaceTimeInterface {
                 Server()?.privateApi?.facetime?.setMuted(session.callUuid, true)?.catch?.(() => {});
             }
             session.admitSelf(false).catch(() => {});
+        } else if (targetMode === "video_bridge" && !session.isTelephony) {
+            // Native WebRTC video bridge keeps the active bridge alive and preserves video metadata.
+            session.isVideo = true;
+            session.isAudio = false;
+            if (session.callUuid && !session.isLinkOnly) {
+                Server()?.privateApi?.facetime?.setMuted(session.callUuid, session.isMuted)?.catch?.(() => {});
+            }
         } else {
             session.isAudio = true;
             session.isVideo = false;

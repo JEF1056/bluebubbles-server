@@ -11,12 +11,44 @@ export const useInterval = (callback: () => void, delay: number | null) => {
         savedCallback.current = callback;
     }, [callback]);
 
-    // Set up the interval.
+    // Set up the interval, pausing while the document is hidden.
     useEffect(() => {
         // Don't schedule if no delay is specified.
         // Note: 0 is a valid value for delay.
         if (!delay && delay !== 0) return;
-        const id = setInterval(() => savedCallback.current(), delay);
-        return () => clearInterval(id);
+
+        let id: ReturnType<typeof setInterval> | null = null;
+        const start = () => {
+            if (id !== null || (typeof document !== 'undefined' && document.hidden)) return;
+            id = setInterval(() => {
+                if (typeof document !== 'undefined' && document.hidden) return;
+                savedCallback.current();
+            }, delay);
+        };
+        const stop = () => {
+            if (id !== null) {
+                clearInterval(id);
+                id = null;
+            }
+        };
+        const onVisibilityChange = () => {
+            if (document.hidden) {
+                stop();
+            } else {
+                start();
+            }
+        };
+
+        start();
+        if (typeof document !== 'undefined') {
+            document.addEventListener('visibilitychange', onVisibilityChange);
+        }
+
+        return () => {
+            stop();
+            if (typeof document !== 'undefined') {
+                document.removeEventListener('visibilitychange', onVisibilityChange);
+            }
+        };
     }, [delay]);
 };

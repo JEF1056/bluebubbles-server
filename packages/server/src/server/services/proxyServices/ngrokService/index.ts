@@ -159,6 +159,10 @@ export class NgrokService extends Proxy {
      * Disconnect from ngrok
      */
     async disconnect(): Promise<void> {
+        if (this.refreshTimer) {
+            clearTimeout(this.refreshTimer);
+            this.refreshTimer = null;
+        }
         try {
             await disconnect();
             await kill();

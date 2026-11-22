@@ -4,7 +4,7 @@ import { UpdatableStatBox } from './index';
 export const DailyMessagesStatBox = (
     {
         autoUpdate = true,
-        updateInterval = 60000,
+        updateInterval = 300000,
         delay = 0
     }:
     {

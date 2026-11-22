@@ -2,7 +2,7 @@
 import { Brackets, DataSource, SelectQueryBuilder } from "typeorm";
 
 import { DBMessageParams, ChatParams, HandleParams, DBWhereItem } from "@server/databases/imessage/types";
-import { convertDateTo2001Time } from "@server/databases/imessage/helpers/dateUtil";
+import { convertDateTo2001Time, convertDateToCocoaTime } from "@server/databases/imessage/helpers/dateUtil";
 import { getChatGuidCandidates } from "@server/databases/imessage/helpers/chatGuid";
 import { Chat } from "@server/databases/imessage/entity/Chat";
 import { Handle } from "@server/databases/imessage/entity/Handle";
@@ -779,9 +779,9 @@ export class MessageRepository extends Loggable {
             result = await this.db.getRepository(Chat).query(
                 `SELECT COUNT(attachment.ROWID) AS media_count
                 FROM attachment
-                WHERE attachment.date >= ? AND attachment.mime_type LIKE '${mType}%';`,
+                WHERE attachment.created_date >= ? AND attachment.mime_type LIKE '${mType}%';`,
                 [
-                    convertDateTo2001Time(after)
+                    convertDateToCocoaTime(after)
                 ]
             );
         }

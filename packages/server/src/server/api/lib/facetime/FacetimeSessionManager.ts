@@ -63,7 +63,8 @@ class FaceTimeSessionManagerSingleton {
             active_device_id: payload.active_device_id,
             active_device_name: payload.active_device_name,
             ended_reason: payload.ended_reason,
-            ended_error: payload.ended_error
+            ended_error: payload.ended_error,
+            silenced_reason: payload.silenced_reason
         });
 
         const key = payload.uuid || payload.session_uuid;

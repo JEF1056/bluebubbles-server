@@ -30,6 +30,11 @@ type ProcessSpawnerOutput = {
 };
 
 
+const BASE_RESTART_DELAY_MS = 2000;
+const MAX_RESTART_DELAY_MS = 60000;
+const MAX_RESTART_RETRIES = 10;
+const STABLE_RUNTIME_RESET_MS = 60000;
+
 export class ProcessSpawner extends Loggable {
     tag = "ProcessSpawner";
 
@@ -58,6 +63,12 @@ export class ProcessSpawner extends Loggable {
     onExit: ((code: number) => void) | null;
 
     private _output: ProcessSpawnerOutput[] = [];
+
+    private restartTimer: NodeJS.Timeout | null = null;
+
+    private retryCount = 0;
+
+    private lastSpawnStart = 0;
 
     get output() {
         // Consecutive log outputs of the same type should be appended to the same line.
@@ -126,6 +137,11 @@ export class ProcessSpawner extends Loggable {
     async execute(): Promise<ProcessSpawner> {
         return new Promise((resolve: (spawner: ProcessSpawner) => void, reject: (err: ProcessSpawnerError) => void) => {
             try {
+                if (this.restartTimer) {
+                    clearTimeout(this.restartTimer);
+                    this.restartTimer = null;
+                }
+                this.lastSpawnStart = Date.now();
                 // Never run through a shell: arguments are passed to the program verbatim,
                 // so nothing in them (config values, tokens, paths) can be interpreted as a command
                 this.process = spawn(this.command, this.args, { ...this.options, shell: false });
@@ -220,12 +236,37 @@ export class ProcessSpawner extends Loggable {
 
         if (code !== 0 && this.restartOnNonZeroExit) {
             if (!this.restartOnNonZeroExitCondition || this.restartOnNonZeroExitCondition(code)) {
-                this.execute();
+                if (this.lastSpawnStart > 0 && Date.now() - this.lastSpawnStart > STABLE_RUNTIME_RESET_MS) {
+                    this.retryCount = 0;
+                }
+                if (this.retryCount >= MAX_RESTART_RETRIES) {
+                    this.log.warn(`Max restart retries (${MAX_RESTART_RETRIES}) reached for ${this.command}; not restarting.`);
+                    return;
+                }
+
+                const delayMs = Math.min(MAX_RESTART_DELAY_MS, BASE_RESTART_DELAY_MS * Math.pow(2, this.retryCount));
+                this.retryCount += 1;
+                if (this.restartTimer) {
+                    clearTimeout(this.restartTimer);
+                }
+                this.restartTimer = setTimeout(() => {
+                    this.restartTimer = null;
+                    if (!this.restartOnNonZeroExit) return;
+                    void this.execute().catch(err => {
+                        this.handleLog(`Restart failed: ${err?.message ?? String(err)}`);
+                    });
+                }, delayMs);
+                this.restartTimer.unref?.();
             }
         }
     }
 
     async kill() {
+        this.restartOnNonZeroExit = false;
+        if (this.restartTimer) {
+            clearTimeout(this.restartTimer);
+            this.restartTimer = null;
+        }
         if (this.process) {
             this.process.kill();
         }

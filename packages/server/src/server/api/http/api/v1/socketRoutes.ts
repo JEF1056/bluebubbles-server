@@ -527,11 +527,11 @@ export class SocketRoutes {
 
             // Get data as a Uint8Array
             let data = FileSystem.readFileChunk(fPath, start, chunkSize);
-            if (compress) data = Uint8Array.from(zlib.deflateSync(data));
-
             if (!data) {
                 return response(cb, "attachment-chunk", createNoDataResponse());
             }
+
+            if (compress) data = Uint8Array.from(zlib.deflateSync(data));
 
             // Convert data to a base64 string
             return response(cb, "attachment-chunk", createSuccessResponse(base64.bytesToBase64(data)));
@@ -1218,11 +1218,17 @@ export class SocketRoutes {
          * Checks for a server update
          */
         socket.on("check-for-server-update", async (_, cb): Promise<void> => {
-            return response(cb, "save-vcf", createSuccessResponse(await GeneralInterface.checkForUpdate()));
+            return response(cb, "check-for-server-update", createSuccessResponse(await GeneralInterface.checkForUpdate()));
         });
 
         registerForkSocketRoutes(socket, log);
         gfindService.onClientConnected();
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            require("@server/api/lib/utag")?.utagService?.onClientConnected?.();
+        } catch {
+            // Ignore when utag module is not stubbed in unit tests.
+        }
 
         socket.on("disconnect", reason => {
             FaceTimeAudioBridge.getInstance().handleSocketDisconnect(socket.id);

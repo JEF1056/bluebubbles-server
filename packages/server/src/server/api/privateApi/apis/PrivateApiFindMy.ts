@@ -17,6 +17,8 @@ export interface RefreshFindMyFriendsOptions {
     live?: boolean;
 }
 
+export const FIND_MY_DEVICES_REFRESH_TIMEOUT_MS = 12_000;
+
 export interface RefreshFindMyDevicesOptions {
     deviceId?: string;
     force?: boolean;
@@ -86,11 +88,30 @@ export class PrivateApiFindMy extends PrivateApiAction {
 
     async refreshDevices(options?: RefreshFindMyDevicesOptions): Promise<TransactionResult> {
         const target = this.requireTarget(this.devicesTargetProcessIdentifier, "Devices");
-        return this.sendApiMessage(
-            "refresh-findmy-devices",
-            compactPayload({ deviceId: options?.deviceId, force: options?.force }),
-            new TransactionPromise(TransactionType.FIND_MY),
-            target
-        );
+        const transaction = new TransactionPromise(TransactionType.FIND_MY);
+        let timeoutId: ReturnType<typeof setTimeout> | undefined;
+        try {
+            return await Promise.race([
+                this.sendApiMessage(
+                    "refresh-findmy-devices",
+                    compactPayload({ deviceId: options?.deviceId, force: options?.force }),
+                    transaction,
+                    target
+                ),
+                new Promise<never>((_, reject) => {
+                    timeoutId = setTimeout(() => {
+                        const error = new Error(
+                            `Find My Devices refresh timed out after ${FIND_MY_DEVICES_REFRESH_TIMEOUT_MS}ms`
+                        );
+                        if (!transaction.isResolved && typeof transaction.reject === "function") {
+                            transaction.reject(error);
+                        }
+                        reject(error);
+                    }, FIND_MY_DEVICES_REFRESH_TIMEOUT_MS);
+                })
+            ]);
+        } finally {
+            if (timeoutId !== undefined) clearTimeout(timeoutId);
+        }
     }
 }

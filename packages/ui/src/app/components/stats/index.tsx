@@ -56,7 +56,7 @@ export const UpdatableStatBox = (
         condition = null,
         dispatchOverride = null,
         autoUpdate = true,
-        updateInterval = 60000,
+        updateInterval = 300000,
         delay = 0,
         pastDays = null
     }:

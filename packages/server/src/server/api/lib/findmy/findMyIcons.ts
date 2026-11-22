@@ -480,8 +480,34 @@ export async function resolveFindMyDeviceIconBytes(
     const task = (async (): Promise<ResolvedDeviceIcon | null> => {
         for (const url of candidateUrls) {
             try {
-                const res = await fetchFn(url, { redirect: "follow" });
-                if (!res.ok) continue;
+                let currentUrl = url;
+                let res: Response | null = null;
+                for (let hop = 0; hop <= 5; hop++) {
+                    const attempt = await fetchFn(currentUrl, { redirect: "manual" });
+                    if (attempt.status >= 300 && attempt.status < 400) {
+                        const location = attempt.headers.get("location");
+                        if (!location || hop === 5) {
+                            res = null;
+                            break;
+                        }
+                        let nextUrl: string;
+                        try {
+                            nextUrl = new URL(location, currentUrl).toString();
+                        } catch {
+                            res = null;
+                            break;
+                        }
+                        if (!isAllowedUpstreamIconUrl(nextUrl)) {
+                            res = null;
+                            break;
+                        }
+                        currentUrl = nextUrl;
+                        continue;
+                    }
+                    res = attempt;
+                    break;
+                }
+                if (!res || !res.ok) continue;
                 if (res.url && !isAllowedUpstreamIconUrl(res.url)) continue;
                 const ab = await res.arrayBuffer();
                 const bytes = Buffer.from(ab);

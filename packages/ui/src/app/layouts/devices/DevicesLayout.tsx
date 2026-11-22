@@ -31,6 +31,7 @@ import { clear, DeviceItem, addAll as addAllDevices } from '../../slices/Devices
 import { AnyAction } from '@reduxjs/toolkit';
 import { AiOutlineInfoCircle } from 'react-icons/ai';
 import { getDevices } from '../../utils/IpcUtils';
+import { useInterval } from '../../hooks/UseInterval';
 
 
 const confirmationActions: ConfirmationItems = {
@@ -72,15 +73,12 @@ export const DevicesLayout = (): JSX.Element => {
     
     useEffect(() => {
         refreshDevices(false);
-
-        // Refresh devices every 60 seconds
-        const refresher = setInterval(() => {
-            refreshDevices(false);
-        }, 60000);
-
-        // Return a function to clear the interval on unmount
-        return () => clearInterval(refresher);
     }, []);
+
+    // Refresh devices every 60 seconds (paused automatically when document.hidden)
+    useInterval(() => {
+        refreshDevices(false);
+    }, 60000);
 
     return (
         <Box p={3} borderRadius={10}>

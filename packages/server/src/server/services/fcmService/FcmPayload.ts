@@ -1,6 +1,12 @@
 /** Firebase rejects a data message whose keys and values exceed 4096 bytes. */
 export const FCM_MAX_DATA_BYTES = 4096;
 
+/** Default Android FCM TTL (24 hours in ms). firebase-admin expects milliseconds. */
+export const FCM_DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Short Android FCM TTL (30s in ms) so stale incoming-ring pushes don't fire after Doze. */
+export const FCM_RING_TTL_MS = 30 * 1000;
+
 export type FcmDataPayload = { type: string; data: string };
 
 const OPTIONAL_MESSAGE_FIELDS = ["attributedBody", "messageSummaryInfo", "payloadData", "metadata"];
@@ -43,4 +49,24 @@ export function fitFcmDataPayload(payload: FcmDataPayload): FcmDataPayload | nul
 
     const fitted = { type: payload.type, data: JSON.stringify(message) };
     return sizeOf(fitted) <= FCM_MAX_DATA_BYTES ? fitted : null;
+}
+
+/**
+ * Uses a 30s TTL for incoming-ring FaceTime pushes so stale rings don't arrive
+ * hours later after Doze, while keeping the 24h TTL for missed-call (status 6)
+ * and all other events.
+ */
+export function getFcmAndroidTtlMs(payload: FcmDataPayload): number {
+    if (payload.type === "incoming-facetime") return FCM_RING_TTL_MS;
+    if (payload.type === "ft-call-status-changed") {
+        try {
+            const parsed = JSON.parse(payload.data);
+            if (isRecord(parsed) && (parsed.status_id === 4 || parsed.call_status === 4)) {
+                return FCM_RING_TTL_MS;
+            }
+        } catch {
+            return FCM_DEFAULT_TTL_MS;
+        }
+    }
+    return FCM_DEFAULT_TTL_MS;
 }

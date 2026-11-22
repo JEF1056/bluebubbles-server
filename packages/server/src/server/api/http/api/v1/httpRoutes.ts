@@ -861,6 +861,7 @@ export class HttpRoutes {
     private static TimeoutMiddleware(requestTimeoutMs: number, responseTimeoutMs: number) {
         return async (ctx: Context, next: Next) => {
             ctx.req.setTimeout(requestTimeoutMs, () => {
+                if (ctx.res.headersSent || ctx.res.writableEnded) return;
                 ctx.status = 504;
                 ctx.set("Content-Type", "application/json");
                 ctx.res.end(
@@ -876,6 +877,7 @@ export class HttpRoutes {
             });
 
             ctx.res.setTimeout(responseTimeoutMs, () => {
+                if (ctx.res.headersSent || ctx.res.writableEnded) return;
                 ctx.status = 504;
                 ctx.set("Content-Type", "application/json");
                 ctx.res.end(

@@ -34,7 +34,22 @@ export function registerForkSocketRoutes(socket: Socket, log: SocketLogger): voi
         FaceTimeAudioBridge.getInstance().handleMute(params);
     });
 
+    socket.on("ft-bridge-camera", (params): void => {
+        FaceTimeAudioBridge.getInstance().handleCamera(params);
+    });
+
     socket.on("ft-bridge-hangup", (params): void => {
         FaceTimeAudioBridge.getInstance().handleHangup(params);
+    });
+
+    socket.on("ft-bridge-config", (params, cb): void => {
+        const ack = typeof params === "function" ? params : cb;
+        if (typeof ack === "function") {
+            ack({
+                iceServers: FaceTimeAudioBridge.getIceServers(),
+                videoSupported: FaceTimeAudioBridge.isVideoSupported(),
+                videoUplinkSupported: FaceTimeAudioBridge.isVideoUplinkSupported()
+            });
+        }
     });
 }

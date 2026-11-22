@@ -39,7 +39,7 @@ export class CloudflareService extends Proxy {
     async connect(): Promise<string> {
         if (this.connectPromise) {
             this.log.debug("Already connecting to Cloudflare. Waiting for connection to complete.");
-            await this.connectPromise;
+            return await this.connectPromise;
         }
 
         try {

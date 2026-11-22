@@ -83,4 +83,10 @@ export class PrivateApiFaceTime extends PrivateApiAction {
         const request = new TransactionPromise(TransactionType.OTHER);
         return this.sendApiMessage(action, {}, request);
     }
+
+    async getConversationState(): Promise<TransactionResult> {
+        const action = "get-conversation-state";
+        const request = new TransactionPromise(TransactionType.OTHER);
+        return this.sendApiMessage(action, {}, request);
+    }
 }

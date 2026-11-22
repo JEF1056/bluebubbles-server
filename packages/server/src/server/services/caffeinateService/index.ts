@@ -23,18 +23,17 @@ export class CaffeinateService extends Loggable {
 
         // Spawn the child process
         // -i: Create an assertion to prevent the system from idle sleeping.
-        // -m: Create an assertion to prevent the disk from idle sleeping.
         // -s: Create an assertion to prevent the system from sleeping
         // -w: Waits for the process with the specified pid to exit.
-        this.childProc = spawn("caffeinate", ["-i", "-m", "-s", "-w", myPid.toString()], { detached: true });
+        this.childProc = spawn("caffeinate", ["-i", "-s", "-w", myPid.toString()], { detached: true });
         this.log.info(`Spawned Caffeinate with PID: ${this.childProc.pid}`);
         this.isCaffeinated = true;
 
         // Setup listeners
-        this.childProc.on("close", this.onClose);
-        this.childProc.on("exit", this.onClose);
-        this.childProc.on("disconnect", this.onClose);
-        this.childProc.on("error", this.onClose);
+        this.childProc.on("close", this.handleChildClose);
+        this.childProc.on("exit", this.handleChildClose);
+        this.childProc.on("disconnect", this.handleChildClose);
+        this.childProc.on("error", this.handleChildClose);
     }
 
     /**
@@ -55,6 +54,10 @@ export class CaffeinateService extends Loggable {
             }
         }
     }
+
+    private readonly handleChildClose = (msg: any) => {
+        this.onClose(msg);
+    };
 
     /**
      * Method to let us know that the caffeinate process has ended

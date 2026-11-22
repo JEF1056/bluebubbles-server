@@ -33,7 +33,18 @@ export class WebhookService extends Loggable {
     async dispatch(event: WebhookEvent) {
         const webhooks = await Server().repo.getWebhooks();
         for (const i of webhooks) {
-            const eventTypes = JSON.parse(i.events) as Array<string>;
+            let eventTypes: Array<string> = [];
+            if (Array.isArray(i.events)) {
+                eventTypes = i.events;
+            } else if (typeof i.events === "string") {
+                try {
+                    const parsed = JSON.parse(i.events);
+                    if (Array.isArray(parsed)) eventTypes = parsed;
+                } catch {
+                    this.log.debug(`Invalid webhook events JSON for webhook ${i.url}`);
+                    continue;
+                }
+            }
             if (!eventTypes.includes("*") && !eventTypes.includes(event.type)) continue;
             this.log.debug(`Dispatching event to webhook: ${i.url}`);
 

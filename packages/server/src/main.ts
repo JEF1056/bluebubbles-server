@@ -69,7 +69,7 @@ const handleExit = async (event: any = null, { exit = true } = {}) => {
 
     // Safely close the services
     if (Server() && !Server().isStopping) {
-        await Server().stopServices();
+        await Server().stopAll();
     }
 
     if (exit) {
@@ -115,11 +115,11 @@ app.on("before-quit", event => handleExit(event));
 
 process.on("SIGTERM", async () => {
     log.debug("Received SIGTERM, exiting...");
-    await handleExit(null, { exit: false });
+    await handleExit(null, { exit: true });
 });
 process.on("SIGINT", async () => {
     log.debug("Received SIGINT, exiting...");
-    await handleExit(null, { exit: false });
+    await handleExit(null, { exit: true });
 });
 
 /**

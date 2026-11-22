@@ -45,6 +45,8 @@ export class MessagePromise {
 
     private tempGuid?: string | null;
 
+    private timeout?: NodeJS.Timeout;
+
     constructor({ chatGuid, text, isAttachment, sentAt, subject, tempGuid }: MessagePromiseConstructorParameters) {
         // Used to temporarily update the guid
         this.tempGuid = tempGuid;
@@ -71,8 +73,9 @@ export class MessagePromise {
 
         // Create a timeout for how long until we "error-out".
         // Timeouts should change based on if it's an attachment or message
-        setTimeout(
+        this.timeout = setTimeout(
             () => {
+                this.timeout = undefined;
                 if (this.isResolved) return;
 
                 // This will trigger our hook handlers, created in the constructor
@@ -84,13 +87,22 @@ export class MessagePromise {
         );
     }
 
+    private clearPendingTimeout() {
+        if (this.timeout) {
+            clearTimeout(this.timeout);
+            this.timeout = undefined;
+        }
+    }
+
     async resolve(value: Message) {
+        this.clearPendingTimeout();
         this.isResolved = true;
         this.resolvePromise(value);
         await this.emitMessageMatch(value);
     }
 
     async reject(reason?: string, message: Message = null) {
+        this.clearPendingTimeout();
         this.isResolved = true;
         this.rejectPromise(new MessagePromiseRejection(reason, message, this.tempGuid));
         if (message) {

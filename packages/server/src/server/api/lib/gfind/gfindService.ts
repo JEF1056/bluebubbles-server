@@ -14,6 +14,8 @@ const POLL_INTERVAL_MS = 5 * 60 * 1000;
 const MIN_LOCATE_INTERVAL_MS = 10_000;
 const TARGETED_FCM_WAIT_MS = 15_000;
 const STAGGER_LOCATE_DELAY_MS = 250;
+const DISCONNECTED_FCM_POLL_INTERVAL_MS = 3_000;
+const DISCONNECTED_FCM_POLL_CAP_MS = 10_000;
 
 const newUuid = (): string => {
     const b = crypto.randomBytes(16);
@@ -49,6 +51,9 @@ export interface GoogleFindServiceDeps {
     pollIntervalMs?: number;
     locateTimeoutMs?: number;
     minLocateIntervalMs?: number;
+    staggerDelayMs?: number;
+    fcmPollIntervalMs?: number;
+    fcmPollCapMs?: number;
     now?: () => number;
 }
 
@@ -101,9 +106,15 @@ export function normalizeGfindId(deviceId: string): string {
     return deviceId.startsWith("gfind:") ? deviceId.slice("gfind:".length) : deviceId;
 }
 
+interface LocationBaseline {
+    lastUpdated: number;
+    accuracy: number;
+}
+
 interface PendingLocateWaiter {
     canonicId: string;
     requestUuid: string;
+    baseline: LocationBaseline;
     resolve: (updated: boolean) => void;
     timer: NodeJS.Timeout;
 }
@@ -189,7 +200,7 @@ export class GoogleFindService {
                 void this.pollAllDevices();
             }, interval);
             this.pollTimer.unref?.();
-            void this.refreshDevices().catch(() => undefined);
+            void this.pollAllDevices();
         }
     }
 
@@ -358,10 +369,13 @@ export class GoogleFindService {
                 if (options?.force || nowMs - prevLocate >= minInterval) {
                     this.lastLocateAt.set(key, nowMs);
                     const existing = this.getRecord(canonicId);
+                    const baseline = this.getRecordBaseline(existing?.canonicId ?? canonicId);
                     const fcmToken = this.auth.getState().fcmToken ?? undefined;
                     const requestUuid = newUuid();
-                    const canWaitFcm = this.fcm.isConnected() || Boolean(fcmToken);
-                    const handle = canWaitFcm ? this.createFcmWaiter(existing?.canonicId ?? canonicId, requestUuid) : null;
+                    const fcmConnected = this.fcm.isConnected();
+                    const handle = fcmConnected
+                        ? this.createFcmWaiter(existing?.canonicId ?? canonicId, requestUuid, baseline)
+                        : null;
                     try {
                         await this.client.locateDevice({
                             canonicId: existing?.canonicId ?? canonicId,
@@ -374,7 +388,9 @@ export class GoogleFindService {
                         throw err;
                     }
 
-                    const pushed = handle ? await handle.promise : false;
+                    const pushed = handle
+                        ? await handle.promise
+                        : await this.pollUntilFresher([{ canonicId: existing?.canonicId ?? canonicId, baseline }]);
                     if (pushed) {
                         this.lastSyncAt = this.now();
                         this.lastError = null;
@@ -391,16 +407,19 @@ export class GoogleFindService {
             if (!targetDeviceId && this.recordsById.size > 0) {
                 const fcmToken = this.auth.getState().fcmToken ?? undefined;
                 const minInterval = this.deps.minLocateIntervalMs ?? MIN_LOCATE_INTERVAL_MS;
-                const canWaitFcm = this.fcm.isConnected() || Boolean(fcmToken);
-                const waiters: Array<Promise<boolean>> = [];
+                const fcmConnected = this.fcm.isConnected();
+                const staggerMs = this.deps.staggerDelayMs ?? STAGGER_LOCATE_DELAY_MS;
+                const waiters: Array<{ promise: Promise<boolean>; cancel: () => void }> = [];
+                const pollTargets: Array<{ canonicId: string; baseline: LocationBaseline }> = [];
 
                 for (const record of this.recordsById.values()) {
                     const key = record.canonicId.toLowerCase();
                     const nowMs = this.now();
                     if (!options?.force && nowMs - (this.lastLocateAt.get(key) ?? 0) < minInterval) continue;
                     this.lastLocateAt.set(key, nowMs);
+                    const baseline = this.getRecordBaseline(record.canonicId);
                     const requestUuid = newUuid();
-                    const handle = canWaitFcm ? this.createFcmWaiter(record.canonicId, requestUuid) : null;
+                    const handle = fcmConnected ? this.createFcmWaiter(record.canonicId, requestUuid, baseline) : null;
                     const ok = await this.client
                         .locateDevice({
                             canonicId: record.canonicId,
@@ -411,17 +430,32 @@ export class GoogleFindService {
                         .then(() => true)
                         .catch(() => false);
                     if (ok && handle) {
-                        waiters.push(handle.promise);
+                        waiters.push(handle);
                     } else {
                         handle?.cancel();
+                        if (ok && !fcmConnected) {
+                            pollTargets.push({ canonicId: record.canonicId, baseline });
+                        }
                     }
-                    if (STAGGER_LOCATE_DELAY_MS > 0) {
-                        await new Promise(r => setTimeout(r, STAGGER_LOCATE_DELAY_MS));
+                    if (staggerMs > 0) {
+                        await new Promise(r => setTimeout(r, staggerMs));
                     }
                 }
 
                 if (waiters.length > 0) {
-                    await Promise.all(waiters);
+                    const capMs = this.deps.locateTimeoutMs ?? DISCONNECTED_FCM_POLL_CAP_MS;
+                    let capTimer: any = null;
+                    await Promise.race([
+                        Promise.all(waiters.map(w => w.promise)),
+                        new Promise<void>(r => {
+                            capTimer = setTimeout(r, capMs);
+                            capTimer.unref?.();
+                        })
+                    ]);
+                    if (capTimer) clearTimeout(capTimer);
+                    for (const w of waiters) w.cancel();
+                } else if (pollTargets.length > 0) {
+                    await this.pollUntilFresher(pollTargets);
                 }
             }
 
@@ -442,18 +476,16 @@ export class GoogleFindService {
 
     private async pollAllDevices(): Promise<void> {
         if (!this.isEnabled() || !this.auth.isSignedIn()) return;
+        if (!(this.deps.hasActiveClients ?? defaultHasActiveClients)()) {
+            this.locateSkipped = true;
+            return;
+        }
+        this.locateSkipped = false;
         try {
             const metadataList = await this.client.listDevices();
             await this.applyMetadataList(metadataList, true);
             this.lastSyncAt = this.now();
             this.lastError = null;
-
-            // Active locates wake trackers; skip them on passive polls when no clients are connected.
-            if (!(this.deps.hasActiveClients ?? defaultHasActiveClients)()) {
-                this.locateSkipped = true;
-                return;
-            }
-            this.locateSkipped = false;
 
             const fcmToken = this.auth.getState().fcmToken ?? undefined;
             const minInterval = this.deps.minLocateIntervalMs ?? MIN_LOCATE_INTERVAL_MS;
@@ -478,13 +510,62 @@ export class GoogleFindService {
         }
     }
 
-    private createFcmWaiter(canonicId: string, requestUuid: string): { promise: Promise<boolean>; cancel: () => void } {
+    private getRecordBaseline(canonicId: string): LocationBaseline {
+        const rec = this.getRecord(canonicId);
+        const lastUpdated = rec?.device.last_updated ?? 0;
+        const acc = rec?.device.location?.horizontalAccuracy;
+        const accuracy = typeof acc === "number" && Number.isFinite(acc) ? acc : Infinity;
+        return { lastUpdated, accuracy };
+    }
+
+    private isRecordFresher(canonicId: string, baseline: LocationBaseline): boolean {
+        const rec = this.getRecord(canonicId);
+        if (!rec) return false;
+        const nextLastUpdated = rec.device.last_updated ?? 0;
+        if (nextLastUpdated > baseline.lastUpdated) return true;
+        if (nextLastUpdated < baseline.lastUpdated) return false;
+        const acc = rec.device.location?.horizontalAccuracy;
+        const nextAccuracy = typeof acc === "number" && Number.isFinite(acc) ? acc : Infinity;
+        return Number.isFinite(nextAccuracy) && nextAccuracy < baseline.accuracy;
+    }
+
+    private async pollUntilFresher(
+        targets: Array<{ canonicId: string; baseline: LocationBaseline }>
+    ): Promise<boolean> {
+        if (targets.length === 0) return false;
+        const intervalMs = this.deps.fcmPollIntervalMs ?? DISCONNECTED_FCM_POLL_INTERVAL_MS;
+        const capMs = this.deps.fcmPollCapMs ?? DISCONNECTED_FCM_POLL_CAP_MS;
+        const deadline = Date.now() + capMs;
+        while (Date.now() < deadline) {
+            const waitMs = Math.min(intervalMs, Math.max(0, deadline - Date.now()));
+            if (waitMs > 0) {
+                await new Promise(r => setTimeout(r, waitMs));
+            }
+            try {
+                const list = await this.client.listDevices();
+                await this.applyMetadataList(list, true);
+                if (targets.some(t => this.isRecordFresher(t.canonicId, t.baseline))) {
+                    return true;
+                }
+            } catch (ex: any) {
+                console.warn(`[GFindService] Transient listDevices error during poll: ${ex?.message ?? String(ex)}`);
+            }
+        }
+        return false;
+    }
+
+    private createFcmWaiter(
+        canonicId: string,
+        requestUuid: string,
+        baseline: LocationBaseline
+    ): { promise: Promise<boolean>; cancel: () => void } {
         const timeoutMs = this.deps.locateTimeoutMs ?? TARGETED_FCM_WAIT_MS;
         let waiter!: PendingLocateWaiter;
         const promise = new Promise<boolean>(resolve => {
             waiter = {
                 canonicId: canonicId.toLowerCase(),
                 requestUuid,
+                baseline,
                 resolve: updated => {
                     clearTimeout(waiter.timer);
                     this.pendingWaiters.delete(waiter);
@@ -514,9 +595,12 @@ export class GoogleFindService {
         logGfind(`FCM push id=${canonicId ?? "?"} reqUuid=${reqUuid ?? "?"} reports=${repCount}`);
         await this.applyMetadataList([update.deviceMetadata], false);
         this.lastSyncAt = this.now();
+        if (repCount === 0) return;
 
         for (const waiter of [...this.pendingWaiters]) {
-            if ((reqUuid && waiter.requestUuid === reqUuid) || (canonicId && waiter.canonicId === canonicId)) {
+            const matches = (reqUuid && waiter.requestUuid === reqUuid) || (canonicId && waiter.canonicId === canonicId);
+            if (!matches) continue;
+            if (this.isRecordFresher(canonicId ?? waiter.canonicId, waiter.baseline)) {
                 waiter.resolve(true);
             }
         }

@@ -48,31 +48,66 @@ export class ZrokManager extends Loggable {
         const reservedTunnel = (Server().repo.getConfig("zrok_reserve_tunnel") as boolean) ?? false;
         const tunnelToken = await ZrokManager.reserve(null);
 
-        return new Promise(async (resolve, reject) => {
-            // Didn't use zx here because I couldn't figure out how to pipe the stdout
-            // properly, without taking over the terminal outputs.
-            // Conditionally change the command based on if we are reserving a tunnel or not
-            const commndFlags = [
-                "share",
-                ...(reservedTunnel ? ["reserved", "--headless"] : ["public", "--backend-mode", "proxy", "--headless"]),
-                ...(reservedTunnel ? [tunnelToken] : [`0.0.0.0:${port}`])
-            ];
+        return new Promise<string>(async (resolve, reject) => {
+            let timeout: NodeJS.Timeout | null = null;
+            let settled = false;
+            const onNewUrl = (url: string) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                resolve(url);
+            };
+            const onError = (err: any) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                reject(err);
+            };
+            const cleanup = () => {
+                if (timeout) {
+                    clearTimeout(timeout);
+                    timeout = null;
+                }
+                this.off("new-url", onNewUrl);
+                this.off("error", onError);
+            };
 
-            if (this.proc && !this.proc?.killed) {
-                this.log.debug("Zrok Tunnel already running. Stopping...");
-                await this.stop();
+            try {
+                // Didn't use zx here because I couldn't figure out how to pipe the stdout
+                // properly, without taking over the terminal outputs.
+                // Conditionally change the command based on if we are reserving a tunnel or not
+                const commndFlags = [
+                    "share",
+                    ...(reservedTunnel ? ["reserved", "--headless"] : ["public", "--backend-mode", "proxy", "--headless"]),
+                    ...(reservedTunnel ? [tunnelToken] : [`0.0.0.0:${port}`])
+                ];
+
+                if (this.proc && !this.proc?.killed) {
+                    this.log.debug("Zrok Tunnel already running. Stopping...");
+                    await this.stop();
+                }
+
+                this.proc = spawn(ZrokManager.daemonPath, commndFlags);
+                this.proc.stdout.on("data", chunk => this.handleData(chunk));
+                this.proc.stderr.on("data", chunk => this.handleData(chunk));
+
+                this.on("new-url", onNewUrl);
+                this.on("error", onError);
+
+                timeout = setTimeout(() => {
+                    if (settled) return;
+                    settled = true;
+                    cleanup();
+                    reject(new Error("Failed to connect to Zrok after 2 minutes..."));
+                }, 1000 * 60 * 2); // 2 minutes
+                timeout.unref?.();
+            } catch (ex) {
+                if (!settled) {
+                    settled = true;
+                    cleanup();
+                    reject(ex);
+                }
             }
-
-            this.proc = spawn(ZrokManager.daemonPath, commndFlags);
-            this.proc.stdout.on("data", chunk => this.handleData(chunk));
-            this.proc.stderr.on("data", chunk => this.handleData(chunk));
-
-            this.on("new-url", url => resolve(url));
-            this.on("error", err => reject(err));
-
-            setTimeout(() => {
-                reject(new Error("Failed to connect to Zrok after 2 minutes..."));
-            }, 1000 * 60 * 2); // 2 minutes
         });
     }
 

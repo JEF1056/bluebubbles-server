@@ -281,13 +281,13 @@ export class IPCService extends Loggable {
 
         ipcMain.handle("get-chat-image-count", async (event, args) => {
             if (!Server().iMessageRepo?.db) return 0;
-            const count = await Server().iMessageRepo.getMediaCountsByChat({ mediaType: "image", after: args?.after });
+            const count = await Server().iMessageRepo.getMediaCounts({ mediaType: "image", after: args?.after });
             return count;
         });
 
         ipcMain.handle("get-chat-video-count", async (event, args) => {
             if (!Server().iMessageRepo?.db) return 0;
-            const count = await Server().iMessageRepo.getMediaCountsByChat({ mediaType: "video", after: args?.after });
+            const count = await Server().iMessageRepo.getMediaCounts({ mediaType: "video", after: args?.after });
             return count;
         });
 
