@@ -7,6 +7,7 @@ import { FaceTimeAudioBridge } from "@server/api/lib/facetime/FaceTimeAudioBridg
 import { BadRequest } from "../responses/errors";
 import { NoData, Success } from "../responses/success";
 import { CallMetadataOptions, FaceTimeInterface } from "@server/api/interfaces/facetimeInterface";
+import { CallHistoryRepository } from "@server/databases/callHistory";
 
 const execFileAsync = promisify(execFile);
 
@@ -64,6 +65,9 @@ async function getBridgeProbe(): Promise<BridgeProbeResult> {
     return bridgeProbeInFlight;
 }
 
+const parseCallMode = (raw: unknown): "video" | "audio" | "video_bridge" | undefined =>
+    raw === "video" || raw === "audio" || raw === "video_bridge" ? raw : undefined;
+
 const extractMetadata = (body: Record<string, any> = {}): CallMetadataOptions => {
     const addresses = Array.isArray(body.addresses)
         ? body.addresses.map(String)
@@ -88,23 +92,34 @@ export class FaceTimeRouter {
     static async answer(ctx: RouterContext, _: Next) {
         const body = (ctx.request.body ?? {}) as Record<string, any>;
         const audioOnly = ctx.request.query?.audioOnly === "true" || Boolean(body.audioOnly);
-        const result = await FaceTimeInterface.answer(ctx.params.call_uuid, audioOnly, extractMetadata(body));
+        const mode = parseCallMode(body.mode);
+        const result = await FaceTimeInterface.answer(ctx.params.call_uuid, audioOnly, {
+            ...extractMetadata(body),
+            mode
+        });
         return new Success(ctx, {
-            data: audioOnly
-                ? { audioOnly: true, callUuid: ctx.params.call_uuid, session: result.session }
-                : { link: result.link, session: result.session }
+            data: {
+                audioOnly: result.audioOnly,
+                callUuid: result.callUuid,
+                ...(result.link ? { link: result.link } : {}),
+                session: result.session
+            }
         }).send();
     }
 
     static async handoff(ctx: RouterContext, _: Next) {
         const body = (ctx.request.body ?? {}) as Record<string, any>;
-        const modeRaw = body.mode;
-        const mode = modeRaw === "video" || modeRaw === "audio" || modeRaw === "video_bridge" ? modeRaw : undefined;
+        const mode = parseCallMode(body.mode);
         const data = await FaceTimeInterface.handoff(ctx.params.call_uuid, {
             deviceId: body.deviceId ?? body.device_id,
             deviceName: body.deviceName ?? body.device_name,
             mode
         });
+        return new Success(ctx, { data }).send();
+    }
+
+    static async transferBack(ctx: RouterContext, _: Next) {
+        const data = await FaceTimeInterface.transferBack(ctx.params.call_uuid);
         return new Success(ctx, { data }).send();
     }
 
@@ -120,7 +135,10 @@ export class FaceTimeRouter {
 
     static async newSession(ctx: RouterContext, _: Next) {
         const body = (ctx.request.body ?? {}) as Record<string, any>;
-        const data = await FaceTimeInterface.create(extractMetadata(body));
+        const rawVideo = body.isVideo ?? body.is_video ?? body.video;
+        const isVideo =
+            rawVideo === false || rawVideo === "false" ? false : rawVideo !== undefined ? Boolean(rawVideo) : true;
+        const data = await FaceTimeInterface.create({ ...extractMetadata(body), isVideo });
         return new Success(ctx, { data }).send();
     }
 
@@ -130,7 +148,8 @@ export class FaceTimeRouter {
         const addresses = meta.addresses ?? [];
         const video = body.video !== undefined ? Boolean(body.video) : true;
         const isTelephony = Boolean(body.isTelephony ?? body.is_telephony ?? false);
-        const data = await FaceTimeInterface.call({ ...meta, addresses, video, isTelephony });
+        const mode = parseCallMode(body.mode);
+        const data = await FaceTimeInterface.call({ ...meta, addresses, video, isTelephony, mode });
         return new Success(ctx, { data }).send();
     }
 
@@ -171,5 +190,66 @@ export class FaceTimeRouter {
                 iceServers: FaceTimeAudioBridge.getIceServers()
             }
         }).send();
+    }
+
+    static async history(ctx: RouterContext, _: Next) {
+        const query = ctx.request.query ?? {};
+        const pick = (val: string | string[] | undefined): string | undefined =>
+            (Array.isArray(val) ? val[0] : val)?.trim();
+
+        let limit = 50;
+        const rawLimit = pick(query.limit);
+        if (rawLimit !== undefined && rawLimit !== "") {
+            if (!/^-?\d+$/.test(rawLimit)) {
+                throw new BadRequest({ message: "limit must be an integer" });
+            }
+            limit = Math.max(1, Math.min(200, Number(rawLimit)));
+        }
+
+        let offset = 0;
+        const rawOffset = pick(query.offset);
+        if (rawOffset !== undefined && rawOffset !== "") {
+            if (!/^-?\d+$/.test(rawOffset)) {
+                throw new BadRequest({ message: "offset must be an integer" });
+            }
+            offset = Math.max(0, Number(rawOffset));
+        }
+
+        let missedOnly = false;
+        const rawMissedOnly = pick(query.missedOnly);
+        if (rawMissedOnly !== undefined && rawMissedOnly !== "") {
+            const normalized = rawMissedOnly.toLowerCase();
+            if (normalized === "true" || normalized === "1") {
+                missedOnly = true;
+            } else if (normalized === "false" || normalized === "0") {
+                missedOnly = false;
+            } else {
+                throw new BadRequest({ message: "missedOnly must be a boolean" });
+            }
+        }
+
+        const repo = new CallHistoryRepository();
+        const result = repo.list({ limit, offset, missedOnly });
+        const metadata: Record<string, any> = {
+            limit,
+            offset,
+            count: result.data.length,
+            available: result.available
+        };
+        if (result.reason !== undefined) {
+            metadata.reason = result.reason;
+        }
+
+        return new Success(ctx, { data: result.data, metadata }).send();
+    }
+
+    static async cleanupLinks(ctx: RouterContext, _: Next) {
+        const body = (ctx.request.body ?? {}) as Record<string, any>;
+        const url = typeof body.url === "string" ? body.url.trim() : "";
+        if (!url) {
+            throw new BadRequest({ message: "url is required" });
+        }
+        const result = await Server().privateApi.facetime.removeLink(url);
+        return new Success(ctx, { data: result?.data ?? {} }).send();
     }
 }

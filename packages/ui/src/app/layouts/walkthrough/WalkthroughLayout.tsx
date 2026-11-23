@@ -82,7 +82,7 @@ export const WalkthroughLayout = ({...rest}): JSX.Element => {
     // Make sure we start at the top
     useEffect(() => {
         window.scrollTo(0, 0);
-    }, []);
+    }, [step]);
 
     const nextButton = (
         <Button
@@ -112,7 +112,7 @@ export const WalkthroughLayout = ({...rest}): JSX.Element => {
                     setCompletedSteps([...completedSteps, step]);
                 }}/>
             </Box>
-            <Box position='fixed' bottom={0} left={0} width='100%' height='80px' bg={bgColor}>
+            <Box position='fixed' bottom={0} left={0} width='100%' height='80px' bg={bgColor} zIndex='sticky'>
                 <Divider />
                 <Flex justifyContent='space-between' alignItems='center' mx={5}>
                     <Button

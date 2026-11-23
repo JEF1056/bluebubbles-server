@@ -193,7 +193,7 @@ test("StickerRouter mounts all /api/v2/sticker* and /api/v2/message/sticker rout
                 },
                 sendSticker: async params => {
                     sentCalls.push(params);
-                    return { identifier: "SENT-MSG-GUID-1" };
+                    return { guid: "SENT-MSG-GUID-1" };
                 }
             }
         },

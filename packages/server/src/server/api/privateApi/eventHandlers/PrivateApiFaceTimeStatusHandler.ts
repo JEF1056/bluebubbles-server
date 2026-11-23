@@ -45,9 +45,10 @@ export class PrivateApiFaceTimeStatusHandler extends Loggable implements Private
     }
 
     private async enrichSessionHandle(session: FaceTimeSession, rawAddress: string | null): Promise<void> {
-        if (session.handle || !rawAddress) return;
+        const targetAddress = rawAddress ?? session.addresses?.[0] ?? null;
+        if (session.handle || !targetAddress) return;
         try {
-            const addr = slugifyAddress(rawAddress);
+            const addr = slugifyAddress(targetAddress);
             const handleRows = addr ? (await Server().iMessageRepo.getHandles({ address: addr, limit: 1 }))[0] : [];
             const serializedHandle = handleRows?.[0]
                 ? await HandleSerializer.serialize({ handle: handleRows[0] })
@@ -74,17 +75,26 @@ export class PrivateApiFaceTimeStatusHandler extends Loggable implements Private
         const eventData = data?.data ?? {};
         const statusId = eventData.call_status ?? eventData.status_id;
         const uniqueProxyIdentifier = eventData.unique_proxy_identifier ?? eventData.uniqueProxyIdentifier ?? null;
-        const callUuid = eventData.call_uuid ?? eventData.callUUID ?? uniqueProxyIdentifier ?? null;
+        const conversationGroupUuid = eventData.conversation_group_uuid ?? null;
+        const callUuid = eventData.call_uuid ?? eventData.callUUID ?? uniqueProxyIdentifier ?? conversationGroupUuid ?? null;
         const rawAddress = eventData.handle?.value ?? eventData.address ?? null;
 
         // Keep tracked sessions (e.g. outbound calls) synced even when facetime_calling is disabled.
-        const existingSession = FaceTimeSessionManager().findSession(callUuid, uniqueProxyIdentifier);
+        const existingSession = FaceTimeSessionManager().findSession(
+            callUuid,
+            uniqueProxyIdentifier,
+            conversationGroupUuid
+        );
         if (existingSession) {
             existingSession.update(FaceTimeSession.fromEvent(eventData));
             if (existingSession.status === FaceTimeSessionStatus.DISCONNECTED) {
-                const bridge = FaceTimeAudioBridge.getInstance();
-                if (existingSession.callUuid) bridge.cleanupSession(existingSession.callUuid);
-                if (callUuid && callUuid !== existingSession.callUuid) bridge.cleanupSession(callUuid);
+                FaceTimeAudioBridge.getInstance().cleanupSessions([
+                    existingSession.callUuid,
+                    ...existingSession.callUuidAliases,
+                    existingSession.uniqueProxyIdentifier,
+                    existingSession.conversationGroupUuid,
+                    callUuid
+                ]);
             }
             FaceTimeSessionManager().broadcastUpdate(existingSession);
             return;
@@ -128,6 +138,23 @@ export class PrivateApiFaceTimeStatusHandler extends Loggable implements Private
             return;
         }
 
+        // Adopt active iPhone-hosted or handoff-eligible calls so the transfer pill shows even when facetime_calling is off.
+        const isIphoneHosted =
+            eventData.is_endpoint_on_current_device === false || eventData.is_handoff_eligible === true;
+        if (
+            isIphoneHosted &&
+            (statusId === FaceTimeSessionStatus.ANSWERED || eventData.is_handoff_eligible === true)
+        ) {
+            const session = FaceTimeSession.fromEvent(eventData, false);
+            if (!session.answeredAt && session.status === FaceTimeSessionStatus.ANSWERED) {
+                session.answeredAt = new Date();
+            }
+            FaceTimeSessionManager().addSession(session);
+            FaceTimeSessionManager().broadcastUpdate(session);
+            await this.enrichSessionHandle(session, rawAddress);
+            return;
+        }
+
         // Ignore calls that are not incoming (or marked outgoing)
         if (statusId !== FaceTimeSessionStatus.INCOMING || eventData.is_outgoing) return;
 
@@ -161,12 +188,13 @@ export class PrivateApiFaceTimeStatusHandler extends Loggable implements Private
         const eventData = data?.data ?? {};
         const statusId = eventData.call_status ?? eventData.status_id;
         const uniqueProxyIdentifier = eventData.unique_proxy_identifier ?? eventData.uniqueProxyIdentifier ?? null;
-        const callUuid = eventData.call_uuid ?? eventData.callUUID ?? uniqueProxyIdentifier ?? null;
+        const conversationGroupUuid = eventData.conversation_group_uuid ?? null;
+        const callUuid = eventData.call_uuid ?? eventData.callUUID ?? uniqueProxyIdentifier ?? conversationGroupUuid ?? null;
         const rawAddress = eventData.handle?.value ?? eventData.address ?? null;
 
         const incomingSession = FaceTimeSession.fromEvent(eventData, false);
 
-        let session = FaceTimeSessionManager().findSession(callUuid, uniqueProxyIdentifier);
+        let session = FaceTimeSessionManager().findSession(callUuid, uniqueProxyIdentifier, conversationGroupUuid);
         let isNew = false;
         if (session) {
             session.update(incomingSession);
@@ -175,23 +203,36 @@ export class PrivateApiFaceTimeStatusHandler extends Loggable implements Private
             isNew = FaceTimeSessionManager().addSession(session);
         }
 
-        if (statusId === FaceTimeSessionStatus.ANSWERED) {
+        if (incomingSession.status === FaceTimeSessionStatus.ANSWERED) {
             if (!session.answeredAt) {
                 session.answeredAt = new Date();
                 session.touch();
             }
             this.log.info(`FaceTime call answered (Call UUID: ${session.callUuid ?? callUuid})`);
-        } else if (statusId === FaceTimeSessionStatus.OUTGOING) {
+        } else if (incomingSession.status === FaceTimeSessionStatus.OUTGOING) {
+            if (
+                session.status === FaceTimeSessionStatus.OUTGOING &&
+                session.isOutgoing &&
+                !session.isTelephony &&
+                !session.isLinkOnly &&
+                session.activeNonLightweightParticipantsCount === 0
+            ) {
+                void session.ensureOutgoingAnswerPolling();
+            }
             this.log.info(`Outgoing FaceTime call to ${rawAddress ?? "unknown"} (Call UUID: ${session.callUuid ?? callUuid})`);
-        } else if (statusId === FaceTimeSessionStatus.INCOMING) {
+        } else if (incomingSession.status === FaceTimeSessionStatus.INCOMING) {
             if (!isNew || eventData.is_outgoing) {
                 return;
             }
             this.log.info(`Incoming FaceTime call from ${rawAddress ?? "unknown"} (Call UUID: ${session.callUuid ?? callUuid})`);
         } else if (session.status === FaceTimeSessionStatus.DISCONNECTED) {
-            const bridge = FaceTimeAudioBridge.getInstance();
-            if (session.callUuid) bridge.cleanupSession(session.callUuid);
-            if (callUuid && callUuid !== session.callUuid) bridge.cleanupSession(callUuid);
+            FaceTimeAudioBridge.getInstance().cleanupSessions([
+                session.callUuid,
+                ...session.callUuidAliases,
+                session.uniqueProxyIdentifier,
+                session.conversationGroupUuid,
+                callUuid
+            ]);
 
             if (isNew && !session.isOutgoing) {
                 if (!session.endedReason) {

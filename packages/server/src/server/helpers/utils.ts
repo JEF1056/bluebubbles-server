@@ -312,10 +312,12 @@ export const parseMetadataString = (metadata: string): { [key: string]: string }
 export const insertChatParticipants = async (message: Message): Promise<Message> => {
     let theMessage = message;
     if (isEmpty(theMessage.chats)) {
-        theMessage = await Server().iMessageRepo.getMessage(message.guid, true, true);
+        const updated = await Server().iMessageRepo.getMessage(message.guid, true, true);
+        if (!updated) return message;
+        theMessage = updated;
     }
 
-    for (const chat of theMessage.chats) {
+    for (const chat of theMessage.chats ?? []) {
         const [chats, _] = await Server().iMessageRepo.getChats({ chatGuid: chat.guid, withParticipants: true });
         if (isEmpty(chats)) continue;
 

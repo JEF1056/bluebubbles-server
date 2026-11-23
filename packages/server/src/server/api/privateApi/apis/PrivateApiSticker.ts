@@ -16,6 +16,17 @@ export type SendStickerParams = {
     stickerUserInfo?: Record<string, any> | null;
 };
 
+export type RepositionStickerParams = {
+    chatGuid: string;
+    messageGuid: string;
+    xScalar: number;
+    yScalar: number;
+    scale: number;
+    rotation: number;
+    parentPreviewWidth: number;
+    currentSpv?: number;
+};
+
 export class PrivateApiSticker extends PrivateApiAction {
     tag = "PrivateApiSticker";
 
@@ -52,5 +63,24 @@ export class PrivateApiSticker extends PrivateApiAction {
         this.throwForNoMissingFields(action, [identifier]);
         const request = new TransactionPromise(TransactionType.OTHER);
         return this.sendApiMessage(action, { identifier }, request);
+    }
+
+    async repositionSticker(params: RepositionStickerParams): Promise<TransactionResult> {
+        const action = "reposition-sticker";
+        this.throwForNoMissingFields(action, [params.chatGuid, params.messageGuid]);
+        const request = new TransactionPromise(TransactionType.OTHER);
+        const payload: Record<string, any> = {
+            chatGuid: params.chatGuid,
+            messageGuid: params.messageGuid,
+            xScalar: params.xScalar,
+            yScalar: params.yScalar,
+            scale: params.scale,
+            rotation: params.rotation,
+            parentPreviewWidth: params.parentPreviewWidth
+        };
+        if (typeof params.currentSpv === "number" && Number.isFinite(params.currentSpv)) {
+            payload.currentSpv = params.currentSpv;
+        }
+        return this.sendApiMessage(action, payload, request);
     }
 }

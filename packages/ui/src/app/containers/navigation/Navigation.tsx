@@ -1,5 +1,5 @@
 import React from 'react';
-import { HashRouter as Router, Routes, Route, Link as RouterLink, useLocation } from 'react-router-dom';
+import { HashRouter as Router, Routes, Route, Navigate, Link as RouterLink, useLocation } from 'react-router-dom';
 import type { AnyAction } from '@reduxjs/toolkit';
 import {
     IconButton,
@@ -11,6 +11,7 @@ import {
     useColorModeValue,
     Link,
     Drawer,
+    DrawerCloseButton,
     DrawerContent,
     Text,
     useDisclosure,
@@ -108,7 +109,7 @@ export const Navigation = (): JSX.Element => {
     return (
         <Box minH="100vh">
             <Router>
-                <SidebarContent onClose={() => onClose} display={{ base: 'none', md: 'block' }} />
+                <SidebarContent onClose={onClose} display={{ base: 'none', md: 'block' }} />
                 <Drawer
                     autoFocus={false}
                     isOpen={isOpen}
@@ -135,13 +136,15 @@ export const Navigation = (): JSX.Element => {
                         <Route path="/webhooks" element={<ApiLayout />} />
                         <Route path="/guides" element={<GuidesLayout />} />
                         <Route path="/" element={<HomeLayout />} />
+                        <Route path="*" element={<Navigate to="/" replace />} />
                     </Routes>
                 </Box>
             </Router>
 
             <Drawer onClose={() => closeNotification(onNotificationClose, dispatch)} isOpen={isNotificationsOpen} size="lg">
                 <DrawerOverlay />
-                <DrawerContent  maxW="75%" minWidth="600px">
+                <DrawerContent maxW={{ base: 'full', md: '75%' }} minW={{ base: 'full', md: '600px' }}>
+                    <DrawerCloseButton />
                     <DrawerHeader>Notifications / Alerts ({unreadCount})</DrawerHeader>
                     <DrawerBody overflowWrap='break-word'>
                         <Menu>
@@ -184,7 +187,6 @@ const SidebarContent = ({ onClose, ...rest }: SidebarProps) => {
         <Box
             borderRight="1px"
             borderRightColor={useColorModeValue('gray.200', 'gray.700')}
-            minW='16em'
             w={{ base: 'full', md: 60 }}
             pos="fixed"
             h="full"
@@ -196,7 +198,7 @@ const SidebarContent = ({ onClose, ...rest }: SidebarProps) => {
                 <CloseButton display={{ base: 'flex', md: 'none' }} onClick={onClose} />
             </Flex>
             {LinkItems.map(link => (
-                <RouterLink key={link.name} to={link.to}>
+                <RouterLink key={link.name} to={link.to} onClick={onClose}>
                     <NavItem icon={link.icon} to={link.to}>{link.name}</NavItem>
                 </RouterLink>
             ))}
@@ -255,7 +257,7 @@ const MobileNav = ({ onOpen, onNotificationOpen, unreadCount, ...rest }: MobileP
 
     return (
         <Flex
-            ml={{ base: 0, md: 255 }}
+            ml={{ base: 0, md: 60 }}
             px={{ base: 4, md: 4 }}
             height="20"
             alignItems="center"

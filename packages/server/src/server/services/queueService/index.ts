@@ -42,34 +42,27 @@ export class QueueService extends Loggable {
                     await ActionHandler.openChat(item.data);
                     break;
                 case "send-attachment":
-                    // Send the attachment first
                     try {
+                        // Send the attachment first
                         await MessageInterface.sendAttachmentSync({
                             chatGuid: item.data.chatGuid,
                             attachmentPath: item.data.attachmentPath,
                             attachmentName: item.data.attachmentName,
                             attachmentGuid: item.data.attachmentGuid
                         });
-                        Server().httpService.sendCache.remove(item?.data?.attachmentGuid);
-                    } catch (ex: any) {
-                        // Re-throw the error after removing from cache
-                        Server().httpService.sendCache.remove(item?.data?.attachmentGuid);
-                        throw ex;
-                    }
 
-                    // Then send the message (if required)
-                    if (isNotEmpty(item.data.message)) {
-                        try {
+                        // Then send the message (if required)
+                        if (isNotEmpty(item.data.message)) {
                             await MessageInterface.sendMessageSync({
                                 chatGuid: item.data.chatGuid,
                                 message: item.data.message,
                                 method: "apple-script",
                                 tempGuid: item.data.tempGuid
                             });
-                        } finally {
-                            // Remove from cache
-                            Server().httpService.sendCache.remove(item?.data?.tempGuid);
                         }
+                    } finally {
+                        Server().httpService.sendCache.remove(item?.data?.attachmentGuid);
+                        Server().httpService.sendCache.remove(item?.data?.tempGuid);
                     }
 
                     // After 30 minutes, delete the attachment chunks

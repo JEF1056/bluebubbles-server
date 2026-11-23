@@ -34,6 +34,10 @@ export class TransactionPromise {
 
     error: any;
 
+    private timeout: NodeJS.Timeout | null = null;
+
+    private onSettled: (() => void) | null = null;
+
     constructor(type: TransactionType) {
         // Create a promise and save the "callbacks"
         this.promise = new Promise((resolve, reject) => {
@@ -52,16 +56,35 @@ export class TransactionPromise {
 
         // Create a timeout for how long until we "error-out".
         // 2 minute timeout for transactions
-        setTimeout(() => {
+        this.timeout = setTimeout(() => {
+            this.timeout = null;
             if (this.isResolved) return;
 
             // This will trigger our hook handlers, created in the constructor
             this.reject("Transaction timeout");
         }, 30000 * 2 * 2);
+        this.timeout.unref?.();
+    }
+
+    setOnSettled(callback: () => void) {
+        if (this.isResolved) {
+            callback();
+            return;
+        }
+        this.onSettled = callback;
+    }
+
+    private clearPendingTimeout() {
+        if (this.timeout) {
+            clearTimeout(this.timeout);
+            this.timeout = null;
+        }
     }
 
     resolve(value: TransactionId, data?: any) {
+        if (this.isResolved) return;
         this.isResolved = true;
+        this.clearPendingTimeout();
         const output: TransactionResult = {
             type: this.type,
             identifier: value
@@ -72,11 +95,17 @@ export class TransactionPromise {
 
         // Resolve the promise
         this.resolvePromise(output as TransactionResult);
+        this.onSettled?.();
+        this.onSettled = null;
     }
 
     reject(reason?: any) {
+        if (this.isResolved) return;
         this.isResolved = true;
+        this.clearPendingTimeout();
         this.rejectPromise(reason);
+        this.onSettled?.();
+        this.onSettled = null;
     }
 
     isSame(transactionId: string) {

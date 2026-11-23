@@ -46,7 +46,7 @@ export class MessageSerializer {
 
         // Handle fetching the chat participants with the messages (if requested)
         const chatCache: { [key: string]: HandleResponse[] } = {};
-        if (config.loadChatParticipants) {
+        if (config.includeChats && config.loadChatParticipants) {
             for (let i = 0; i < messages.length; i++) {
                 // If there aren't any chats for this message, skip it
                 if (isEmpty(messages[i]?.chats ?? [])) continue;
@@ -54,7 +54,7 @@ export class MessageSerializer {
                 // Iterate over the chats for this message and load the participants.
                 // We only need to load the participants for group chats since DMs don't have them.
                 // Once we load the chat participants for a chat, we will cache it to be used later.
-                for (let k = 0; k < (messages[i]?.chats ?? []).length; i++) {
+                for (let k = 0; k < (messages[i]?.chats ?? []).length; k++) {
                     // If it's not a group, skip it (style == 43; DM = 45)
                     // Also skip it if there are already participants
                     if (messages[i]?.chats[k].style !== 43 || isNotEmpty(messages[i]?.chats[k].participants)) continue;
@@ -164,6 +164,7 @@ export class MessageSerializer {
             dateCreated: message.dateCreated ? message.dateCreated.getTime() : null,
             dateRead: message.dateRead ? message.dateRead.getTime() : null,
             dateDelivered: message.dateDelivered ? message.dateDelivered.getTime() : null,
+            isRead: message.isRead ?? null,
             isDelivered: message.isDelivered,
             isFromMe: message.isFromMe,
             hasDdResults: message.hasDdResults,

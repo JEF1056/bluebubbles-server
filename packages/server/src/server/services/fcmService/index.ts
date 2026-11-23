@@ -326,7 +326,7 @@ export class FCMService extends Loggable {
                 headers
             });
         } catch (ex: any) {
-            const errorResponse = ex?.response.data;
+            const errorResponse = ex?.response?.data;
             if (errorResponse?.error?.message) {
                 // If the project has been deleted, we should unload the FCM configs.
                 // And stop the service.
@@ -356,6 +356,29 @@ export class FCMService extends Loggable {
         }
     }
 
+    private static firestoreUnsubscribe: (() => void) | null = null;
+
+    private static realtimeUnsubscribe: (() => void) | null = null;
+
+    private static cleanupListeners() {
+        if (FCMService.firestoreUnsubscribe) {
+            try {
+                FCMService.firestoreUnsubscribe();
+            } catch {
+                // Ignore
+            }
+            FCMService.firestoreUnsubscribe = null;
+        }
+        if (FCMService.realtimeUnsubscribe) {
+            try {
+                FCMService.realtimeUnsubscribe();
+            } catch {
+                // Ignore
+            }
+            FCMService.realtimeUnsubscribe = null;
+        }
+    }
+
     @AsyncRetryer({
         name: "FCMService.listenFirestoreDb",
         maxTries: 12,
@@ -368,7 +391,9 @@ export class FCMService extends Loggable {
 
         const startListening = () =>
             new Promise<void>((resolve, reject) => {
-                db.collection("server")
+                FCMService.cleanupListeners();
+                FCMService.firestoreUnsubscribe = db
+                    .collection("server")
                     .doc("commands")
                     .onSnapshot(
                         (snapshot: admin.firestore.DocumentSnapshot) => {
@@ -397,18 +422,16 @@ export class FCMService extends Loggable {
 
         const startListening = () =>
             new Promise<void>((resolve, reject) => {
-                db.ref("config")
-                    .child("nextRestart")
-                    .on(
-                        "value",
-                        async (snapshot: admin.database.DataSnapshot) => {
-                            this.nextRestartHandler(snapshot.val());
-                            resolve();
-                        },
-                        (error: any) => {
-                            reject(error);
-                        }
-                    );
+                FCMService.cleanupListeners();
+                const ref = db.ref("config").child("nextRestart");
+                const onValue = async (snapshot: admin.database.DataSnapshot) => {
+                    this.nextRestartHandler(snapshot.val());
+                    resolve();
+                };
+                FCMService.realtimeUnsubscribe = () => ref.off("value", onValue);
+                ref.on("value", onValue, (error: any) => {
+                    reject(error);
+                });
             });
 
         await startListening();
@@ -507,6 +530,7 @@ export class FCMService extends Loggable {
     }
 
     static async stop() {
+        FCMService.cleanupListeners();
         const app = FCMService.getApp();
         if (app) await app.delete();
     }

@@ -178,7 +178,7 @@ export class MessagePromise {
         const messageText = onlyAlphaNumeric(message.universalText(true));
 
         // Check if the text matches
-        return this.text === messageText && this.sentAt <= message.dateCreated.getTime();
+        return this.text === messageText && this.sentAt <= (message?.dateCreated?.getTime() ?? 0);
     }
 }
 

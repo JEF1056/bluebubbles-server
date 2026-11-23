@@ -8,6 +8,14 @@ import { v4 } from "uuid";
 import { ScheduledService } from "../../../lib/ScheduledService";
 import { Loggable } from "../../../lib/logging/Loggable";
 
+function getFaceTimeAudioBridge(): typeof import("./FaceTimeAudioBridge").FaceTimeAudioBridge | null {
+    try {
+        return require("./FaceTimeAudioBridge").FaceTimeAudioBridge;
+    } catch {
+        return null;
+    }
+}
+
 export enum FaceTimeSessionStatus {
     UNKNOWN = 0,
     ANSWERED = 1,
@@ -44,6 +52,7 @@ export type SerializedFaceTimeSession = {
     is_telephony: boolean;
     is_link_only: boolean;
     is_muted: boolean;
+    is_group: boolean;
     initiator_device_id: string | null;
     initiator_device_name: string | null;
     active_device_id: string | null;
@@ -54,6 +63,8 @@ export type SerializedFaceTimeSession = {
     ended_reason: string | null;
     ended_error: string | null;
     silenced_reason: "dnd" | null;
+    endpoint_on_mac: boolean;
+    from_iphone: boolean;
 };
 
 export type FaceTimeSessionInit = {
@@ -75,6 +86,7 @@ export type FaceTimeSessionInit = {
     isTelephony?: boolean;
     isLinkOnly?: boolean;
     isMuted?: boolean;
+    isGroup?: boolean;
     providerIdentifier?: string | null;
     initiatorDeviceId?: string | null;
     initiatorDeviceName?: string | null;
@@ -83,6 +95,8 @@ export type FaceTimeSessionInit = {
     endedReason?: string | null;
     endedError?: string | null;
     silencedReason?: "dnd" | null;
+    endpointOnMac?: boolean;
+    fromIphone?: boolean;
 };
 
 export class FaceTimeSession extends Loggable {
@@ -136,6 +150,8 @@ export class FaceTimeSession extends Loggable {
 
     isMuted = false;
 
+    isGroup = false;
+
     providerIdentifier: string | null = null;
 
     initiatorDeviceId: string | null = null;
@@ -184,11 +200,19 @@ export class FaceTimeSession extends Loggable {
 
     leftForHandoff = false;
 
+    private outgoingAnswerPromise: Promise<boolean> | null = null;
+
     handoffLeaveObserved = false;
 
     endedByUser = false;
 
     endAndInvalidateTriggered = false;
+
+    endpointOnMac = true;
+
+    fromIphone = false;
+
+    private hasEndpointOnMac = false;
 
     private expiryTimer: NodeJS.Timeout = null;
 
@@ -211,6 +235,7 @@ export class FaceTimeSession extends Loggable {
         isTelephony = false,
         isLinkOnly = false,
         isMuted = false,
+        isGroup = false,
         providerIdentifier = null,
         initiatorDeviceId = null,
         initiatorDeviceName = null,
@@ -218,7 +243,9 @@ export class FaceTimeSession extends Loggable {
         activeDeviceName = null,
         endedReason = null,
         endedError = null,
-        silencedReason = null
+        silencedReason = null,
+        endpointOnMac = true,
+        fromIphone = false
     }: FaceTimeSessionInit = {}) {
         super();
 
@@ -250,6 +277,7 @@ export class FaceTimeSession extends Loggable {
         this.isTelephony = isTelephony;
         this.isLinkOnly = isLinkOnly;
         this.isMuted = isMuted;
+        this.isGroup = Boolean(isGroup || this.addresses.length > 1);
         this.providerIdentifier = providerIdentifier;
         this.initiatorDeviceId = initiatorDeviceId;
         this.initiatorDeviceName = initiatorDeviceName;
@@ -258,24 +286,55 @@ export class FaceTimeSession extends Loggable {
         this.endedReason = endedReason;
         this.endedError = endedError;
         this.silencedReason = silencedReason;
+        this.endpointOnMac = endpointOnMac;
+        this.fromIphone = fromIphone || !endpointOnMac;
+        if (!this.endpointOnMac && !this.activeDeviceName) {
+            this.activeDeviceName = "iPhone";
+        }
         if (this.status === FaceTimeSessionStatus.ANSWERED) {
             this.answeredAt = this.createdAt;
         }
 
         if (addToManager) {
             FaceTimeSessionManager().addSession(this);
-
-            // After 3 hours, invalidate the FaceTime session and broadcast disconnected
-            this.expiryTimer = setTimeout(() => {
-                this.invalidate("expired");
-                FaceTimeSessionManager().broadcastUpdate(this, true);
-            }, 1000 * 60 * 60 * 3);
-            this.expiryTimer.unref?.();
+            this.armExpiryTimer();
         }
+    }
+
+    armExpiryTimer() {
+        if (this.expiryTimer || this.status === FaceTimeSessionStatus.DISCONNECTED) return;
+        // After 3 hours, invalidate the FaceTime session and broadcast disconnected
+        this.expiryTimer = setTimeout(() => {
+            this.invalidate("expired");
+            FaceTimeSessionManager().broadcastUpdate(this, true);
+        }, 1000 * 60 * 60 * 3);
+        this.expiryTimer.unref?.();
     }
 
     touch() {
         this.updatedAt = new Date();
+    }
+
+    setStatus(status: FaceTimeSessionStatus): void {
+        const prevStatus = this.status;
+        this.status = status;
+        if (status === FaceTimeSessionStatus.ANSWERED && !this.answeredAt) {
+            this.answeredAt = new Date();
+        }
+        if (prevStatus !== FaceTimeSessionStatus.ANSWERED && status === FaceTimeSessionStatus.ANSWERED) {
+            const bridge = getFaceTimeAudioBridge();
+            if (bridge) {
+                const ids = new Set<string>();
+                if (this.callUuid) ids.add(this.callUuid);
+                if (this.uniqueProxyIdentifier) ids.add(this.uniqueProxyIdentifier);
+                for (const alias of this.callUuidAliases) {
+                    if (alias) ids.add(alias);
+                }
+                for (const id of ids) {
+                    bridge.getInstance()?.onCallAnswered?.(id);
+                }
+            }
+        }
     }
 
     serialize(): SerializedFaceTimeSession {
@@ -297,6 +356,7 @@ export class FaceTimeSession extends Loggable {
             is_telephony: Boolean(this.isTelephony),
             is_link_only: Boolean(this.isLinkOnly),
             is_muted: Boolean(this.isMuted),
+            is_group: Boolean(this.isGroup),
             initiator_device_id: this.initiatorDeviceId ?? null,
             initiator_device_name: this.initiatorDeviceName ?? null,
             active_device_id: this.activeDeviceId ?? null,
@@ -306,14 +366,16 @@ export class FaceTimeSession extends Loggable {
             updated_at: this.updatedAt ? this.updatedAt.getTime() : null,
             ended_reason: this.endedReason ?? null,
             ended_error: this.endedError ?? null,
-            silenced_reason: this.silencedReason ?? null
+            silenced_reason: this.silencedReason ?? null,
+            endpoint_on_mac: Boolean(this.endpointOnMac),
+            from_iphone: Boolean(this.fromIphone)
         };
     }
 
     invalidate(endedReason: string | null = null, endedError: string | null = null) {
         const prevUrl = this.url;
         const prevGroupUuid = this.conversationGroupUuid;
-        this.status = FaceTimeSessionStatus.DISCONNECTED;
+        this.setStatus(FaceTimeSessionStatus.DISCONNECTED);
         if (endedReason !== null && endedReason !== undefined) {
             this.endedReason = endedReason;
         }
@@ -356,8 +418,14 @@ export class FaceTimeSession extends Loggable {
             }
         }
 
+        this.outgoingAnswerPromise = null;
+
         // Preserve callUuid and uuid until after disconnected listeners/serializers match it.
         this.emit("disconnected");
+
+        if (prevUrl) {
+            FaceTimeSessionManager().scheduleLinkCleanup(prevUrl);
+        }
     }
 
     static isFailureEndedReason(reason: string | null | undefined): boolean {
@@ -426,6 +494,7 @@ export class FaceTimeSession extends Loggable {
             (this.callUuid ?? "").toLowerCase() === normalized ||
             (this.uuid ?? "").toLowerCase() === normalized ||
             (this.uniqueProxyIdentifier ?? "").toLowerCase() === normalized ||
+            (this.conversationGroupUuid ?? "").toLowerCase() === normalized ||
             this.callUuidAliases.has(normalized)
         );
     }
@@ -453,8 +522,12 @@ export class FaceTimeSession extends Loggable {
             this.address = session.address;
             changed = true;
         }
-        if (session.addresses?.length && this.addresses.length === 0) {
+        if (session.addresses?.length && session.addresses.length > this.addresses.length) {
             this.addresses = [...session.addresses];
+            changed = true;
+        }
+        if (session.isGroup && !this.isGroup) {
+            this.isGroup = true;
             changed = true;
         }
         if (session.displayName && !this.displayName) {
@@ -495,6 +568,22 @@ export class FaceTimeSession extends Loggable {
         }
         if (session.conversationGroupUuid && !this.conversationGroupUuid) {
             this.conversationGroupUuid = session.conversationGroupUuid;
+            this.registerIdentifier(session.conversationGroupUuid);
+            changed = true;
+        }
+        if (session.hasEndpointOnMac && session.endpointOnMac !== this.endpointOnMac) {
+            this.endpointOnMac = session.endpointOnMac;
+            if (this.endpointOnMac && this.activeDeviceName === "iPhone") {
+                this.activeDeviceName = null;
+            }
+            changed = true;
+        }
+        if (session.fromIphone && !this.fromIphone) {
+            this.fromIphone = true;
+            changed = true;
+        }
+        if (!this.endpointOnMac && !this.activeDeviceName) {
+            this.activeDeviceName = "iPhone";
             changed = true;
         }
         if (session.conversationUuid && !this.conversationUuid) {
@@ -538,15 +627,11 @@ export class FaceTimeSession extends Loggable {
         }
 
         if (session.status === FaceTimeSessionStatus.DISCONNECTED) {
-            const nonLightweightCount =
-                session.activeNonLightweightParticipantsCount ?? this.activeNonLightweightParticipantsCount;
+            const nonLightweightCount = session.activeNonLightweightParticipantsCount;
             const calleeStillActive =
                 nonLightweightCount !== null
-                    ? nonLightweightCount > 0 || (this.addresses.length === 0 && this.activeRemoteParticipantsCount > 0)
-                    : this.activeRemoteParticipantsCount > 0 ||
-                      this.pendingMembersCount > 0 ||
-                      session.activeRemoteParticipantsCount > 0 ||
-                      session.pendingMembersCount > 0;
+                    ? nonLightweightCount > 0 || (this.addresses.length === 0 && session.activeRemoteParticipantsCount > 0)
+                    : session.activeRemoteParticipantsCount > 0 || session.pendingMembersCount > 0;
             const initialHandoffLeave = this.leftForHandoff && !this.handoffLeaveObserved;
             if (initialHandoffLeave) {
                 this.handoffLeaveObserved = true;
@@ -554,14 +639,17 @@ export class FaceTimeSession extends Loggable {
             // Once the Mac has left for handoff, ignore duplicate TUCall DISCONNECTED notifications
             // (both CallStatusChanged and VideoCallStatusChanged fire); the conversation monitor owns hangup.
             const isHandoffLeave =
-                (this.leftForHandoff || (calleeStillActive && this.status === FaceTimeSessionStatus.ANSWERED)) &&
+                (this.leftForHandoff ||
+                    (Boolean(this.url) &&
+                        this.admittedParticipants.length > 0 &&
+                        session.hasParticipantCounts &&
+                        calleeStillActive)) &&
                 !this.endedByUser &&
                 !session.endedError &&
                 !FaceTimeSession.isFailureEndedReason(session.endedReason);
             if (isHandoffLeave) {
                 if (this.status !== FaceTimeSessionStatus.ANSWERED) {
-                    this.status = FaceTimeSessionStatus.ANSWERED;
-                    if (!this.answeredAt) this.answeredAt = new Date();
+                    this.setStatus(FaceTimeSessionStatus.ANSWERED);
                     this.emit("answered", true);
                 }
                 this.touch();
@@ -595,10 +683,7 @@ export class FaceTimeSession extends Loggable {
         }
 
         if (session.status === FaceTimeSessionStatus.ANSWERED && this.status !== FaceTimeSessionStatus.ANSWERED) {
-            this.status = FaceTimeSessionStatus.ANSWERED;
-            if (!this.answeredAt) {
-                this.answeredAt = new Date();
-            }
+            this.setStatus(FaceTimeSessionStatus.ANSWERED);
             this.touch();
             this.emit("answered", true);
             this.emit("updated");
@@ -611,14 +696,14 @@ export class FaceTimeSession extends Loggable {
                 this.status
             )
         ) {
-            this.status = FaceTimeSessionStatus.CONNECTING;
+            this.setStatus(FaceTimeSessionStatus.CONNECTING);
             this.touch();
             this.emit("updated");
             return;
         }
 
         if (this.status === FaceTimeSessionStatus.UNKNOWN && session.status !== FaceTimeSessionStatus.UNKNOWN) {
-            this.status = session.status;
+            this.setStatus(session.status);
             this.touch();
             this.emit("updated");
             return;
@@ -693,13 +778,13 @@ export class FaceTimeSession extends Loggable {
                     return false;
                 }
 
-                if (!d.req?.body.includes("join")) {
+                if (!d.req?.body?.includes("join")) {
                     this.log.debug(`Notification body does not contain a join request: ${String(d.req?.body)}`);
                     continue;
                 }
 
                 // Extract the user data
-                const userData = d.req?.usda["$objects"] ?? [];
+                const userData = d.req?.usda?.["$objects"] ?? [];
 
                 // If our data is incomplete, skip
                 if (userData.length < 10) {
@@ -830,6 +915,7 @@ export class FaceTimeSession extends Loggable {
 
         // Set the url
         this.url = result.data.url;
+        FaceTimeSessionManager().recordCreatedLink(this.url);
 
         // Emit URL to listeners
         this.emit("link", this.url);
@@ -1140,36 +1226,121 @@ export class FaceTimeSession extends Loggable {
         }, intervalMs);
     }
 
-    private waitForOutgoingAnswer(ringTimeoutMs = 90000): Promise<boolean> {
+    ensureOutgoingAnswerPolling(ringTimeoutMs = 60000): Promise<boolean> {
         if (this.status === FaceTimeSessionStatus.ANSWERED) return Promise.resolve(true);
         if (this.status !== FaceTimeSessionStatus.OUTGOING) return Promise.resolve(false);
+        if (this.isLinkOnly) return Promise.resolve(false);
+        if (this.outgoingAnswerPromise) return this.outgoingAnswerPromise;
 
-        return new Promise<boolean>(resolve => {
-            let timer: NodeJS.Timeout;
+        this.outgoingAnswerPromise = new Promise<boolean>(resolve => {
+            let settled = false;
+            let timer: NodeJS.Timeout | null = null;
+            let pollTimer: NodeJS.Timeout | null = null;
+            let pollInFlight = false;
             const cleanup = () => {
-                clearTimeout(timer);
+                if (timer) clearTimeout(timer);
+                if (pollTimer) clearInterval(pollTimer);
                 this.removeListener("answered", onAnswered);
                 this.removeListener("disconnected", onDisconnected);
             };
-            const onAnswered = () => {
+            const finish = (answered: boolean) => {
+                if (settled) return;
+                settled = true;
+                this.outgoingAnswerPromise = null;
                 cleanup();
-                resolve(true);
+                resolve(answered);
             };
-            const onDisconnected = () => {
-                cleanup();
-                resolve(false);
-            };
+            const onAnswered = () => finish(true);
+            const onDisconnected = () => finish(false);
             this.once("answered", onAnswered);
             this.once("disconnected", onDisconnected);
-            timer = setTimeout(() => {
-                cleanup();
-                resolve(false);
-            }, ringTimeoutMs);
+
+            try {
+                const getter = Server()?.privateApi?.facetime?.getConversationState;
+                if (typeof getter === "function") {
+                    pollTimer = setInterval(async () => {
+                        if (settled || pollInFlight) return;
+                        pollInFlight = true;
+                        try {
+                            const res = await getter.call(Server().privateApi.facetime);
+                            const conversations = res?.data?.conversations;
+                            if (!Array.isArray(conversations)) return;
+                            const match = this.findMatchingConversation(conversations);
+                            if (!match) return;
+                            this.applyConversationMatch(match);
+                            if (
+                                (this.activeNonLightweightParticipantsCount ?? 0) > 0 &&
+                                this.status === FaceTimeSessionStatus.OUTGOING
+                            ) {
+                                this.setStatus(FaceTimeSessionStatus.ANSWERED);
+                                this.hadNonLightweightParticipant = true;
+                                this.touch();
+                                this.emit("answered", true);
+                                this.emit("updated");
+                                FaceTimeSessionManager().broadcastUpdate(this);
+                            }
+                        } catch {
+                            // Ignore transient poll errors while waiting for outgoing answer
+                        } finally {
+                            pollInFlight = false;
+                        }
+                    }, 1000);
+                    pollTimer.unref?.();
+                }
+            } catch {
+                // Ignore when Server singleton is not initialized
+            }
+
+            const onTimeout = () => {
+                if (settled) return;
+                // Guard against racing with a late answer or user hangup
+                const shouldAutoEndNoAnswer =
+                    this.status === FaceTimeSessionStatus.OUTGOING &&
+                    !this.isLinkOnly &&
+                    !this.endedByUser;
+                finish(false);
+                if (!shouldAutoEndNoAnswer) return;
+
+                this.log.info(
+                    `Outgoing FaceTime call timed out after ${ringTimeoutMs}ms with no answer (${this.callUuid || this.uuid})`
+                );
+                if (this.callUuid) {
+                    try {
+                        Server()?.privateApi?.facetime?.leaveCall?.(this.callUuid)?.catch?.(() => {});
+                    } catch {
+                        // Ignore when Server singleton is not initialized
+                    }
+                }
+                this.invalidate("no_answer");
+                getFaceTimeAudioBridge()
+                    ?.getInstance()
+                    ?.cleanupSessions?.([
+                        this.callUuid,
+                        ...this.callUuidAliases,
+                        this.uniqueProxyIdentifier,
+                        this.conversationGroupUuid,
+                        this.uuid
+                    ]);
+                FaceTimeSessionManager().broadcastUpdate(this, true);
+            };
+
+            timer = setTimeout(onTimeout, ringTimeoutMs);
+            timer.unref?.();
         });
+
+        return this.outgoingAnswerPromise;
     }
 
-    async admitAndLeave(ringTimeoutMs = 90000, handoffDelayMs = 15000, leaveAfterAdmit = true): Promise<void> {
+    private waitForOutgoingAnswer(ringTimeoutMs = 60000): Promise<boolean> {
+        return this.ensureOutgoingAnswerPolling(ringTimeoutMs);
+    }
+
+    async admitAndLeave(ringTimeoutMs = 60000, handoffDelayMs = 15000, leaveAfterAdmit = true): Promise<void> {
         this.log.debug("Waiting to admit self...");
+
+        if (this.status === FaceTimeSessionStatus.OUTGOING && !this.isLinkOnly) {
+            void this.ensureOutgoingAnswerPolling(ringTimeoutMs);
+        }
 
         // Wait for the user, and admit them into the call
         await this.admitSelf(leaveAfterAdmit);
@@ -1182,7 +1353,7 @@ export class FaceTimeSession extends Loggable {
         // Keep the Mac in an active outbound call while ringing so leaveCall never drops an unanswered ring.
         if (this.status === FaceTimeSessionStatus.OUTGOING && !this.isLinkOnly) {
             this.log.debug("Outbound FaceTime call still ringing; waiting for answer before handoff...");
-            const answered = await this.waitForOutgoingAnswer(ringTimeoutMs);
+            const answered = await this.ensureOutgoingAnswerPolling(ringTimeoutMs);
             if (!answered || (this.status as FaceTimeSessionStatus) === FaceTimeSessionStatus.DISCONNECTED) {
                 this.log.debug("Outbound FaceTime call did not reach answered state; skipping leaveCall.");
                 return;
@@ -1322,17 +1493,17 @@ export class FaceTimeSession extends Loggable {
         // Answer the call and generate a link for it.
         await session.answerWithServer();
         await session.generateLink();
-        await session.admitAndLeave(90000, 15000, true);
+        await session.admitAndLeave(60000, 15000, true);
         return session;
     }
 
-    static async fromGeneratedLink(callUuid: string = null): Promise<FaceTimeSession> {
+    static async fromGeneratedLink(callUuid: string = null, isVideo = true): Promise<FaceTimeSession> {
         const session = new FaceTimeSession({
             callUuid,
             isLinkOnly: !callUuid,
             isOutgoing: !callUuid,
-            isVideo: true,
-            isAudio: false
+            isVideo,
+            isAudio: !isVideo
         });
 
         if (callUuid) {
@@ -1351,9 +1522,30 @@ export class FaceTimeSession extends Loggable {
     }
 
     static fromEvent(event: any, addToManager = false): FaceTimeSession {
-        const status = event?.call_status ?? event?.status_id ?? FaceTimeSessionStatus.UNKNOWN;
-        const rawAddress = event?.handle?.value ?? event?.address ?? null;
+        const isHandoffEligible = Boolean(event?.is_handoff_eligible);
+        let status =
+            event?.call_status ??
+            event?.status_id ??
+            (isHandoffEligible ? FaceTimeSessionStatus.ANSWERED : FaceTimeSessionStatus.UNKNOWN);
+        const addresses = Array.isArray(event?.addresses)
+            ? event.addresses.filter((a: any) => typeof a === "string" && a.trim().length > 0)
+            : [];
+        const rawAddress = event?.handle?.value ?? event?.address ?? addresses[0] ?? null;
+        const isGroup = Boolean(
+            event?.is_group ?? ((event?.remote_members_count ?? 0) > 1 || addresses.length > 1)
+        );
         const { isTelephony, isVideo, isAudio } = FaceTimeSession.resolveMediaFlags(event);
+        // Outgoing GFT calls join their own conversation (callStatus=1) before the callee answers.
+        if (
+            status === FaceTimeSessionStatus.ANSWERED &&
+            event?.is_outgoing &&
+            event?.is_conversation &&
+            !isTelephony &&
+            Boolean(event?.conversation_uuid || event?.conversation_group_uuid) &&
+            Number(event?.active_non_lightweight_participants_count ?? 1) === 0
+        ) {
+            status = FaceTimeSessionStatus.OUTGOING;
+        }
         const isOutgoing = Boolean(event?.is_outgoing ?? status === FaceTimeSessionStatus.OUTGOING);
         const endedError = event?.ended_error ?? null;
         const disconnectedReason =
@@ -1373,8 +1565,20 @@ export class FaceTimeSession extends Loggable {
             false,
             Boolean(silencedReason || isIncomingSilenced)
         );
+        const hasEndpointOnMac = event?.is_endpoint_on_current_device !== undefined || isHandoffEligible;
+        const endpointOnMac = isHandoffEligible
+            ? false
+            : event?.is_endpoint_on_current_device !== undefined
+              ? Boolean(event.is_endpoint_on_current_device)
+              : true;
+        const fromIphone = !endpointOnMac || isHandoffEligible;
+        const conversationGroupUuid = event?.conversation_group_uuid ?? null;
         const uniqueProxyIdentifier = event?.unique_proxy_identifier ?? event?.uniqueProxyIdentifier ?? null;
-        const resolvedCallUuid = event?.call_uuid ?? event?.callUUID ?? uniqueProxyIdentifier ?? null;
+        const resolvedCallUuid =
+            event?.call_uuid ??
+            event?.callUUID ??
+            uniqueProxyIdentifier ??
+            (isHandoffEligible ? conversationGroupUuid : null);
         const session = new FaceTimeSession({
             callUuid: resolvedCallUuid,
             uniqueProxyIdentifier,
@@ -1383,21 +1587,26 @@ export class FaceTimeSession extends Loggable {
             addToManager,
             status,
             address: rawAddress,
-            addresses: Array.isArray(event?.addresses) ? event.addresses : rawAddress ? [rawAddress] : [],
+            addresses: addresses.length > 0 ? addresses : rawAddress ? [rawAddress] : [],
             imageUrl: event?.image_url ?? null,
             isOutgoing,
             isAudio,
             isVideo,
             isTelephony,
+            isGroup,
             providerIdentifier: event?.provider_identifier ?? null,
             endedReason,
             endedError,
-            silencedReason
+            silencedReason,
+            endpointOnMac,
+            fromIphone
         });
+        session.hasEndpointOnMac = hasEndpointOnMac;
         session.disconnectedReason = disconnectedReason;
         session.rawEndedReason = rawEndedReason;
         session.isIncomingSilenced = isIncomingSilenced;
-        session.conversationGroupUuid = event?.conversation_group_uuid ?? null;
+        session.conversationGroupUuid = conversationGroupUuid;
+        session.registerIdentifier(conversationGroupUuid);
         session.hasParticipantCounts =
             event?.active_remote_participants_count !== undefined ||
             event?.active_lightweight_participants_count !== undefined ||

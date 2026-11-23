@@ -5,6 +5,7 @@ import type { ChatSerializerMutliParams, ChatSerializerSingleParams } from "./ty
 import { MessageSerializer } from "./MessageSerializer";
 import { HandleSerializer } from "./HandleSerializer";
 import { extractReadReceiptsOverride, isChatFilteredAsSpam } from "./chatSpam";
+import { readPointerToEpochMs } from "@server/databases/imessage/snapshot/ChatStateSnapshot";
 import { Server } from "@server";
 
 // Unified `any;-;` chats can keep a stale `chat.service_name` (e.g. "SMS") in chat.db;
@@ -78,6 +79,15 @@ export class ChatSerializer {
             latestMsgService = latest?.service ?? null;
         }
 
+        const lastReadRaw = chat.lastReadMessageTimestamp as unknown;
+        let lastReadMessageTimestamp: number | null = null;
+        if (lastReadRaw instanceof Date) {
+            const ms = lastReadRaw.getTime();
+            lastReadMessageTimestamp = Number.isFinite(ms) && ms > 0 ? ms : null;
+        } else if (typeof lastReadRaw === "string" || typeof lastReadRaw === "number") {
+            lastReadMessageTimestamp = readPointerToEpochMs(String(lastReadRaw)) ?? null;
+        }
+
         let output: ChatResponse = {
             originalROWID: chat.ROWID,
             guid: chat.guid,
@@ -90,7 +100,8 @@ export class ChatSerializer {
             // or iOS-filtered sender arrives by push, before any chat sync.
             isFiltered: Boolean(chat.isFiltered),
             isFilteredAsSpam: isChatFilteredAsSpam(chat.properties),
-            autoSendReadReceipts: extractReadReceiptsOverride(chat.properties)
+            autoSendReadReceipts: extractReadReceiptsOverride(chat.properties),
+            lastReadMessageTimestamp
         };
 
         if (config.includeParticipants) {

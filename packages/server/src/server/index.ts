@@ -94,6 +94,7 @@ import { obfuscatedHandle } from "./utils/StringUtils";
 import { AutoStartMethods } from "./databases/server/constants";
 import { MacOsInterface } from "./api/interfaces/macosInterface";
 import { FaceTimeAudioBridge } from "./api/lib/facetime/FaceTimeAudioBridge";
+import { FaceTimeSessionManager } from "./api/lib/facetime/FacetimeSessionManager";
 
 const findProcess = require("find-process");
 
@@ -589,6 +590,7 @@ class BlueBubblesServer extends EventEmitter {
         if (privateApiEnabled || ftPrivateApiEnabled) {
             this.logger.info("Starting Private API Helper listener...");
             this.privateApi.start();
+            FaceTimeSessionManager().ensureLinkSweepStarted(true);
         }
 
         if (this.hasDiskAccess) {
@@ -616,7 +618,7 @@ class BlueBubblesServer extends EventEmitter {
         this.logger.info("Stopping services...");
 
         try {
-            FCMService.stop();
+            await FCMService.stop();
         } catch (ex: any) {
             this.logger.info(`Failed to stop FCM service! ${ex?.message ?? ex}`);
         }
@@ -674,6 +676,12 @@ class BlueBubblesServer extends EventEmitter {
             FaceTimeAudioBridge.getInstance().cleanupAllSessions();
         } catch (ex: any) {
             this.logger.error(`Failed to stop FaceTime bridge sessions! ${ex?.message ?? ex}`);
+        }
+
+        try {
+            FaceTimeSessionManager().stopLinkSweep();
+        } catch (ex: any) {
+            this.logger.error(`Failed to stop FaceTime link sweep! ${ex?.message ?? ex}`);
         }
 
         this.logger.info("Finished stopping services...");
@@ -1409,20 +1417,34 @@ class BlueBubblesServer extends EventEmitter {
             this.iMessageListener.addPoller(new ChatUpdatePoller(this.iMessageRepo, cache));
         }
 
-        this.iMessageListener.on(CHAT_READ_STATUS_CHANGED, async (item: { guid: string; read: boolean; readAt?: number }) => {
-            // Preserve the detector's transition decision verbatim. On Monterey,
-            // Mark as Unread moves the chat-level read pointer backward while the
-            // message rows remain read; re-querying those rows would erase the
-            // unread transition and incorrectly emit read: true.
-            this.logger.info(`Chat read state changed [${item.guid}]: ${item.read ? "read" : "unread"}`);
-            await Server().emitMessage(CHAT_READ_STATUS_CHANGED, {
-                chatGuid: item.guid,
-                read: item.read,
-                // When Apple marked it read, so a client can tell a message sent
-                // before the read from one sent after it. Older clients ignore it.
-                ...(item.readAt != null ? { readAt: item.readAt } : {})
-            });
-        });
+        const safeListener = <T>(eventName: string, handler: (item: T) => Promise<void>) => {
+            return (item: T) => {
+                Promise.resolve(handler(item)).catch((err: any) => {
+                    this.logger.error(
+                        `Error in iMessageListener "${eventName}" handler: ${err?.message ?? String(err)}`
+                    );
+                    if (err?.stack) this.logger.debug(err.stack);
+                });
+            };
+        };
+
+        this.iMessageListener.on(
+            CHAT_READ_STATUS_CHANGED,
+            safeListener(CHAT_READ_STATUS_CHANGED, async (item: { guid: string; read: boolean; readAt?: number }) => {
+                // Preserve the detector's transition decision verbatim. On Monterey,
+                // Mark as Unread moves the chat-level read pointer backward while the
+                // message rows remain read; re-querying those rows would erase the
+                // unread transition and incorrectly emit read: true.
+                this.logger.info(`Chat read state changed [${item.guid}]: ${item.read ? "read" : "unread"}`);
+                await Server().emitMessage(CHAT_READ_STATUS_CHANGED, {
+                    chatGuid: item.guid,
+                    read: item.read,
+                    // When Apple marked it read, so a client can tell a message sent
+                    // before the read from one sent after it. Older clients ignore it.
+                    ...(item.readAt != null ? { readAt: item.readAt } : {})
+                });
+            })
+        );
 
         // Recently Deleted only exists on Ventura and later. Deleting a single
         // message leaves both the chat row and the message row in place, so no
@@ -1431,234 +1453,270 @@ class BlueBubblesServer extends EventEmitter {
             this.iMessageListener.addPoller(new RecoverableMessagePoller(this.iMessageRepo, cache));
         }
 
-        this.iMessageListener.on(MESSAGE_DELETED, async (item: { chatGuid: string; messageGuid: string }) => {
-            // The poller seeds silently on its first run and only reports
-            // transitions, so this mirrors an Apple-side delete without
-            // re-checking the database. Only the two GUIDs are sent: the client
-            // already holds the message, and this also goes out over FCM.
-            this.logger.info(`Message deleted on Apple [${item.messageGuid}]`);
-            await this.translationService?.deleteForMessage(item.messageGuid);
-            await Server().emitMessage(MESSAGE_DELETED, item);
-        });
+        this.iMessageListener.on(
+            MESSAGE_DELETED,
+            safeListener(MESSAGE_DELETED, async (item: { chatGuid: string; messageGuid: string }) => {
+                // The poller seeds silently on its first run and only reports
+                // transitions, so this mirrors an Apple-side delete without
+                // re-checking the database. Only the two GUIDs are sent: the client
+                // already holds the message, and this also goes out over FCM.
+                this.logger.info(`Message deleted on Apple [${item.messageGuid}]`);
+                await this.translationService?.deleteForMessage(item.messageGuid);
+                await Server().emitMessage(MESSAGE_DELETED, item);
+            })
+        );
 
-        this.iMessageListener.on(MESSAGE_RESTORED, async (item: { chatGuid: string; messageGuid: string }) => {
-            this.logger.info(`Message restored on Apple [${item.messageGuid}]`);
-            await Server().emitMessage(MESSAGE_RESTORED, item);
-        });
+        this.iMessageListener.on(
+            MESSAGE_RESTORED,
+            safeListener(MESSAGE_RESTORED, async (item: { chatGuid: string; messageGuid: string }) => {
+                this.logger.info(`Message restored on Apple [${item.messageGuid}]`);
+                await Server().emitMessage(MESSAGE_RESTORED, item);
+            })
+        );
 
-        this.iMessageListener.on(CHAT_DELETED, async (item: { guid: string }) => {
-            // A chat Apple previously held with messages is now empty or absent.
-            // The detector already enforces forward-only semantics (it only fires
-            // for chats previously observed non-empty), so this can be trusted to
-            // mirror Apple's deletion without re-checking the database.
-            this.logger.info(`Chat deleted on Apple [${item.guid}]`);
-            await this.translationService?.deleteForChat(item.guid);
-            await Server().emitMessage(CHAT_DELETED, {
-                chatGuid: item.guid
-            });
-        });
+        this.iMessageListener.on(
+            CHAT_DELETED,
+            safeListener(CHAT_DELETED, async (item: { guid: string }) => {
+                // A chat Apple previously held with messages is now empty or absent.
+                // The detector already enforces forward-only semantics (it only fires
+                // for chats previously observed non-empty), so this can be trusted to
+                // mirror Apple's deletion without re-checking the database.
+                this.logger.info(`Chat deleted on Apple [${item.guid}]`);
+                await this.translationService?.deleteForChat(item.guid);
+                await Server().emitMessage(CHAT_DELETED, {
+                    chatGuid: item.guid
+                });
+            })
+        );
 
         /**
          * Message listener for my messages only. We need this because messages from ourselves
          * need to be fully sent before forwarding to any clients. If we emit a notification
          * before the message is sent, it will cause a duplicate.
          */
-        this.iMessageListener.on("new-entry", (item) => this.handleNewMessage(item));
+        this.iMessageListener.on("new-entry", safeListener("new-entry", (item: Message) => this.handleNewMessage(item)));
 
         /**
          * Message listener checking for updated messages. This means either the message's
          * delivered date or read date have changed since the last time we checked the database.
          */
-        this.iMessageListener.on("updated-entry", (item) => this.handleUpdatedMessage(item));
+        this.iMessageListener.on(
+            "updated-entry",
+            safeListener("updated-entry", (item: Message) => this.handleUpdatedMessage(item))
+        );
 
         /**
          * Message listener for messages that have errored out
          */
-        this.iMessageListener.on("message-send-error", async (item: Message) => {
-            await this.emitMessageError(item);
-        });
+        this.iMessageListener.on(
+            "message-send-error",
+            safeListener("message-send-error", async (item: Message) => {
+                await this.emitMessageError(item);
+            })
+        );
 
-        this.iMessageListener.on("name-change", async (item: Message) => {
-            this.logger.info(`Group name for [${item.cacheRoomnames}] changed to [${item.groupTitle}]`);
+        this.iMessageListener.on(
+            "name-change",
+            safeListener("name-change", async (item: Message) => {
+                this.logger.info(`Group name for [${item.cacheRoomnames}] changed to [${item.groupTitle}]`);
 
-            // Manually send the message to the socket so we can serialize it with
-            // all the extra data
-            this.httpService.socketServer.emit(
-                GROUP_NAME_CHANGE,
-                await MessageSerializer.serialize({
-                    message: item,
-                    config: {
-                        loadChatParticipants: true,
-                        includeChats: true
-                    }
-                })
-            );
+                // Manually send the message to the socket so we can serialize it with
+                // all the extra data
+                this.httpService.socketServer.emit(
+                    GROUP_NAME_CHANGE,
+                    await MessageSerializer.serialize({
+                        message: item,
+                        config: {
+                            loadChatParticipants: true,
+                            includeChats: true
+                        }
+                    })
+                );
 
-            // Group name changes don't require the participants to be loaded
-            await this.emitMessage(
-                GROUP_NAME_CHANGE,
-                await MessageSerializer.serialize({
-                    message: item,
-                    config: {
-                        loadChatParticipants: false
-                    },
-                    isForNotification: true
-                }),
-                "normal",
-                true,
-                false
-            );
-        });
+                // Group name changes don't require the participants to be loaded
+                await this.emitMessage(
+                    GROUP_NAME_CHANGE,
+                    await MessageSerializer.serialize({
+                        message: item,
+                        config: {
+                            loadChatParticipants: false
+                        },
+                        isForNotification: true
+                    }),
+                    "normal",
+                    true,
+                    false
+                );
+            })
+        );
 
-        this.iMessageListener.on("participant-removed", async (item: Message) => {
-            const from = item.isFromMe || item.handleId === 0 ? "You" : obfuscatedHandle(item.handle?.id);
-            this.logger.info(`[${from}] removed [${item.otherHandle}] from [${item.cacheRoomnames}]`);
+        this.iMessageListener.on(
+            "participant-removed",
+            safeListener("participant-removed", async (item: Message) => {
+                const from = item.isFromMe || item.handleId === 0 ? "You" : obfuscatedHandle(item.handle?.id);
+                this.logger.info(`[${from}] removed [${item.otherHandle}] from [${item.cacheRoomnames}]`);
 
-            // Manually send the message to the socket so we can serialize it with
-            // all the extra data
-            this.httpService.socketServer.emit(
-                PARTICIPANT_REMOVED,
-                await MessageSerializer.serialize({
-                    message: item,
-                    config: {
-                        loadChatParticipants: true,
-                        includeChats: true
-                    }
-                })
-            );
+                // Manually send the message to the socket so we can serialize it with
+                // all the extra data
+                this.httpService.socketServer.emit(
+                    PARTICIPANT_REMOVED,
+                    await MessageSerializer.serialize({
+                        message: item,
+                        config: {
+                            loadChatParticipants: true,
+                            includeChats: true
+                        }
+                    })
+                );
 
-            await this.emitMessage(
-                PARTICIPANT_REMOVED,
-                await MessageSerializer.serialize({
-                    message: item,
-                    isForNotification: true
-                }),
-                "normal",
-                true,
-                false
-            );
-        });
+                await this.emitMessage(
+                    PARTICIPANT_REMOVED,
+                    await MessageSerializer.serialize({
+                        message: item,
+                        isForNotification: true
+                    }),
+                    "normal",
+                    true,
+                    false
+                );
+            })
+        );
 
-        this.iMessageListener.on("participant-added", async (item: Message) => {
-            const from = item.isFromMe || item.handleId === 0 ? "You" : obfuscatedHandle(item.handle?.id);
-            this.logger.info(`[${from}] added [${item.otherHandle}] to [${item.cacheRoomnames}]`);
+        this.iMessageListener.on(
+            "participant-added",
+            safeListener("participant-added", async (item: Message) => {
+                const from = item.isFromMe || item.handleId === 0 ? "You" : obfuscatedHandle(item.handle?.id);
+                this.logger.info(`[${from}] added [${item.otherHandle}] to [${item.cacheRoomnames}]`);
 
-            // Manually send the message to the socket so we can serialize it with
-            // all the extra data
-            this.httpService.socketServer.emit(
-                PARTICIPANT_ADDED,
-                await MessageSerializer.serialize({
-                    message: item,
-                    config: {
-                        loadChatParticipants: true,
-                        includeChats: true
-                    }
-                })
-            );
+                // Manually send the message to the socket so we can serialize it with
+                // all the extra data
+                this.httpService.socketServer.emit(
+                    PARTICIPANT_ADDED,
+                    await MessageSerializer.serialize({
+                        message: item,
+                        config: {
+                            loadChatParticipants: true,
+                            includeChats: true
+                        }
+                    })
+                );
 
-            await this.emitMessage(
-                PARTICIPANT_ADDED,
-                await MessageSerializer.serialize({
-                    message: item,
-                    isForNotification: true
-                }),
-                "normal",
-                true,
-                false
-            );
-        });
+                await this.emitMessage(
+                    PARTICIPANT_ADDED,
+                    await MessageSerializer.serialize({
+                        message: item,
+                        isForNotification: true
+                    }),
+                    "normal",
+                    true,
+                    false
+                );
+            })
+        );
 
-        this.iMessageListener.on("participant-left", async (item: Message) => {
-            const from = item.isFromMe || item.handleId === 0 ? "You" : obfuscatedHandle(item.handle?.id);
-            this.logger.info(`[${from}] left [${item.cacheRoomnames}]`);
+        this.iMessageListener.on(
+            "participant-left",
+            safeListener("participant-left", async (item: Message) => {
+                const from = item.isFromMe || item.handleId === 0 ? "You" : obfuscatedHandle(item.handle?.id);
+                this.logger.info(`[${from}] left [${item.cacheRoomnames}]`);
 
-            // Manually send the message to the socket so we can serialize it with
-            // all the extra data
-            this.httpService.socketServer.emit(
-                PARTICIPANT_LEFT,
-                await MessageSerializer.serialize({
-                    message: item,
-                    config: {
-                        loadChatParticipants: true,
-                        includeChats: true
-                    }
-                })
-            );
+                // Manually send the message to the socket so we can serialize it with
+                // all the extra data
+                this.httpService.socketServer.emit(
+                    PARTICIPANT_LEFT,
+                    await MessageSerializer.serialize({
+                        message: item,
+                        config: {
+                            loadChatParticipants: true,
+                            includeChats: true
+                        }
+                    })
+                );
 
-            await this.emitMessage(
-                PARTICIPANT_LEFT,
-                await MessageSerializer.serialize({
-                    message: item,
-                    isForNotification: true
-                }),
-                "normal",
-                true,
-                false
-            );
-        });
+                await this.emitMessage(
+                    PARTICIPANT_LEFT,
+                    await MessageSerializer.serialize({
+                        message: item,
+                        isForNotification: true
+                    }),
+                    "normal",
+                    true,
+                    false
+                );
+            })
+        );
 
-        this.iMessageListener.on("group-icon-changed", async (item: Message) => {
-            const from = item.isFromMe || item.handleId === 0 ? "You" : obfuscatedHandle(item.handle?.id);
-            this.logger.info(`[${from}] changed a group photo`);
+        this.iMessageListener.on(
+            "group-icon-changed",
+            safeListener("group-icon-changed", async (item: Message) => {
+                const from = item.isFromMe || item.handleId === 0 ? "You" : obfuscatedHandle(item.handle?.id);
+                this.logger.info(`[${from}] changed a group photo`);
 
-            // Manually send the message to the socket so we can serialize it with
-            // all the extra data
-            this.httpService.socketServer.emit(
-                GROUP_ICON_CHANGED,
-                await MessageSerializer.serialize({
-                    message: item,
-                    config: {
-                        loadChatParticipants: true,
-                        includeChats: true
-                    }
-                })
-            );
+                // Manually send the message to the socket so we can serialize it with
+                // all the extra data
+                this.httpService.socketServer.emit(
+                    GROUP_ICON_CHANGED,
+                    await MessageSerializer.serialize({
+                        message: item,
+                        config: {
+                            loadChatParticipants: true,
+                            includeChats: true
+                        }
+                    })
+                );
 
-            await this.emitMessage(
-                GROUP_ICON_CHANGED,
-                await MessageSerializer.serialize({
-                    message: item,
-                    isForNotification: true
-                }),
-                "normal",
-                true,
-                false
-            );
-        });
+                await this.emitMessage(
+                    GROUP_ICON_CHANGED,
+                    await MessageSerializer.serialize({
+                        message: item,
+                        isForNotification: true
+                    }),
+                    "normal",
+                    true,
+                    false
+                );
+            })
+        );
 
-        this.iMessageListener.on("group-icon-removed", async (item: Message) => {
-            const from = item.isFromMe || item.handleId === 0 ? "You" : obfuscatedHandle(item.handle?.id);
-            this.logger.info(`[${from}] removed a group photo`);
+        this.iMessageListener.on(
+            "group-icon-removed",
+            safeListener("group-icon-removed", async (item: Message) => {
+                const from = item.isFromMe || item.handleId === 0 ? "You" : obfuscatedHandle(item.handle?.id);
+                this.logger.info(`[${from}] removed a group photo`);
 
-            // Manually send the message to the socket so we can serialize it with
-            // all the extra data
-            this.httpService.socketServer.emit(
-                GROUP_ICON_REMOVED,
-                await MessageSerializer.serialize({
-                    message: item,
-                    config: {
-                        loadChatParticipants: true,
-                        includeChats: true
-                    }
-                })
-            );
+                // Manually send the message to the socket so we can serialize it with
+                // all the extra data
+                this.httpService.socketServer.emit(
+                    GROUP_ICON_REMOVED,
+                    await MessageSerializer.serialize({
+                        message: item,
+                        config: {
+                            loadChatParticipants: true,
+                            includeChats: true
+                        }
+                    })
+                );
 
-            await this.emitMessage(
-                GROUP_ICON_REMOVED,
-                await MessageSerializer.serialize({
-                    message: item,
-                    isForNotification: true
-                }),
-                "normal",
-                true,
-                false
-            );
-        });
+                await this.emitMessage(
+                    GROUP_ICON_REMOVED,
+                    await MessageSerializer.serialize({
+                        message: item,
+                        isForNotification: true
+                    }),
+                    "normal",
+                    true,
+                    false
+                );
+            })
+        );
 
         this.iMessageListener.on("error", (error: Error) => this.logger.error(error.message));
 
         // Start the listeners with a 500ms delay between each to prevent locks.
-        this.iMessageListener.start();
+        this.iMessageListener.start().catch((err: any) => {
+            this.logger.error(`Failed to start iMessage listener: ${err?.message ?? String(err)}`);
+            if (err?.stack) this.logger.debug(err.stack);
+        });
     }
 
     private async handleNewMessage(item: Message) {

@@ -647,6 +647,18 @@ export class HttpRoutes {
                 ]
             },
             {
+                name: "FaceTime History",
+                middleware: HttpRoutes.protected,
+                prefix: "facetime",
+                routes: [
+                    {
+                        method: HttpMethod.GET,
+                        path: "history",
+                        controller: FaceTimeRouter.history
+                    }
+                ]
+            },
+            {
                 name: "FaceTime",
                 middleware: [...HttpRoutes.protected, PrivateApiMiddleware],
                 prefix: "facetime",
@@ -655,6 +667,11 @@ export class HttpRoutes {
                         method: HttpMethod.GET,
                         path: "sessions",
                         controller: FaceTimeRouter.listSessions
+                    },
+                    {
+                        method: HttpMethod.POST,
+                        path: "links/cleanup",
+                        controller: FaceTimeRouter.cleanupLinks
                     },
                     {
                         method: HttpMethod.POST,
@@ -670,6 +687,11 @@ export class HttpRoutes {
                         method: HttpMethod.POST,
                         path: "session/:call_uuid/handoff",
                         controller: FaceTimeRouter.handoff
+                    },
+                    {
+                        method: HttpMethod.POST,
+                        path: "session/:call_uuid/transfer_back",
+                        controller: FaceTimeRouter.transferBack
                     },
                     {
                         method: HttpMethod.POST,

@@ -380,11 +380,22 @@ export class HttpService extends Loggable {
         });
 
         // Start the server
-        this.httpServer.listen(port, () => {
-            this.log.info(`Successfully started HTTP${isNotEmpty(this.httpOpts) ? "S" : ""} server`);
+        await new Promise<void>((resolve, reject) => {
+            const onError = (err: Error) => {
+                this.httpServer?.off("listening", onListening);
+                reject(err);
+            };
+            const onListening = () => {
+                this.httpServer?.off("error", onError);
+                this.log.info(`Successfully started HTTP${isNotEmpty(this.httpOpts) ? "S" : ""} server`);
 
-            // Once we start, let's send a hello-world to all the clients
-            Server().emitMessage(HELLO_WORLD, null);
+                // Once we start, let's send a hello-world to all the clients
+                Server().emitMessage(HELLO_WORLD, null);
+                resolve();
+            };
+            this.httpServer.once("error", onError);
+            this.httpServer.once("listening", onListening);
+            this.httpServer.listen(port);
         });
     }
 
@@ -416,6 +427,7 @@ export class HttpService extends Loggable {
                         resolve(null);
                     }
                 });
+                (this.httpServer as any).closeAllConnections?.();
             } else {
                 resolve(null);
             }

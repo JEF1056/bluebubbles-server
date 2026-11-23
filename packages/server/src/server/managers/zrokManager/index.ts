@@ -88,8 +88,9 @@ export class ZrokManager extends Loggable {
                 }
 
                 this.proc = spawn(ZrokManager.daemonPath, commndFlags);
-                this.proc.stdout.on("data", chunk => this.handleData(chunk));
-                this.proc.stderr.on("data", chunk => this.handleData(chunk));
+                this.proc.on("error", err => onError(err));
+                this.proc.stdout?.on("data", chunk => this.handleData(chunk));
+                this.proc.stderr?.on("data", chunk => this.handleData(chunk));
 
                 this.on("new-url", onNewUrl);
                 this.on("error", onError);
@@ -98,6 +99,15 @@ export class ZrokManager extends Loggable {
                     if (settled) return;
                     settled = true;
                     cleanup();
+                    const proc = this.proc;
+                    this.proc = null;
+                    if (proc && proc.exitCode === null && !proc.killed) {
+                        try {
+                            proc.kill();
+                        } catch {
+                            // Ignore
+                        }
+                    }
                     reject(new Error("Failed to connect to Zrok after 2 minutes..."));
                 }, 1000 * 60 * 2); // 2 minutes
                 timeout.unref?.();
@@ -119,8 +129,35 @@ export class ZrokManager extends Loggable {
         }
 
         if (!this.proc) return;
+        const proc = this.proc;
+        this.proc = null;
         this.currentProxyUrl = null;
-        await this.proc.kill();
+        if (proc.exitCode === null && !proc.killed) {
+            await new Promise<void>(resolve => {
+                const forceKillTimer = setTimeout(() => {
+                    try {
+                        proc.kill("SIGKILL");
+                    } catch {
+                        // Ignore
+                    }
+                    resolve();
+                }, 3000);
+                forceKillTimer.unref?.();
+                proc.once("exit", () => {
+                    clearTimeout(forceKillTimer);
+                    resolve();
+                });
+                try {
+                    if (!proc.kill()) {
+                        clearTimeout(forceKillTimer);
+                        resolve();
+                    }
+                } catch {
+                    clearTimeout(forceKillTimer);
+                    resolve();
+                }
+            });
+        }
     }
 
     setProxyUrl(url: string) {

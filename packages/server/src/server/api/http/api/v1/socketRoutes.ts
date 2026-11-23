@@ -1210,7 +1210,7 @@ export class SocketRoutes {
          * Tells the server to restart the Private API helper
          */
         socket.on("restart-private-api", async (_, cb): Promise<void> => {
-            Server().privateApi.start();
+            await Server().privateApi.restart();
             return response(cb, "restart-private-api-success", createSuccessResponse(null));
         });
 

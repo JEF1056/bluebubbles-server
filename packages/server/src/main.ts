@@ -1,4 +1,6 @@
 import "reflect-metadata";
+// Must run before anything loads werift (Electron 25 / Node 18.15 lacks AbortSignal.any).
+import "@server/lib/abortSignalPolyfill";
 // Must run before anything loads firebase-admin or googleapis.
 import "@server/lib/gaxiosFetch";
 import "@server/env";

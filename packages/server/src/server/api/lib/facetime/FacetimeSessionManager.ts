@@ -14,7 +14,110 @@ export const FaceTimeSessionManager = () => {
 class FaceTimeSessionManagerSingleton {
     sessions: FaceTimeSession[] = [];
 
+    createdLinkUrls: Map<string, number> = new Map();
+
+    linkCleanupGraceMs = 60 * 1000;
+
+    linkMaxAgeMs = 5 * 60 * 1000;
+
     private lastBroadcastSignatures: Map<string, string> = new Map();
+
+    private lastBroadcastStatuses: Map<string, FaceTimeSessionStatus> = new Map();
+
+    private pendingLinkCleanups: Map<string, NodeJS.Timeout> = new Map();
+
+    private linkSweepInterval: NodeJS.Timeout | null = null;
+
+    private startupLinkSweepTimer: NodeJS.Timeout | null = null;
+
+    recordCreatedLink(url: string | null | undefined) {
+        const normalized = typeof url === "string" ? url.trim() : "";
+        if (!normalized) return;
+        this.cancelLinkCleanup(normalized);
+        this.createdLinkUrls.set(normalized, Date.now());
+        this.ensureLinkSweepStarted();
+    }
+
+    cancelLinkCleanup(url: string | null | undefined) {
+        const normalized = typeof url === "string" ? url.trim() : "";
+        if (!normalized) return;
+        const timer = this.pendingLinkCleanups.get(normalized);
+        if (timer) {
+            clearTimeout(timer);
+            this.pendingLinkCleanups.delete(normalized);
+        }
+    }
+
+    isLinkInActiveSession(url: string): boolean {
+        return this.sessions.some(
+            session => session.status !== FaceTimeSessionStatus.DISCONNECTED && session.url === url
+        );
+    }
+
+    scheduleLinkCleanup(url: string | null | undefined, delayMs = this.linkCleanupGraceMs) {
+        const normalized = typeof url === "string" ? url.trim() : "";
+        if (!normalized || !this.createdLinkUrls.has(normalized)) return;
+        if (this.isLinkInActiveSession(normalized)) return;
+        if (this.pendingLinkCleanups.has(normalized)) return;
+
+        const timer = setTimeout(() => {
+            this.pendingLinkCleanups.delete(normalized);
+            if (this.isLinkInActiveSession(normalized)) return;
+            this.createdLinkUrls.delete(normalized);
+            try {
+                Server()?.privateApi?.facetime?.removeLink?.(normalized)?.catch?.(() => {});
+            } catch {
+                // Ignore when Server singleton is unavailable
+            }
+        }, delayMs);
+        timer.unref?.();
+        this.pendingLinkCleanups.set(normalized, timer);
+    }
+
+    sweepUnusedLinks(maxAgeMs = this.linkMaxAgeMs) {
+        const now = Date.now();
+        for (const [url, createdAt] of Array.from(this.createdLinkUrls.entries())) {
+            if (now - createdAt < maxAgeMs) continue;
+            if (this.isLinkInActiveSession(url)) continue;
+            this.cancelLinkCleanup(url);
+            this.createdLinkUrls.delete(url);
+            try {
+                Server()?.privateApi?.facetime?.removeLink?.(url)?.catch?.(() => {});
+            } catch {
+                // Ignore when Server singleton is unavailable
+            }
+        }
+    }
+
+    ensureLinkSweepStarted(runStartupSweep = false) {
+        if (runStartupSweep && !this.startupLinkSweepTimer) {
+            this.startupLinkSweepTimer = setTimeout(() => {
+                this.startupLinkSweepTimer = null;
+                this.sweepUnusedLinks();
+            }, 30 * 1000);
+            this.startupLinkSweepTimer.unref?.();
+        }
+        if (this.linkSweepInterval) return;
+        this.linkSweepInterval = setInterval(() => {
+            this.sweepUnusedLinks();
+        }, 15 * 60 * 1000);
+        this.linkSweepInterval.unref?.();
+    }
+
+    stopLinkSweep() {
+        if (this.startupLinkSweepTimer) {
+            clearTimeout(this.startupLinkSweepTimer);
+            this.startupLinkSweepTimer = null;
+        }
+        if (this.linkSweepInterval) {
+            clearInterval(this.linkSweepInterval);
+            this.linkSweepInterval = null;
+        }
+        for (const timer of this.pendingLinkCleanups.values()) {
+            clearTimeout(timer);
+        }
+        this.pendingLinkCleanups.clear();
+    }
 
     findSession(callUuid: string, ...aliases: Array<string | null | undefined>): FaceTimeSession {
         const candidates = [callUuid, ...aliases].filter(
@@ -34,6 +137,10 @@ class FaceTimeSessionManagerSingleton {
             existingSession.update(session);
         } else {
             this.sessions.push(session);
+            session.armExpiryTimer();
+        }
+        if (session?.url && session.status !== FaceTimeSessionStatus.DISCONNECTED) {
+            this.cancelLinkCleanup(session.url);
         }
 
         this.purgeOldSessions();
@@ -51,6 +158,7 @@ class FaceTimeSessionManagerSingleton {
             uuid: payload.uuid,
             status_id: payload.status_id,
             address: payload.address,
+            addresses: payload.addresses,
             display_name: payload.display_name,
             chat_guid: payload.chat_guid,
             link: payload.link,
@@ -60,6 +168,9 @@ class FaceTimeSessionManagerSingleton {
             is_telephony: payload.is_telephony,
             is_link_only: payload.is_link_only,
             is_muted: payload.is_muted,
+            is_group: payload.is_group,
+            endpoint_on_mac: payload.endpoint_on_mac,
+            from_iphone: payload.from_iphone,
             active_device_id: payload.active_device_id,
             active_device_name: payload.active_device_name,
             ended_reason: payload.ended_reason,
@@ -73,8 +184,16 @@ class FaceTimeSessionManagerSingleton {
         }
         this.lastBroadcastSignatures.set(key, signature);
 
+        const prevStatus = this.lastBroadcastStatuses.get(key);
+        const useFcm =
+            prevStatus !== session.status &&
+            (session.status === FaceTimeSessionStatus.INCOMING ||
+                session.status === FaceTimeSessionStatus.ANSWERED ||
+                session.status === FaceTimeSessionStatus.DISCONNECTED);
+        this.lastBroadcastStatuses.set(key, session.status);
+
         try {
-            Server()?.emitMessage(FT_CALL_STATUS_CHANGED, payload, "high", true)?.catch?.(() => {});
+            Server()?.emitMessage(FT_CALL_STATUS_CHANGED, payload, useFcm ? "high" : "normal", useFcm)?.catch?.(() => {});
         } catch {
             // Ignore when Server singleton is not initialized (e.g. unit tests)
         }
@@ -90,12 +209,15 @@ class FaceTimeSessionManagerSingleton {
     }
 
     clearSessions() {
+        this.stopLinkSweep();
+        this.createdLinkUrls.clear();
         for (const session of this.sessions) {
             session.invalidate();
         }
 
         this.sessions = [];
         this.lastBroadcastSignatures.clear();
+        this.lastBroadcastStatuses.clear();
     }
 
     purgeOldSessions() {
@@ -106,7 +228,9 @@ class FaceTimeSessionManagerSingleton {
                 session.status !== FaceTimeSessionStatus.DISCONNECTED ||
                 now - session.createdAt.getTime() < 1000 * 60 * 60 * 3;
             if (!keep) {
-                this.lastBroadcastSignatures.delete(session.callUuid || session.uuid);
+                const key = session.callUuid || session.uuid;
+                this.lastBroadcastSignatures.delete(key);
+                this.lastBroadcastStatuses.delete(key);
             }
             return keep;
         });

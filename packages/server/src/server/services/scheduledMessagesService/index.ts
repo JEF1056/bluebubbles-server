@@ -264,12 +264,16 @@ export class ScheduledMessagesService extends Loggable {
         }
 
         if (scheduledMessage.status === ScheduledMessageStatus.COMPLETE) {
-            this.tryReschedule(scheduledMessage);
+            this.tryReschedule(scheduledMessage).catch(err =>
+                this.log.error(`Failed to reschedule completed scheduled message: ${err?.message ?? err}`)
+            );
             return;
         }
 
         if (scheduledMessage.status === ScheduledMessageStatus.ERROR) {
-            this.tryReschedule(scheduledMessage);
+            this.tryReschedule(scheduledMessage).catch(err =>
+                this.log.error(`Failed to reschedule errored scheduled message: ${err?.message ?? err}`)
+            );
             return;
         }
 
@@ -284,7 +288,9 @@ export class ScheduledMessagesService extends Loggable {
         } else {
             this.log.info(`Scheduling (in ${diff} ms): ${scheduledMessage.toString()}`);
             this.timers[String(scheduledMessage.id)] = safeTimeout(() => {
-                this.sendScheduledMessage(scheduledMessage);
+                this.sendScheduledMessage(scheduledMessage).catch(err =>
+                    this.log.error(`Failed to send scheduled message: ${err?.message ?? err}`)
+                );
             }, diff, (newTimeout) => {
                 clearTimeout(this.timers[String(scheduledMessage.id)]);
                 this.timers[String(scheduledMessage.id)] = newTimeout;
@@ -355,7 +361,12 @@ export class ScheduledMessagesService extends Loggable {
         const isRecurring = scheduledMessage.schedule.type === ScheduledMessageScheduleType.RECURRING;
         if (isRecurring) {
             if (recalc) {
-                scheduledMessage.scheduledFor = this.getNextRecurringDate(scheduledMessage);
+                const nextDate = this.getNextRecurringDate(scheduledMessage);
+                if (!nextDate) {
+                    this.log.warn(`Cannot reschedule ${scheduledMessage.toString()}: invalid recurring schedule.`);
+                    return false;
+                }
+                scheduledMessage.scheduledFor = nextDate;
             }
 
             this.log.info(`Rescheduling: ${scheduledMessage.toString()}`);
@@ -371,18 +382,18 @@ export class ScheduledMessagesService extends Loggable {
      * Gets the next date for a recurring message.
      *
      * @param schedule The scheduling configruation
-     * @returns A future date
+     * @returns A future date, or null if the recurring schedule is invalid
      */
-    getNextRecurringDate(scheduledMessage: ScheduledMessage): Date {
+    getNextRecurringDate(scheduledMessage: ScheduledMessage): Date | null {
         if (scheduledMessage.schedule.type !== ScheduledMessageScheduleType.RECURRING) {
             throw new Error('Schedule must be of type "recurring" to get the next date!');
         }
 
         let nowTime = new Date().getTime();
-        const previousTime = scheduledMessage.scheduledFor.getTime();
+        const previousTime = scheduledMessage.scheduledFor?.getTime?.() ?? NaN;
         const nextTs = this.getMillisecondsForSchedule(scheduledMessage.schedule);
-        if (nextTs === 0) {
-            throw new Error("Invalid schedule! Next schedule would have been 0 ms in the future.");
+        if (!Number.isFinite(previousTime) || !Number.isFinite(nextTs) || nextTs <= 0) {
+            return null;
         }
 
         // Calculate when the next time should be.
@@ -439,7 +450,10 @@ export class ScheduledMessagesService extends Loggable {
 
         // Calculate the next schedule time (for recurring only)
         if (scheduledMessage.schedule.type === ScheduledMessageScheduleType.RECURRING) {
-            scheduledMessage.scheduledFor = this.getNextRecurringDate(scheduledMessage);
+            const nextDate = this.getNextRecurringDate(scheduledMessage);
+            if (nextDate) {
+                scheduledMessage.scheduledFor = nextDate;
+            }
         }
 
         // Save the updated information
@@ -489,7 +503,9 @@ export class ScheduledMessagesService extends Loggable {
      * Starts the scheduled message service.
      */
     start() {
-        this.loadAndSchedule();
+        this.loadAndSchedule().catch(err =>
+            this.log.error(`Failed to start scheduled messages service: ${err?.message ?? err}`)
+        );
     }
 
     /**

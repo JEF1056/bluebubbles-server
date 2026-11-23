@@ -74,6 +74,12 @@ export class StickerRouter {
         router.post("/api/v2/sticker", ...protectedMw, StickerRouter.create);
         router.delete("/api/v2/sticker/:id", ...protectedMw, StickerRouter.remove);
         router.post("/api/v2/message/sticker", ...protectedMw, PrivateApiMiddleware, StickerRouter.send);
+        router.post(
+            "/api/v2/message/sticker/:guid/reposition",
+            ...protectedMw,
+            PrivateApiMiddleware,
+            StickerRouter.reposition
+        );
     }
 
     static async list(ctx: RouterContext, _: Next) {
@@ -173,13 +179,65 @@ export class StickerRouter {
             stickerUserInfo: extractStickerUserInfo(body)
         });
 
-        const data =
-            sent && typeof (sent as any).guid === "string"
-                ? await MessageSerializer.serialize({ message: sent as any })
-                : sent;
+        if (!sent || typeof (sent as any).guid !== "string" || (sent as any).guid.trim().length === 0) {
+            throw new ServerError({ error: "Failed to send sticker! No serialized message returned." });
+        }
+
+        const data = await MessageSerializer.serialize({ message: sent as any });
 
         return new Success(ctx, {
             message: "Successfully sent sticker!",
+            data
+        }).send();
+    }
+
+    static async reposition(ctx: RouterContext, _: Next) {
+        const { guid } = ctx.params ?? {};
+        if (!isNotEmpty(guid)) throw new BadRequest({ error: "Sticker message guid is required!" });
+
+        const body = (ctx.request.body ?? {}) as Record<string, any>;
+        const chatGuid = body.chatGuid;
+        if (!isNotEmpty(chatGuid)) throw new BadRequest({ error: "chatGuid is required!" });
+
+        const xScalar = parseFiniteNumber(body.xScalar);
+        const yScalar = parseFiniteNumber(body.yScalar);
+        const scale = parseFiniteNumber(body.scale);
+        const rotation = parseFiniteNumber(body.rotation);
+        const parentPreviewWidth = parseFiniteNumber(body.parentPreviewWidth);
+
+        if (
+            xScalar === null ||
+            yScalar === null ||
+            scale === null ||
+            rotation === null ||
+            parentPreviewWidth === null
+        ) {
+            throw new BadRequest({
+                error: "xScalar, yScalar, scale, rotation, and parentPreviewWidth must be finite numbers!"
+            });
+        }
+        if (scale <= 0 || parentPreviewWidth <= 0) {
+            throw new BadRequest({ error: "scale and parentPreviewWidth must be greater than 0!" });
+        }
+
+        const updated = await StickerInterface.repositionSticker({
+            chatGuid,
+            messageGuid: guid,
+            xScalar,
+            yScalar,
+            scale,
+            rotation,
+            parentPreviewWidth
+        });
+
+        if (!updated || typeof (updated as any).guid !== "string" || (updated as any).guid.trim().length === 0) {
+            throw new ServerError({ error: "Failed to reposition sticker! No serialized message returned." });
+        }
+
+        const data = await MessageSerializer.serialize({ message: updated as any });
+
+        return new Success(ctx, {
+            message: "Successfully repositioned sticker!",
             data
         }).send();
     }

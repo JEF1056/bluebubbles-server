@@ -5,6 +5,14 @@ export class TransactionManager {
 
     add(promise: TransactionPromise) {
         this.promises.push(promise);
+        promise.setOnSettled(() => this.remove(promise));
+    }
+
+    remove(promise: TransactionPromise) {
+        const idx = this.promises.indexOf(promise);
+        if (idx >= 0) {
+            this.promises.splice(idx, 1);
+        }
     }
 
     findIndex(transactionId: string, includeResolved = false): number {

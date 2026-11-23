@@ -82,12 +82,20 @@ export class CertificateService extends Loggable {
         if (shouldRefresh) {
             log.info("Certificate doesn't exist or is expired! Regenerating...");
             CertificateService.generateCertificate();
-            Server().httpService.restart();
+            Server().httpService.restart().catch(err =>
+                log.error(`Failed to restart HTTP service after certificate refresh: ${err?.message ?? err}`)
+            );
         }
     }
 
+    private static configListener: ((args: ServerConfigChange) => void) | null = null;
+
     private static createListener() {
-        Server().on("config-update", (args: ServerConfigChange) => CertificateService.handleConfigUpdate(args));
+        if (CertificateService.configListener) {
+            Server().off("config-update", CertificateService.configListener);
+        }
+        CertificateService.configListener = (args: ServerConfigChange) => CertificateService.handleConfigUpdate(args);
+        Server().on("config-update", CertificateService.configListener);
     }
 
     private static certificateExists() {
@@ -116,7 +124,9 @@ export class CertificateService extends Loggable {
         if (prevConfig.password !== nextConfig.password) {
             log.info("Password changed, generating new certificate");
             CertificateService.generateCertificate();
-            Server().httpService.restart();
+            Server().httpService.restart().catch(err =>
+                log.error(`Failed to restart HTTP service after password update: ${err?.message ?? err}`)
+            );
         } else if (
             onlyAlphaNumeric(prevConfig.proxy_service as string).toLowerCase() !==
                 onlyAlphaNumeric(nextConfig.proxy_service as string).toLowerCase() &&
@@ -124,7 +134,9 @@ export class CertificateService extends Loggable {
         ) {
             log.info("Proxy service changed to Dynamic DNS. Refreshing certificate");
             CertificateService.refreshCertificate();
-            Server().httpService.restart();
+            Server().httpService.restart().catch(err =>
+                log.error(`Failed to restart HTTP service after proxy change: ${err?.message ?? err}`)
+            );
         }
     }
 

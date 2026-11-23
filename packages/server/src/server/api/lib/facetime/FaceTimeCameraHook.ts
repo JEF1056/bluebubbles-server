@@ -13,10 +13,25 @@ import { getLogger } from "@server/lib/logging/Loggable";
 const execFileAsync = promisify(execFile);
 
 export const CAMERA_HOOK_DYLIB_NAME = "BlueBubblesCameraHook.dylib";
-export const CAMERA_HOOK_SANDBOX_DIR = "/private/tmp/FaceTime";
+export const CAMERA_HOOK_SANDBOX_DIR = "/private/var/tmp/AVConference";
 export const CAMERA_HOOK_INSTALLED_PATH = path.join(CAMERA_HOOK_SANDBOX_DIR, CAMERA_HOOK_DYLIB_NAME);
 export const CAMERA_HOOK_MARKER_PATH = path.join(CAMERA_HOOK_SANDBOX_DIR, "BlueBubblesCameraHook.sha256");
+export const CAMERA_HOOK_ACTIVE_FLAG_PATH = path.join(CAMERA_HOOK_SANDBOX_DIR, "bb-camera.active");
 export const CAMERA_HOOK_SERVICE_LABEL = "com.apple.videoconference.camera";
+
+export function setCameraHookActiveFlag(active: boolean): void {
+    if (process.platform !== "darwin") return;
+    try {
+        if (active) {
+            fs.mkdirSync(CAMERA_HOOK_SANDBOX_DIR, { recursive: true, mode: 0o755 });
+            fs.writeFileSync(CAMERA_HOOK_ACTIVE_FLAG_PATH, String(Date.now()));
+        } else if (fs.existsSync(CAMERA_HOOK_ACTIVE_FLAG_PATH)) {
+            fs.unlinkSync(CAMERA_HOOK_ACTIVE_FLAG_PATH);
+        }
+    } catch {
+        // Best-effort flag for clamshell camera hook
+    }
+}
 
 const COMMAND_TIMEOUT_MS = 5000;
 // com.apple.videoconference.camera has minimum runtime = 10s + exit timeout = 5s (~14-15s kickstart)
@@ -73,6 +88,8 @@ export async function isSipDisabled(): Promise<boolean> {
 export async function isCameraHookEnabled(): Promise<boolean> {
     if (process.platform !== "darwin") return false;
 
+    if (await isSipDisabled()) return true;
+
     try {
         const raw = Server()?.repo?.getConfig("facetime_camera_uplink");
         if (raw !== undefined && raw !== null) {
@@ -86,7 +103,7 @@ export async function isCameraHookEnabled(): Promise<boolean> {
         // Ignore when Server singleton/repo is not initialized
     }
 
-    return isSipDisabled();
+    return false;
 }
 
 function sha256File(filePath: string): string {
@@ -180,6 +197,33 @@ function ensureSafeSandboxDir(dirPath: string): void {
     }
 }
 
+export function installDylibAtomically(sourcePath: string, destPath: string, mode = 0o644): void {
+    const stagedPath = `${destPath}.tmp.${process.pid}`;
+    try {
+        fs.unlinkSync(stagedPath);
+    } catch (err: any) {
+        if (err?.code !== "ENOENT") throw err;
+    }
+    const dylibBytes = fs.readFileSync(sourcePath);
+    const fd = fs.openSync(stagedPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, mode);
+    try {
+        try {
+            fs.writeFileSync(fd, dylibBytes);
+            fs.fchmodSync(fd, mode);
+        } finally {
+            fs.closeSync(fd);
+        }
+        fs.renameSync(stagedPath, destPath);
+    } catch (err) {
+        try {
+            fs.unlinkSync(stagedPath);
+        } catch {
+            // Best-effort cleanup of staged temp file
+        }
+        throw err;
+    }
+}
+
 export async function ensureCameraHookInstalled(options: { force?: boolean } = {}): Promise<CameraHookResult> {
     const log = getLogger("FaceTimeCameraHook");
     if (process.platform !== "darwin") {
@@ -230,22 +274,7 @@ export async function ensureCameraHookInstalled(options: { force?: boolean } = {
         }
 
         ensureSafeSandboxDir(CAMERA_HOOK_SANDBOX_DIR);
-
-        const stagedPath = `${CAMERA_HOOK_INSTALLED_PATH}.tmp.${process.pid}`;
-        try {
-            fs.unlinkSync(stagedPath);
-        } catch (err: any) {
-            if (err?.code !== "ENOENT") throw err;
-        }
-        const dylibBytes = fs.readFileSync(sourceDylib);
-        const fd = fs.openSync(stagedPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o644);
-        try {
-            fs.writeFileSync(fd, dylibBytes);
-            fs.fchmodSync(fd, 0o644);
-        } finally {
-            fs.closeSync(fd);
-        }
-        fs.renameSync(stagedPath, CAMERA_HOOK_INSTALLED_PATH);
+        installDylibAtomically(sourceDylib, CAMERA_HOOK_INSTALLED_PATH, 0o644);
 
         const debugRes = await runLaunchctlDebug([
             serviceTarget,

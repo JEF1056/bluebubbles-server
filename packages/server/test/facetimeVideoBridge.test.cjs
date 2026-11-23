@@ -15,7 +15,16 @@ const loadTypeScriptModule = (modulePath, overrides = {}) => {
     });
     const loadedModule = { exports: {} };
     const loadModule = new Function("module", "exports", "require", "__dirname", "__filename", transformed.code);
-    const customRequire = request => overrides[request] ?? require(request);
+    const customRequire = request => {
+        if (overrides[request]) return overrides[request];
+        if (request.startsWith("./") || request.startsWith("../")) {
+            const tsCandidate = path.resolve(path.dirname(modulePath), `${request}.ts`);
+            if (require("fs").existsSync(tsCandidate)) {
+                return loadTypeScriptModule(tsCandidate, overrides);
+            }
+        }
+        return require(request);
+    };
     loadModule(loadedModule, loadedModule.exports, customRequire, path.dirname(modulePath), modulePath);
     return loadedModule.exports;
 };

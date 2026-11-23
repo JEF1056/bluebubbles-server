@@ -18,6 +18,7 @@ export enum IMessagePollType {
 
 type MessageState = {
     cacheTime: number;
+    rowId: number;
     dateCreated: number;
     isDelivered: boolean;
     dateDelivered: number;
@@ -26,6 +27,11 @@ type MessageState = {
     dateRetracted: number;
     didNotifyRecipient: boolean;
     hasUnsentParts: boolean;
+    threadOriginatorGuid: string | null;
+    threadOriginatorPart: string | null;
+    associatedMessageGuid: string | null;
+    associatedMessageType: string | null;
+    associatedMessageEmoji: string | null;
 };
 
 type ChatState = {
@@ -103,7 +109,7 @@ export abstract class IMessagePoller extends Loggable {
         if (!state) return null;
 
         // If any of the dates are newer, it's an update
-        if (message.dateCreated.getTime() > state.dateCreated) return "updated-entry";
+        if ((message?.dateCreated?.getTime() ?? 0) > state.dateCreated) return "updated-entry";
 
         const delivered = message?.dateDelivered ? message.dateDelivered.getTime() : 0;
         if (delivered > state.dateDelivered) return "updated-entry";
@@ -126,6 +132,13 @@ export abstract class IMessagePoller extends Loggable {
         // If it has unsent parts, it's an update
         if (message.hasUnsentParts !== state.hasUnsentParts) return "updated-entry";
 
+        // If CloudKit backfilled thread/reaction metadata in-place, it's an update
+        if ((message.threadOriginatorGuid ?? null) !== state.threadOriginatorGuid) return "updated-entry";
+        if ((message.threadOriginatorPart ?? null) !== state.threadOriginatorPart) return "updated-entry";
+        if ((message.associatedMessageGuid ?? null) !== state.associatedMessageGuid) return "updated-entry";
+        if ((message.associatedMessageType ?? null) !== state.associatedMessageType) return "updated-entry";
+        if ((message.associatedMessageEmoji ?? null) !== state.associatedMessageEmoji) return "updated-entry";
+
         return null;
     }
 
@@ -139,14 +152,20 @@ export abstract class IMessagePoller extends Loggable {
 
         this.cache.messageStates[message.guid] = {
             cacheTime: new Date().getTime(),
-            dateCreated: message.dateCreated.getTime(),
+            rowId: message.ROWID,
+            dateCreated: message?.dateCreated?.getTime() ?? 0,
             isDelivered: message.isDelivered ?? false,
             dateDelivered: message?.dateDelivered ? message.dateDelivered.getTime() : 0,
             dateRead: message?.dateRead ? message.dateRead.getTime() : 0,
             dateEdited: message.dateEdited ? message.dateEdited.getTime() : 0,
             dateRetracted: message.dateRetracted ? message.dateRetracted.getTime() : 0,
             didNotifyRecipient: message.didNotifyRecipient ?? false,
-            hasUnsentParts: message.hasUnsentParts
+            hasUnsentParts: message.hasUnsentParts,
+            threadOriginatorGuid: message.threadOriginatorGuid ?? null,
+            threadOriginatorPart: message.threadOriginatorPart ?? null,
+            associatedMessageGuid: message.associatedMessageGuid ?? null,
+            associatedMessageType: message.associatedMessageType ?? null,
+            associatedMessageEmoji: message.associatedMessageEmoji ?? null
         };
 
         return event;

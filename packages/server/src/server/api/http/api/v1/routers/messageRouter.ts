@@ -147,7 +147,7 @@ export class MessageRouter {
                 return new Success(ctx, {
                     message: `No chat found with GUID: ${chatGuid}`,
                     data: []
-                });
+                }).send();
         }
 
         let messages, totalCount;

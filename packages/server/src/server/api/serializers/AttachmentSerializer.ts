@@ -26,7 +26,7 @@ function parseFiniteNumber(value: unknown): number | null {
     return null;
 }
 
-function decodeStickerUserInfo(raw: unknown): Record<string, unknown> | null {
+export function decodeStickerUserInfo(raw: unknown): Record<string, unknown> | null {
     if (!raw) return null;
     let decoded: unknown = raw;
     if (Buffer.isBuffer(raw) || raw instanceof Uint8Array) {

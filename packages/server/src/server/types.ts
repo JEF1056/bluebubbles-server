@@ -43,6 +43,7 @@ export type MessageResponse = {
     dateCreated: number;
     dateRead: number | null;
     dateDelivered: number | null;
+    isRead?: boolean | null;
     isFromMe: boolean;
     isDelayed?: boolean;
     isDelivered?: boolean;
@@ -118,6 +119,7 @@ export type ChatResponse = {
     isFiltered?: boolean;
     isFilteredAsSpam?: boolean;
     autoSendReadReceipts?: boolean | null;
+    lastReadMessageTimestamp?: number | null;
     displayName: string;
     groupId?: string;
     lastAddressedHandle?: string | null;

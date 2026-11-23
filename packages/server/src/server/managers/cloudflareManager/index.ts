@@ -26,6 +26,8 @@ export class CloudflareManager extends Loggable {
 
     private proxyUrlRegex = /INF \|\s{1,}(https:\/\/[^\s]+)\s{1,}\|/m;
 
+    private backoffTimeout: NodeJS.Timeout | null = null;
+
     async start(): Promise<string> {
         if (this.isRateLimited) {
             throw new Error("Cloudflare is rate limiting your requests. Waiting 1 hour... If you do not wawnt to wait 1 hour, fully restart the server.");
@@ -33,7 +35,7 @@ export class CloudflareManager extends Loggable {
 
         try {
             this.emit("started");
-            return this.connectHandler();
+            return await this.connectHandler();
         } catch (ex) {
             this.log.error(`Failed to run Cloudflare daemon! ${ex.toString()}`);
             this.emitError(ex);
@@ -123,6 +125,10 @@ export class CloudflareManager extends Loggable {
     }
 
     async stop() {
+        if (this.backoffTimeout) {
+            clearTimeout(this.backoffTimeout);
+            this.backoffTimeout = null;
+        }
         this.currentProxyUrl = null;
         if (!this.proc) return;
         await this.proc.kill();
@@ -180,11 +186,16 @@ export class CloudflareManager extends Loggable {
     private backOffFromProvisioning() {
         if (this.isRateLimited) return;
         this.isRateLimited = true;
-        this.stop();
-        waitMs(1000 * 60 * 60).then(() => {
+        void this.stop().catch(() => {});
+        if (this.backoffTimeout) {
+            clearTimeout(this.backoffTimeout);
+        }
+        this.backoffTimeout = setTimeout(() => {
+            this.backoffTimeout = null;
             this.isRateLimited = false;
-            this.start();
-        });
+            void this.start().catch(() => {});
+        }, 1000 * 60 * 60);
+        this.backoffTimeout.unref?.();
     }
 
     private detectNewUrl(data: string) {

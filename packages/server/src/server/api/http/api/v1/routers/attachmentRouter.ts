@@ -212,8 +212,6 @@ export class AttachmentRouter {
             throw new BadRequest({ message: `An attachment with the GUID, "${guid}" does not exist!` });
         }
 
-        await Server().privateApi.attachment.downloadPurged(guid);
-
         // Wait a max of 10 minutes
         await AttachmentInterface.forceDownload(attachment);
         return await AttachmentRouter.download(ctx, _);

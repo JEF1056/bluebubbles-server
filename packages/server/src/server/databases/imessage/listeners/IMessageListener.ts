@@ -101,9 +101,15 @@ export class IMessageListener extends Loggable {
     getEarliestModifiedDate() {
         let earliest = new Date();
         for (const filePath of this.filePaths) {
-            const stat = fs.statSync(filePath);
-            if (stat.mtime < earliest) {
-                earliest = stat.mtime;
+            try {
+                const stat = fs.statSync(filePath);
+                if (stat.mtime < earliest) {
+                    earliest = stat.mtime;
+                }
+            } catch (err: any) {
+                if (err?.code !== "ENOENT") {
+                    this.log.debug(`Failed to stat "${filePath}": ${err?.message ?? err}`);
+                }
             }
         }
 
@@ -146,14 +152,18 @@ export class IMessageListener extends Loggable {
         if (this.pollTimer || this.pollIntervalMs <= 0) return;
 
         this.pollTimer = setInterval(async () => {
-            const signature = await getFileStatSignature(this.filePaths);
-            if (signature === this.lastStatSignature) return;
-            this.lastStatSignature = signature;
-            await this.handleChangeEvent({
-                filePath: "poll-interval",
-                prevStat: null,
-                currentStat: null
-            });
+            try {
+                const signature = await getFileStatSignature(this.filePaths);
+                if (signature === this.lastStatSignature) return;
+                this.lastStatSignature = signature;
+                await this.handleChangeEvent({
+                    filePath: "poll-interval",
+                    prevStat: null,
+                    currentStat: null
+                });
+            } catch (err: any) {
+                this.log.debug(`Poll timer iteration failed: ${err?.message ?? err}`);
+            }
         }, this.pollIntervalMs);
         this.pollTimer.unref?.();
     }

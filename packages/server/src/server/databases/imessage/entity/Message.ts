@@ -60,7 +60,7 @@ export class Message {
         if (attachmentsLen > 0) parts.push(`Attachments: ${attachmentsLen}`);
 
         // Lastly, add the date
-        parts.push(`Date: ${this.dateCreated.toLocaleString()}`);
+        parts.push(`Date: ${this.dateCreated?.toLocaleString() ?? "Unknown"}`);
 
         return parts.join("; ");
     }

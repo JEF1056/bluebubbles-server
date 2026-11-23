@@ -42,6 +42,10 @@ export function registerForkSocketRoutes(socket: Socket, log: SocketLogger): voi
         FaceTimeAudioBridge.getInstance().handleHangup(params);
     });
 
+    socket.on("ft-bridge-keyframe", (params): void => {
+        FaceTimeAudioBridge.getInstance().handleKeyframe(params);
+    });
+
     socket.on("ft-bridge-config", (params, cb): void => {
         const ack = typeof params === "function" ? params : cb;
         if (typeof ack === "function") {

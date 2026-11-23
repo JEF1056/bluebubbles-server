@@ -116,32 +116,40 @@ export class MessageInterface {
 
         // Try to send the iMessage
         let sentMessage = null;
-        if (method === "apple-script") {
-            // Attempt to send the message
-            await ActionHandler.sendMessage(chatGuid, message ?? "", null);
-            sentMessage = await awaiter.promise;
-        } else if (method === "private-api") {
-            sentMessage = await MessageInterface.sendMessagePrivateApi({
-                chatGuid,
-                message,
-                attributedBody,
-                textFormatting,
-                subject,
-                effectId,
-                selectedMessageGuid,
-                partIndex,
-                ddScan,
-                richLink
-            });
+        try {
+            if (method === "apple-script") {
+                // Attempt to send the message
+                await ActionHandler.sendMessage(chatGuid, message ?? "", null);
+                sentMessage = await awaiter.promise;
+            } else if (method === "private-api") {
+                sentMessage = await MessageInterface.sendMessagePrivateApi({
+                    chatGuid,
+                    message,
+                    attributedBody,
+                    textFormatting,
+                    subject,
+                    effectId,
+                    selectedMessageGuid,
+                    partIndex,
+                    ddScan,
+                    richLink
+                });
 
-            // We already have the exact message via its GUID, so resolve the awaiter directly
-            // instead of leaving it to be matched (by text) on a future poll. This attaches
-            // the tempGuid immediately and stops the poller from matching against it further.
-            if (sentMessage && !awaiter.isResolved) {
-                await awaiter.resolve(sentMessage);
+                // We already have the exact message via its GUID, so resolve the awaiter directly
+                // instead of leaving it to be matched (by text) on a future poll. This attaches
+                // the tempGuid immediately and stops the poller from matching against it further.
+                if (sentMessage && !awaiter.isResolved) {
+                    await awaiter.resolve(sentMessage);
+                }
+            } else {
+                throw new Error(`Invalid send method: ${method}`);
             }
-        } else {
-            throw new Error(`Invalid send method: ${method}`);
+        } catch (err: any) {
+            if (!awaiter.isResolved) {
+                await awaiter.reject(err?.message ?? String(err));
+            }
+            Server().messageManager.prune();
+            throw err;
         }
 
         return sentMessage;
@@ -205,54 +213,62 @@ export class MessageInterface {
         Server().messageManager.add(awaiter);
 
         let sentMessage = null;
-        if (method === "apple-script") {
-            // Attempt to send the attachment
-            await ActionHandler.sendMessage(chatGuid, "", newPath, isAudioMessage);
-            sentMessage = await awaiter.promise;
-        } else if (method === "private-api") {
-            sentMessage = await MessageInterface.sendAttachmentPrivateApi({
-                chatGuid,
-                filePath: newPath,
-                attributedBody,
-                subject,
-                effectId,
-                selectedMessageGuid,
-                partIndex,
-                isAudioMessage
-            });
+        try {
+            if (method === "apple-script") {
+                // Attempt to send the attachment
+                await ActionHandler.sendMessage(chatGuid, "", newPath, isAudioMessage);
+                sentMessage = await awaiter.promise;
+            } else if (method === "private-api") {
+                sentMessage = await MessageInterface.sendAttachmentPrivateApi({
+                    chatGuid,
+                    filePath: newPath,
+                    attributedBody,
+                    subject,
+                    effectId,
+                    selectedMessageGuid,
+                    partIndex,
+                    isAudioMessage
+                });
 
-            try {
-                // Wait for the promise so that we can confirm the message was sent.
-                // Wrapped in a try/catch because if the private API returned a sentMessage,
-                // we know it sent, and maybe it just took a while (longer than the timeout).
-                // Only wait for the promise if it's not sent yet.
-                if (sentMessage && !sentMessage.isSent) {
-                    sentMessage = await awaiter.promise;
-                } else if (sentMessage && !awaiter.isResolved) {
-                    // We already have the exact message via its GUID, so resolve the awaiter
-                    // directly instead of leaving it to be matched (by filename) on a future
-                    // poll. This attaches the tempGuid immediately and stops the poller from
-                    // matching against it further.
-                    await awaiter.resolve(sentMessage);
+                try {
+                    // Wait for the promise so that we can confirm the message was sent.
+                    // Wrapped in a try/catch because if the private API returned a sentMessage,
+                    // we know it sent, and maybe it just took a while (longer than the timeout).
+                    // Only wait for the promise if it's not sent yet.
+                    if (sentMessage && !sentMessage.isSent) {
+                        sentMessage = await awaiter.promise;
+                    } else if (sentMessage && !awaiter.isResolved) {
+                        // We already have the exact message via its GUID, so resolve the awaiter
+                        // directly instead of leaving it to be matched (by filename) on a future
+                        // poll. This attaches the tempGuid immediately and stops the poller from
+                        // matching against it further.
+                        await awaiter.resolve(sentMessage);
+                    }
+                } catch (e) {
+                    if (sentMessage) {
+                        Server().log("Attachment sent via Private API, but message match failed", "debug");
+                    } else {
+                        throw e;
+                    }
                 }
-            } catch (e) {
-                if (sentMessage) {
-                    Server().log("Attachment sent via Private API, but message match failed", "debug");
-                } else {
-                    throw e;
-                }
+            } else {
+                throw new Error(`Invalid send method: ${method}`);
             }
-        } else {
-            throw new Error(`Invalid send method: ${method}`);
-        }
-
-        // Delete the attachment.
-        // Only if below Monterey. On Monterey, we store attachments
-        // within the iMessage App Support directory. When AppleScript sees this
-        // it _does not_ copy the attachment to a permanent location.
-        // This means that if we delete the attachment, it won't be downloadable anymore.
-        if (!isMinMonterey && method === "apple-script") {
-            fs.unlink(newPath, _ => null);
+        } catch (err: any) {
+            if (!awaiter.isResolved) {
+                await awaiter.reject(err?.message ?? String(err));
+            }
+            Server().messageManager.prune();
+            throw err;
+        } finally {
+            // Delete the attachment.
+            // Only if below Monterey. On Monterey, we store attachments
+            // within the iMessage App Support directory. When AppleScript sees this
+            // it _does not_ copy the attachment to a permanent location.
+            // This means that if we delete the attachment, it won't be downloadable anymore.
+            if (!isMinMonterey && method === "apple-script") {
+                fs.unlink(newPath, _ => null);
+            }
         }
 
         return sentMessage;
@@ -512,47 +528,55 @@ export class MessageInterface {
         const awaiter = new MessagePromise({ chatGuid, text: messageText, isAttachment: false, sentAt: now, tempGuid });
         Server().messageManager.add(awaiter);
 
-        // Send the reaction
-        const result = await Server().privateApi.message.react(
-            chatGuid,
-            message.guid,
-            reaction,
-            partIndex ?? 0,
-            emoji ?? undefined
-        );
-        if (!result?.identifier) {
-            throw new Error("Failed to send reaction! No message GUID returned.");
-        } else {
-            Server().log(`Reaction sent with Message GUID: ${result.identifier}`, "debug");
-        }
-
-        const maxWaitMs = 60000;
-        let retMessage = await resultAwaiter({
-            maxWaitMs,
-            getData: async _ => {
-                return await Server().iMessageRepo.getMessage(result.identifier, true, false);
-            }
-        });
-
-        // If we can't get the message via the transaction, try via the promise
-        if (!retMessage) {
-            retMessage = await awaiter.promise;
-        } else if (!awaiter.isResolved) {
-            // We already have the exact message via its GUID, so resolve the awaiter directly
-            // instead of leaving it to be matched (by text) on a future poll. This attaches
-            // the tempGuid immediately and stops the poller from matching against it further.
-            await awaiter.resolve(retMessage);
-        }
-
-        // Check if the name changed
-        if (!retMessage) {
-            throw new Error(
-                `Failed to send reaction! Message not found in database after ${maxWaitMs / 1000} seconds!`
+        try {
+            // Send the reaction
+            const result = await Server().privateApi.message.react(
+                chatGuid,
+                message.guid,
+                reaction,
+                partIndex ?? 0,
+                emoji ?? undefined
             );
-        }
+            if (!result?.identifier) {
+                throw new Error("Failed to send reaction! No message GUID returned.");
+            } else {
+                Server().log(`Reaction sent with Message GUID: ${result.identifier}`, "debug");
+            }
 
-        // Return the message
-        return retMessage;
+            const maxWaitMs = 60000;
+            let retMessage = await resultAwaiter({
+                maxWaitMs,
+                getData: async _ => {
+                    return await Server().iMessageRepo.getMessage(result.identifier, true, false);
+                }
+            });
+
+            // If we can't get the message via the transaction, try via the promise
+            if (!retMessage) {
+                retMessage = await awaiter.promise;
+            } else if (!awaiter.isResolved) {
+                // We already have the exact message via its GUID, so resolve the awaiter directly
+                // instead of leaving it to be matched (by text) on a future poll. This attaches
+                // the tempGuid immediately and stops the poller from matching against it further.
+                await awaiter.resolve(retMessage);
+            }
+
+            // Check if the name changed
+            if (!retMessage) {
+                throw new Error(
+                    `Failed to send reaction! Message not found in database after ${maxWaitMs / 1000} seconds!`
+                );
+            }
+
+            // Return the message
+            return retMessage;
+        } catch (err: any) {
+            if (!awaiter.isResolved) {
+                await awaiter.reject(err?.message ?? String(err));
+            }
+            Server().messageManager.prune();
+            throw err;
+        }
     }
 
     static async notifySilencedMessage(chat: Chat, message: Message): Promise<Message> {

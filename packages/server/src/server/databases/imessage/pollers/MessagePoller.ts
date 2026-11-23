@@ -1,6 +1,7 @@
 import { IMessagePollResult, IMessagePollType, IMessagePoller } from ".";
 import { Message } from "../entity/Message";
 import { isEmpty } from "@server/helpers/utils";
+import { isMinBigSur, isMinSierra } from "@server/env";
 import { Server } from "@server";
 import { MESSAGE_FAST_LOOKBACK_MS, MESSAGE_RECONCILE_INTERVAL_MS, MESSAGE_RECONCILE_LOOKBACK_MS } from "./constants";
 
@@ -54,25 +55,67 @@ export class MessagePoller extends IMessagePoller {
         // Filter out messages that aren't within our actual range.
         // Do this here instead of in SQLite to save on performance
         const afterTime = after.getTime();
-        let entries = search.filter(e => (
-            (e.dateCreated?.getTime() ?? 0) >= afterTime ||
-            // Date delivered only matters if it's from you
-            (e.isFromMe && (e.dateDelivered?.getTime() ?? 0) >= afterTime) ||
-            (e.isFromMe && !e.dateDelivered && e.isDelivered) ||
-            // Date read only matters if it's from you and it's not a group chat
-            (e.isFromMe && !e.chats?.[0]?.isGroup && (e.dateRead?.getTime() ?? 0) >= afterTime) ||
-            // Date edited can be from anyone (should include edits & unsends)
-            (e.dateEdited?.getTime() ?? 0) >= afterTime ||
-            // Date retracted can be from anyone, but Apple doesn't even use this field.
-            // We still want to be thorough and check it.
-            // isEmpty is what's actually used by Apple to determine if it's retracted.
-            // (in addition to dateEdited)
-            (e.dateRetracted?.getTime() ?? 0) >= afterTime ||
-            // If there are retracted parts, it's unsent
-            e.hasUnsentParts ||
-            // If didNotifyRecipient changed (from false to true)
-            (e.didNotifyRecipient ?? false)
-        ));
+        let entries = search.filter(e => {
+            const cachedState = this.cache.messageStates[e.guid];
+            return (
+                (e.dateCreated?.getTime() ?? 0) >= afterTime ||
+                // Date delivered only matters if it's from you
+                (e.isFromMe && (e.dateDelivered?.getTime() ?? 0) >= afterTime) ||
+                (Boolean(cachedState) && e.isFromMe && !e.dateDelivered && e.isDelivered && !cachedState.isDelivered) ||
+                // Date read only matters if it's from you and it's not a group chat
+                (e.isFromMe && !e.chats?.[0]?.isGroup && (e.dateRead?.getTime() ?? 0) >= afterTime) ||
+                // Date edited can be from anyone (should include edits & unsends)
+                (e.dateEdited?.getTime() ?? 0) >= afterTime ||
+                // Date retracted can be from anyone, but Apple doesn't even use this field.
+                // We still want to be thorough and check it.
+                // isEmpty is what's actually used by Apple to determine if it's retracted.
+                // (in addition to dateEdited)
+                (e.dateRetracted?.getTime() ?? 0) >= afterTime ||
+                // If there are retracted parts, it's unsent
+                (Boolean(cachedState) && e.hasUnsentParts && !cachedState.hasUnsentParts) ||
+                // If didNotifyRecipient changed (from false to true)
+                (Boolean(cachedState) && Boolean(e.didNotifyRecipient) && !cachedState.didNotifyRecipient) ||
+                // In-place CloudKit backfill (thread/reaction columns populated without changing date columns)
+                this.getMessageEvent(e) === "updated-entry"
+            );
+        });
+
+        // Check tracked recent rows whose thread/assoc columns were null in case CloudKit
+        // backfilled them in-place after they aged past the fast lookback window.
+        // shortcut: cap at 500 most recent tracked rows to stay well under SQLite IN limits.
+        const checkedRowIds = new Set(search.map(e => e.ROWID));
+        const trackedNullRowIds = Object.values(this.cache.messageStates)
+            .filter(s => s.rowId > 0 && !s.threadOriginatorGuid && !s.associatedMessageGuid && !checkedRowIds.has(s.rowId))
+            .sort((a, b) => b.cacheTime - a.cacheTime)
+            .slice(0, 500)
+            .map(s => s.rowId);
+
+        const backfillClauses: string[] = [];
+        if (isMinBigSur) backfillClauses.push("message.thread_originator_guid IS NOT NULL");
+        if (isMinSierra) {
+            backfillClauses.push("message.associated_message_guid IS NOT NULL");
+            backfillClauses.push("COALESCE(message.associated_message_type, 0) != 0");
+        }
+
+        if (trackedNullRowIds.length > 0 && backfillClauses.length > 0) {
+            const [backfillCandidates] = await this.repo.getMessages({
+                withChats: true,
+                withAttachments: false,
+                withCount: false,
+                limit: trackedNullRowIds.length,
+                where: [
+                    {
+                        statement: `message.ROWID in (${trackedNullRowIds.join(", ")}) AND (${backfillClauses.join(" OR ")})`,
+                        args: null
+                    }
+                ]
+            });
+            for (const candidate of backfillCandidates) {
+                if (this.getMessageEvent(candidate) === "updated-entry") {
+                    entries.push(candidate);
+                }
+            }
+        }
 
         // Hydrate the (small) set of changed entries with their attachments, since downstream
         // consumers (sockets, webhooks) need the full message payload.
@@ -127,6 +170,14 @@ export class MessagePoller extends IMessagePoller {
             const event = this.processMessageEvent(entry);
             if (!event) continue;
 
+            if (entry.isFromMe && (entry.error ?? 0) > 0) {
+                const success = await Server().messageManager.reject("message-send-error", entry);
+                if (!success) {
+                    results.push({ eventType: "message-send-error", data: entry });
+                }
+                continue;
+            }
+
             // Resolve the promise for sent messages from a client
             if (entry.isFromMe) {
                 Server().messageManager.resolve(entry);
@@ -137,7 +188,7 @@ export class MessagePoller extends IMessagePoller {
         }
 
         // Sort results ascending order by date created so that older messages are processed first
-        results.sort((a, b) => a.data.dateCreated.getTime() - b.data.dateCreated.getTime());
+        results.sort((a, b) => (a.data?.dateCreated?.getTime() ?? 0) - (b.data?.dateCreated?.getTime() ?? 0));
 
         return results;
     }

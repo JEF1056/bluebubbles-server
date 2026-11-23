@@ -24,7 +24,7 @@ require.extensions[".ts"] = function (module: any, filename: string) {
 };
 
 // Mock @server and heavy Electron/DB dependencies before importing FaceTime modules.
-const emittedMessages: Array<{ type: string; data: any; priority?: string }> = [];
+const emittedMessages: Array<{ type: string; data: any; priority?: string; useFcm?: boolean }> = [];
 const loggedMessages: Array<{ message: string; type?: string }> = [];
 const privateApiCalls: Array<{ method: string; args: any[] }> = [];
 let mockRepoConfig: Record<string, any> = { facetime_calling: true };
@@ -33,6 +33,8 @@ let mockConversationState: { data: { conversationCount: number; conversations: a
     data: { conversationCount: 0, conversations: [] }
 };
 let getHandlesOverride: ((args: { address: string }) => Promise<any>) | null = null;
+let pullCallOverride: ((callUuid?: string | null, groupUuid?: string | null) => Promise<any>) | null = null;
+let pushCallOverride: ((callUuid?: string | null) => Promise<any>) | null = null;
 
 const mockServerInstance = {
     log: (message: string, type?: string) => {
@@ -51,6 +53,10 @@ const mockServerInstance = {
             generateLink: async (uuid: string | null) => {
                 privateApiCalls.push({ method: "generateLink", args: [uuid] });
                 return { data: { url: `https://facetime.apple.com/join#v=1&p=${uuid ?? "new"}` } };
+            },
+            removeLink: async (url?: string) => {
+                privateApiCalls.push({ method: "removeLink", args: [url ?? null] });
+                return { data: { removed: true, removed_count: 1, skipped_active_count: 0 } };
             },
             answerCall: async (uuid: string) => {
                 privateApiCalls.push({ method: "answerCall", args: [uuid] });
@@ -79,6 +85,16 @@ const mockServerInstance = {
             getConversationState: async () => {
                 privateApiCalls.push({ method: "getConversationState", args: [] });
                 return mockConversationState;
+            },
+            pullCall: async (callUuid?: string | null, groupUuid?: string | null) => {
+                privateApiCalls.push({ method: "pullCall", args: [callUuid ?? null, groupUuid ?? null] });
+                if (pullCallOverride) return pullCallOverride(callUuid, groupUuid);
+                return { data: { call_uuid: callUuid ?? "pulled-uuid" } };
+            },
+            pushCall: async (callUuid?: string | null) => {
+                privateApiCalls.push({ method: "pushCall", args: [callUuid ?? null] });
+                if (pushCallOverride) return pushCallOverride(callUuid);
+                return { data: { pushed: true } };
             }
         }
     },
@@ -88,8 +104,8 @@ const mockServerInstance = {
                 ? getHandlesOverride(args)
                 : [[{ address: args.address, uncanonicalizedId: args.address, service: "FaceTime" }]]
     },
-    emitMessage: async (type: string, data: any, priority?: string) => {
-        emittedMessages.push({ type, data, priority });
+    emitMessage: async (type: string, data: any, priority?: string, useFcm?: boolean) => {
+        emittedMessages.push({ type, data, priority, useFcm });
     }
 };
 
@@ -108,7 +124,9 @@ const origLoad = (Module as any)._load;
         return {
             checkPrivateApiStatus: () => {},
             waitMs: async () => {},
-            slugifyAddress: (v: string) => v
+            slugifyAddress: (v: string) => v,
+            isEmpty: (val: any) => val == null || (Array.isArray(val) && val.length === 0) || val === "",
+            generateUuid: () => "tx-uuid-" + Math.random().toString(36).slice(2, 10)
         };
     }
     if (request === "@server/databases/notificationCenter/NotiicationCenterRepository") {
@@ -120,6 +138,9 @@ const origLoad = (Module as any)._load;
     if (request === "@server/api/serializers/HandleSerializer") {
         return { HandleSerializer: { serialize: async ({ handle }: any) => ({ address: handle.address }) } };
     }
+    if (request === "@server/databases/callHistory") {
+        return { CallHistoryRepository: class {} };
+    }
     if (
         request === "@server/api/lib/facetime/FaceTimeAudioBridge" ||
         request.endsWith("/FaceTimeAudioBridge") ||
@@ -127,13 +148,28 @@ const origLoad = (Module as any)._load;
     ) {
         return {
             FaceTimeAudioBridge: {
-                getInstance: () => ({
-                    cleanupSession: (uuid: string) => {
+                getInstance: () => {
+                    const cleanupSession = (uuid: string) => {
                         privateApiCalls.push({ method: "bridgeCleanup", args: [uuid] });
-                    },
-                    sendDtmf: () => false,
-                    sessions: new Map()
-                })
+                    };
+                    return {
+                        cleanupSession,
+                        cleanupSessions: (ids: Iterable<string | null | undefined>) => {
+                            const seen = new Set<string>();
+                            for (const id of ids) {
+                                if (!id || seen.has(id)) continue;
+                                seen.add(id);
+                                cleanupSession(id);
+                            }
+                        },
+                        sendDtmf: () => false,
+                        onCallAnswered: (uuid: string) => {
+                            privateApiCalls.push({ method: "bridgeOnCallAnswered", args: [uuid] });
+                            return true;
+                        },
+                        sessions: new Map()
+                    };
+                }
             }
         };
     }
@@ -154,6 +190,8 @@ const origLoad = (Module as any)._load;
 const { FaceTimeSession, FaceTimeSessionStatus } = require("../src/server/api/lib/facetime/FaceTimeSession.ts");
 const { FaceTimeSessionManager } = require("../src/server/api/lib/facetime/FacetimeSessionManager.ts");
 const { FaceTimeInterface } = require("../src/server/api/interfaces/facetimeInterface.ts");
+const { FaceTimeRouter } = require("../src/server/api/http/api/v1/routers/facetimeRouter.ts");
+const { PrivateApiFaceTime } = require("../src/server/api/privateApi/apis/PrivateApiFaceTime.ts");
 const { PrivateApiFaceTimeStatusHandler } = require(
     "../src/server/api/privateApi/eventHandlers/PrivateApiFaceTimeStatusHandler.ts"
 );
@@ -167,6 +205,8 @@ const resetState = () => {
     mockServerEnabled = true;
     mockConversationState = { data: { conversationCount: 0, conversations: [] } };
     getHandlesOverride = null;
+    pullCallOverride = null;
+    pushCallOverride = null;
 };
 
 test("FaceTimeSession.serialize() returns full backwards-compatible payload and preserves uuid on invalidate()", () => {
@@ -1019,4 +1059,995 @@ test("declining an incoming call preserves ended_reason='declined' on trailing D
 
     assert.equal(FaceTimeSessionManager().findSession("call-decline-preserve")?.endedReason, "declined");
     assert.equal(emittedMessages.length, afterDeclineCount, "must not emit a second missed broadcast after decline");
+});
+
+test("handleStandard adopts iPhone-hosted and handoff-eligible calls, handoff pulls and re-keys, and transferBack pushes", async () => {
+    resetState();
+    mockRepoConfig = { facetime_calling: false };
+    const handler = new PrivateApiFaceTimeStatusHandler();
+
+    // 1. Synthetic handoff-eligible FaceTime call on iPhone (keyed by conversation_group_uuid, facetime_calling off)
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                is_handoff_eligible: true,
+                conversation_group_uuid: "group-iphone-1",
+                handle: { value: "+15557778888" },
+                is_video: false
+            }
+        } as any,
+        null as any
+    );
+
+    const eligibleSession = FaceTimeSessionManager().findSession("group-iphone-1");
+    assert.ok(eligibleSession, "handleStandard should adopt handoff-eligible session when facetime_calling is off");
+    assert.equal(eligibleSession.endpointOnMac, false);
+    assert.equal(eligibleSession.fromIphone, true);
+    assert.equal(eligibleSession.activeDeviceName, "iPhone");
+    assert.equal(eligibleSession.serialize().endpoint_on_mac, false);
+    assert.equal(eligibleSession.serialize().from_iphone, true);
+
+    // 2. Pull -> re-key -> bridge mode
+    pullCallOverride = async () => ({ data: { call_uuid: "pulled-mac-uuid-1" } });
+    const handoffRes = await FaceTimeInterface.handoff("group-iphone-1", {
+        deviceId: "android-pixel",
+        deviceName: "Pixel 9",
+        mode: "audio"
+    });
+    assert.equal(privateApiCalls.some(c => c.method === "pullCall" && c.args[1] === "group-iphone-1"), true);
+    assert.equal(eligibleSession.callUuid, "pulled-mac-uuid-1");
+    assert.equal(eligibleSession.endpointOnMac, true);
+    assert.equal(eligibleSession.fromIphone, true);
+    assert.equal(handoffRes.session.uuid, "pulled-mac-uuid-1");
+    assert.equal(handoffRes.session.endpoint_on_mac, true);
+    assert.equal(handoffRes.session.from_iphone, true);
+    assert.equal(FaceTimeSessionManager().findSession("group-iphone-1"), eligibleSession);
+    assert.equal(FaceTimeSessionManager().findSession("pulled-mac-uuid-1"), eligibleSession);
+    assert.equal(privateApiCalls.some(c => c.method === "setMuted" && c.args[0] === "pulled-mac-uuid-1"), true);
+
+    // 3. transferBack cleans up bridge and calls pushCall
+    privateApiCalls.length = 0;
+    const backRes = await FaceTimeInterface.transferBack("pulled-mac-uuid-1");
+    const cleanupIdx = privateApiCalls.findIndex(
+        c => c.method === "bridgeCleanup" && c.args[0] === "pulled-mac-uuid-1"
+    );
+    const pushIdx = privateApiCalls.findIndex(c => c.method === "pushCall" && c.args[0] === "pulled-mac-uuid-1");
+    assert.ok(cleanupIdx >= 0, "transferBack should clean up bridge session");
+    assert.ok(pushIdx > cleanupIdx, "transferBack should call pushCall after bridgeCleanup");
+    assert.equal(backRes.session?.endpoint_on_mac, false);
+    assert.equal(backRes.session?.active_device_name, "iPhone");
+});
+
+test("handleStandard adopts status-1 Continuity call with is_endpoint_on_current_device=false and propagates pull errors", async () => {
+    resetState();
+    mockRepoConfig = { facetime_calling: false };
+    const handler = new PrivateApiFaceTimeStatusHandler();
+
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "continuity-call-1",
+                call_status: FaceTimeSessionStatus.ANSWERED,
+                is_endpoint_on_current_device: false,
+                is_telephony: true,
+                handle: { value: "+15559990000" }
+            }
+        } as any,
+        null as any
+    );
+
+    const session = FaceTimeSessionManager().findSession("continuity-call-1");
+    assert.ok(session, "handleStandard should adopt status-1 call when is_endpoint_on_current_device is false");
+    assert.equal(session.endpointOnMac, false);
+    assert.equal(session.fromIphone, true);
+    assert.equal(session.activeDeviceName, "iPhone");
+
+    pullCallOverride = async () => {
+        throw new Error("No eligible call on iPhone");
+    };
+    await assert.rejects(
+        () =>
+            FaceTimeInterface.handoff("continuity-call-1", {
+                deviceId: "android-1",
+                deviceName: "Pixel",
+                mode: "audio"
+            }),
+        /No eligible call on iPhone/
+    );
+    assert.equal(session.endpointOnMac, false);
+    assert.equal(session.activeDeviceName, "iPhone");
+});
+
+test("outgoing conversation call_status=1 with 0 non-lightweight participants stays OUTGOING until callee joins", async () => {
+    resetState();
+    const handler = new PrivateApiFaceTimeStatusHandler();
+
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "outgoing-gft-1",
+                conversation_group_uuid: "group-gft-1",
+                call_status: FaceTimeSessionStatus.ANSWERED,
+                is_outgoing: true,
+                is_conversation: true,
+                is_video: true,
+                is_telephony: false,
+                active_non_lightweight_participants_count: 0,
+                handle: { value: "+15551112222" }
+            }
+        } as any,
+        null as any
+    );
+
+    const session = FaceTimeSessionManager().findSession("outgoing-gft-1");
+    assert.ok(session, "session should be tracked");
+    assert.equal(session.status, FaceTimeSessionStatus.OUTGOING);
+    assert.equal(session.answeredAt, null);
+
+    let answeredEmitted = false;
+    session.once("answered", () => {
+        answeredEmitted = true;
+    });
+
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "outgoing-gft-1",
+                conversation_group_uuid: "group-gft-1",
+                call_status: FaceTimeSessionStatus.ANSWERED,
+                is_outgoing: true,
+                is_conversation: true,
+                is_video: true,
+                is_telephony: false,
+                active_non_lightweight_participants_count: 1,
+                handle: { value: "+15551112222" }
+            }
+        } as any,
+        null as any
+    );
+
+    assert.equal(session.status, FaceTimeSessionStatus.ANSWERED);
+    assert.ok(session.answeredAt instanceof Date);
+    assert.equal(answeredEmitted, true);
+});
+
+test("waitForOutgoingAnswer polls getConversationState and promotes OUTGOING to ANSWERED when non-lightweight count > 0", async () => {
+    resetState();
+    const session = new FaceTimeSession({
+        callUuid: "outgoing-poll-1",
+        status: FaceTimeSessionStatus.OUTGOING,
+        isOutgoing: true,
+        isVideo: true,
+        addToManager: true
+    });
+    session.conversationGroupUuid = "group-poll-1";
+
+    let pollCount = 0;
+    const origGetConversationState = mockServerInstance.privateApi.facetime.getConversationState;
+    mockServerInstance.privateApi.facetime.getConversationState = async () => {
+        pollCount += 1;
+        return {
+            data: {
+                conversationCount: 1,
+                conversations: [
+                    {
+                        groupUUID: "group-poll-1",
+                        activeRemoteParticipantCount: pollCount >= 2 ? 1 : 0,
+                        activeLightweightParticipantCount: 0,
+                        activeNonLightweightParticipantCount: pollCount >= 2 ? 1 : 0,
+                        pendingMemberCount: 0
+                    }
+                ]
+            }
+        };
+    };
+
+    try {
+        const answered = await (session as any).waitForOutgoingAnswer(3500);
+        assert.equal(answered, true);
+        assert.equal(session.status, FaceTimeSessionStatus.ANSWERED);
+        assert.ok(session.answeredAt instanceof Date);
+    } finally {
+        mockServerInstance.privateApi.facetime.getConversationState = origGetConversationState;
+    }
+});
+
+test("handler.handle auto-polls getConversationState for downgraded outgoing conversation without admitSelf", async () => {
+    resetState();
+    const handler = new PrivateApiFaceTimeStatusHandler();
+    let pollCount = 0;
+    const origGetConversationState = mockServerInstance.privateApi.facetime.getConversationState;
+    mockServerInstance.privateApi.facetime.getConversationState = async () => {
+        pollCount += 1;
+        return {
+            data: {
+                conversationCount: 1,
+                conversations: [
+                    {
+                        groupUUID: "group-autopolled-1",
+                        activeRemoteParticipantCount: pollCount >= 2 ? 1 : 0,
+                        activeLightweightParticipantCount: 0,
+                        activeNonLightweightParticipantCount: pollCount >= 2 ? 1 : 0,
+                        pendingMemberCount: 0
+                    }
+                ]
+            }
+        };
+    };
+
+    try {
+        await handler.handle(
+            {
+                event: "ft-call-status-changed",
+                data: {
+                    call_uuid: "outgoing-autopolled-1",
+                    conversation_group_uuid: "group-autopolled-1",
+                    call_status: FaceTimeSessionStatus.ANSWERED,
+                    is_outgoing: true,
+                    is_conversation: true,
+                    is_video: false,
+                    is_telephony: false,
+                    active_non_lightweight_participants_count: 0,
+                    handle: { value: "+15553334444" }
+                }
+            } as any,
+            null as any
+        );
+
+        const session = FaceTimeSessionManager().findSession("outgoing-autopolled-1");
+        assert.ok(session, "session should be tracked");
+        assert.equal(session.status, FaceTimeSessionStatus.OUTGOING);
+        assert.equal(session.answeredAt, null);
+
+        await new Promise<void>((resolve, reject) => {
+            const timeout = setTimeout(() => reject(new Error("timed out waiting for auto-poll promotion")), 3500);
+            session.once("answered", () => {
+                clearTimeout(timeout);
+                resolve();
+            });
+        });
+
+        assert.equal(session.status, FaceTimeSessionStatus.ANSWERED);
+        assert.ok(session.answeredAt instanceof Date);
+        assert.ok(pollCount >= 2);
+    } finally {
+        mockServerInstance.privateApi.facetime.getConversationState = origGetConversationState;
+    }
+});
+
+test("P0 #5: normal answered call without leftForHandoff/link invalidates on DISCONNECTED; addSession arms expiryTimer", async () => {
+    resetState();
+    const session = FaceTimeSession.fromEvent(
+        {
+            call_uuid: "call-p05-normal",
+            call_status: FaceTimeSessionStatus.ANSWERED,
+            active_remote_participants_count: 1,
+            handle: { value: "+15551110000" }
+        },
+        false
+    );
+    const isNew = FaceTimeSessionManager().addSession(session);
+    assert.equal(isNew, true);
+    assert.ok((session as any).expiryTimer, "addSession should arm expiryTimer for new sessions");
+
+    // Stale activeRemoteParticipantsCount=1 on `this` must NOT falsely trigger isHandoffLeave when session has null counts and no url/admittedParticipants
+    session.update(
+        FaceTimeSession.fromEvent({
+            call_uuid: "call-p05-normal",
+            call_status: FaceTimeSessionStatus.DISCONNECTED
+        })
+    );
+    assert.equal(session.status, FaceTimeSessionStatus.DISCONNECTED);
+
+    // Link-hosted call with admittedParticipants and active callee counts stays ANSWERED on local DISCONNECTED
+    const linkSession = new FaceTimeSession({
+        callUuid: "call-p05-link",
+        url: "https://facetime.apple.com/join#v=1&p=test",
+        status: FaceTimeSessionStatus.ANSWERED,
+        addToManager: true
+    });
+    linkSession.admittedParticipants.push("guest-1");
+    linkSession.update(
+        FaceTimeSession.fromEvent({
+            call_uuid: "call-p05-link",
+            call_status: FaceTimeSessionStatus.DISCONNECTED,
+            active_remote_participants_count: 1,
+            active_non_lightweight_participants_count: 1
+        })
+    );
+    assert.equal(linkSession.status, FaceTimeSessionStatus.ANSWERED);
+    linkSession.invalidate();
+});
+
+test("P1 #9 & #12: FaceTime FCM priority gated to lifecycle transitions and endpointOnMac clears default iPhone device name", async () => {
+    resetState();
+    const session = new FaceTimeSession({
+        callUuid: "call-p19-fcm",
+        status: FaceTimeSessionStatus.INCOMING,
+        endpointOnMac: false,
+        addToManager: true
+    });
+    assert.equal(session.activeDeviceName, "iPhone");
+
+    FaceTimeSessionManager().broadcastUpdate(session);
+    assert.equal(emittedMessages.at(-1)?.priority, "high");
+    assert.equal(emittedMessages.at(-1)?.useFcm, true);
+
+    session.update(
+        FaceTimeSession.fromEvent({
+            call_uuid: "call-p19-fcm",
+            call_status: FaceTimeSessionStatus.ANSWERED,
+            is_endpoint_on_current_device: true
+        })
+    );
+    assert.equal(session.activeDeviceName, null);
+    FaceTimeSessionManager().broadcastUpdate(session);
+    assert.equal(emittedMessages.at(-1)?.priority, "high");
+    assert.equal(emittedMessages.at(-1)?.useFcm, true);
+    assert.equal(emittedMessages.at(-1)?.data?.endpoint_on_mac, true);
+
+    // Mute delta while ANSWERED must be socket-only (normal priority, useFcm=false)
+    session.isMuted = true;
+    FaceTimeSessionManager().broadcastUpdate(session);
+    assert.equal(emittedMessages.at(-1)?.priority, "normal");
+    assert.equal(emittedMessages.at(-1)?.useFcm, false);
+
+    // Transition to DISCONNECTED uses high priority + FCM
+    session.invalidate("remote_ended");
+    FaceTimeSessionManager().broadcastUpdate(session);
+    assert.equal(emittedMessages.at(-1)?.priority, "high");
+    assert.equal(emittedMessages.at(-1)?.useFcm, true);
+});
+
+test("cleanupSessions cleans up pre-handoff callUuid, aliases, uniqueProxyIdentifier, and conversationGroupUuid on handoff/end/disconnect", async () => {
+    resetState();
+    const session = new FaceTimeSession({
+        callUuid: "call-old-1",
+        uniqueProxyIdentifier: "proxy-1",
+        status: FaceTimeSessionStatus.ANSWERED,
+        endpointOnMac: false,
+        addToManager: true
+    });
+    session.conversationGroupUuid = "group-1";
+    session.registerIdentifier("alias-1");
+    pullCallOverride = async () => ({ data: { call_uuid: "call-new-1" } });
+
+    await FaceTimeInterface.handoff("call-old-1", { mode: "video" });
+    const handoffCleanups = privateApiCalls.filter(c => c.method === "bridgeCleanup").map(c => c.args[0]);
+    assert.equal(new Set(handoffCleanups).size, handoffCleanups.length);
+    for (const id of ["call-old-1", "call-new-1", "alias-1", "proxy-1", "group-1"]) {
+        assert.ok(handoffCleanups.includes(id), `handoff missing cleanup for ${id}`);
+    }
+
+    privateApiCalls.length = 0;
+    await FaceTimeInterface.end("alias-1");
+    const endCleanups = privateApiCalls.filter(c => c.method === "bridgeCleanup").map(c => c.args[0]);
+    assert.equal(new Set(endCleanups).size, endCleanups.length);
+    for (const id of ["call-new-1", "call-old-1", "alias-1", "proxy-1", "group-1"]) {
+        assert.ok(endCleanups.includes(id), `end missing cleanup for ${id}`);
+    }
+
+    privateApiCalls.length = 0;
+    const handler = new PrivateApiFaceTimeStatusHandler();
+    await handler.handle({
+        event: "ft-call-status-changed",
+        data: {
+            call_uuid: "call-event-1",
+            unique_proxy_identifier: "proxy-1",
+            conversation_group_uuid: "group-1",
+            call_status: FaceTimeSessionStatus.DISCONNECTED
+        }
+    });
+    const handlerCleanups = privateApiCalls.filter(c => c.method === "bridgeCleanup").map(c => c.args[0]);
+    assert.equal(new Set(handlerCleanups).size, handlerCleanups.length);
+    for (const id of ["call-new-1", "call-old-1", "alias-1", "proxy-1", "group-1", "call-event-1"]) {
+        assert.ok(handlerCleanups.includes(id), `disconnect missing cleanup for ${id}`);
+    }
+});
+
+test("Slice A: FaceTimeSession.fromEvent / update / serialize handles addresses and is_group, and manager broadcasts changes", async () => {
+    resetState();
+    const initial = FaceTimeSession.fromEvent(
+        {
+            call_uuid: "group-call-1",
+            call_status: FaceTimeSessionStatus.ANSWERED,
+            addresses: ["+15551110001"],
+            remote_members_count: 1
+        },
+        true
+    );
+    assert.equal(initial.address, "+15551110001");
+    assert.deepEqual(initial.addresses, ["+15551110001"]);
+    assert.equal(initial.isGroup, false);
+    assert.equal(initial.serialize().is_group, false);
+
+    FaceTimeSessionManager().broadcastUpdate(initial);
+    const firstEmitCount = emittedMessages.length;
+
+    // Incoming update with longer addresses list and is_group=true should update and re-broadcast
+    initial.update(
+        FaceTimeSession.fromEvent({
+            call_uuid: "group-call-1",
+            call_status: FaceTimeSessionStatus.ANSWERED,
+            addresses: ["+15551110001", "alice@example.com"],
+            is_group: true
+        })
+    );
+    assert.deepEqual(initial.addresses, ["+15551110001", "alice@example.com"]);
+    assert.equal(initial.isGroup, true);
+    assert.equal(initial.serialize().is_group, true);
+
+    FaceTimeSessionManager().broadcastUpdate(initial);
+    assert.equal(emittedMessages.length, firstEmitCount + 1);
+    assert.deepEqual(emittedMessages.at(-1)?.data?.addresses, ["+15551110001", "alice@example.com"]);
+    assert.equal(emittedMessages.at(-1)?.data?.is_group, true);
+
+    // Shorter incoming addresses list must not overwrite longer list, and isGroup stays true via OR
+    initial.update(
+        FaceTimeSession.fromEvent({
+            call_uuid: "group-call-1",
+            call_status: FaceTimeSessionStatus.ANSWERED,
+            addresses: ["+15551110001"],
+            is_group: false
+        })
+    );
+    assert.deepEqual(initial.addresses, ["+15551110001", "alice@example.com"]);
+    assert.equal(initial.isGroup, true);
+
+    // remote_members_count > 1 infers is_group when is_group is omitted
+    const inferredGroup = FaceTimeSession.fromEvent({
+        call_uuid: "group-call-2",
+        call_status: FaceTimeSessionStatus.INCOMING,
+        remote_members_count: 3
+    });
+    assert.equal(inferredGroup.isGroup, true);
+});
+
+test("FaceTime link cleanup removes unused links after disconnect and skips active or reused links", async () => {
+    resetState();
+    const mgr = FaceTimeSessionManager();
+    const prevGrace = mgr.linkCleanupGraceMs;
+    mgr.linkCleanupGraceMs = 30;
+
+    try {
+        // 1. Server-created link is recorded and cleaned up after session disconnects
+        const s1 = new FaceTimeSession({
+            callUuid: "call-link-1",
+            status: FaceTimeSessionStatus.ANSWERED,
+            addToManager: true
+        });
+        const link1 = await s1.generateLink();
+        assert.ok(mgr.createdLinkUrls.has(link1), "generated link should be tracked in createdLinkUrls");
+
+        s1.invalidate("user_ended");
+        await new Promise(r => setTimeout(r, 60));
+        assert.ok(
+            privateApiCalls.some(c => c.method === "removeLink" && c.args[0] === link1),
+            "unused link must be removed after disconnect grace delay"
+        );
+        assert.equal(mgr.createdLinkUrls.has(link1), false);
+
+        // 2. Active session sharing the same link prevents deletion
+        privateApiCalls.length = 0;
+        const link2 = "https://facetime.apple.com/join#v=1&p=shared";
+        mgr.recordCreatedLink(link2);
+        const s2a = new FaceTimeSession({
+            callUuid: "call-link-2a",
+            status: FaceTimeSessionStatus.ANSWERED,
+            url: link2,
+            addToManager: true
+        });
+        const s2b = new FaceTimeSession({
+            callUuid: "call-link-2b",
+            status: FaceTimeSessionStatus.ANSWERED,
+            url: link2,
+            addToManager: true
+        });
+        s2a.invalidate("user_ended");
+        await new Promise(r => setTimeout(r, 60));
+        assert.equal(
+            privateApiCalls.some(c => c.method === "removeLink" && c.args[0] === link2),
+            false,
+            "active link used by another session must NOT be deleted"
+        );
+
+        // Once the second session also disconnects, cleanup proceeds
+        s2b.invalidate("remote_ended");
+        await new Promise(r => setTimeout(r, 60));
+        assert.ok(
+            privateApiCalls.some(c => c.method === "removeLink" && c.args[0] === link2),
+            "link should be removed once all active sessions using it disconnect"
+        );
+
+        // 3. Reusing a link cancels scheduled cleanup, and periodic sweep only removes old unused links
+        privateApiCalls.length = 0;
+        const link3 = "https://facetime.apple.com/join#v=1&p=reused";
+        mgr.recordCreatedLink(link3);
+        const s3 = new FaceTimeSession({
+            callUuid: "call-link-3",
+            status: FaceTimeSessionStatus.ANSWERED,
+            url: link3,
+            addToManager: true
+        });
+        s3.invalidate("user_ended");
+        // Reuse immediately before grace delay fires
+        new FaceTimeSession({
+            callUuid: "call-link-3-reused",
+            status: FaceTimeSessionStatus.ANSWERED,
+            url: link3,
+            addToManager: true
+        });
+        await new Promise(r => setTimeout(r, 60));
+        assert.equal(
+            privateApiCalls.some(c => c.method === "removeLink" && c.args[0] === link3),
+            false,
+            "reused link must cancel pending cleanup"
+        );
+
+        // Periodic sweep removes old unused link, leaves active link3 untouched
+        const staleLink = "https://facetime.apple.com/join#v=1&p=stale";
+        mgr.createdLinkUrls.set(staleLink, Date.now() - 10 * 60 * 1000);
+        mgr.createdLinkUrls.set(link3, Date.now() - 10 * 60 * 1000);
+        mgr.sweepUnusedLinks(5 * 60 * 1000);
+        assert.ok(
+            privateApiCalls.some(c => c.method === "removeLink" && c.args[0] === staleLink),
+            "sweepUnusedLinks must remove stale unused link"
+        );
+        assert.equal(
+            privateApiCalls.some(c => c.method === "removeLink" && c.args[0] === link3),
+            false,
+            "sweepUnusedLinks must NOT remove link still in active session"
+        );
+
+        // When no active sessions or tracked links remain, sweepUnusedLinks must NOT call removeLink() without a URL
+        mgr.clearSessions();
+        privateApiCalls.length = 0;
+        mgr.sweepUnusedLinks(5 * 60 * 1000);
+        assert.equal(
+            privateApiCalls.length,
+            0,
+            "sweepUnusedLinks must NEVER call removeLink without an explicit tracked URL"
+        );
+    } finally {
+        mgr.linkCleanupGraceMs = prevGrace;
+        mgr.clearSessions();
+    }
+});
+
+test("ensureOutgoingAnswerPolling auto-ends unanswered outgoing calls with no_answer and preserves link-only sessions", async () => {
+    const mgr = FaceTimeSessionManager();
+    mgr.clearSessions();
+    privateApiCalls.length = 0;
+    emittedMessages.length = 0;
+    mockConversationState = { data: { conversationCount: 0, conversations: [] } };
+
+    try {
+        const session = new FaceTimeSession({
+            callUuid: "call-no-answer-1",
+            status: FaceTimeSessionStatus.OUTGOING,
+            isOutgoing: true,
+            isVideo: true,
+            isAudio: false,
+            isTelephony: false,
+            isLinkOnly: false,
+            address: "+15551230001",
+            addToManager: true
+        });
+
+        const answered = await session.ensureOutgoingAnswerPolling(40);
+        assert.equal(answered, false);
+        assert.equal(session.status, FaceTimeSessionStatus.DISCONNECTED);
+        assert.equal(session.endedReason, "no_answer");
+        assert.ok(
+            privateApiCalls.some(c => c.method === "leaveCall" && c.args[0] === "call-no-answer-1"),
+            "timeout must leave the Mac call"
+        );
+        assert.ok(
+            privateApiCalls.some(c => c.method === "endAndInvalidateCall" && c.args[0] === "call-no-answer-1"),
+            "timeout must trigger endAndInvalidateCall"
+        );
+        assert.ok(
+            emittedMessages.some(
+                m =>
+                    m.type === "ft-call-status-changed" &&
+                    m.data?.uuid === "call-no-answer-1" &&
+                    m.data?.status_id === FaceTimeSessionStatus.DISCONNECTED &&
+                    m.data?.ended_reason === "no_answer"
+            ),
+            "timeout must broadcast DISCONNECTED with ended_reason='no_answer'"
+        );
+
+        // Link-only session (no recipients) must not be auto-ended by outgoing answer polling
+        privateApiCalls.length = 0;
+        const linkOnly = new FaceTimeSession({
+            callUuid: "call-link-only-1",
+            status: FaceTimeSessionStatus.OUTGOING,
+            isOutgoing: true,
+            isLinkOnly: true,
+            url: "https://facetime.apple.com/join#v=1&p=linkonly",
+            addToManager: true
+        });
+        const linkAnswered = await linkOnly.ensureOutgoingAnswerPolling(40);
+        assert.equal(linkAnswered, false);
+        assert.equal(linkOnly.status, FaceTimeSessionStatus.OUTGOING);
+        assert.equal(linkOnly.endedReason, null);
+        assert.equal(privateApiCalls.some(c => c.method === "leaveCall"), false);
+    } finally {
+        mgr.clearSessions();
+    }
+});
+
+test("FaceTimeInterface.call starts outgoing answer polling for non-telephony audio-only calls", async () => {
+    const mgr = FaceTimeSessionManager();
+    mgr.clearSessions();
+    privateApiCalls.length = 0;
+    mockConversationState = { data: { conversationCount: 0, conversations: [] } };
+
+    let pollingTimeoutMs: number | undefined;
+    const origPolling = FaceTimeSession.prototype.ensureOutgoingAnswerPolling;
+    FaceTimeSession.prototype.ensureOutgoingAnswerPolling = function (ringTimeoutMs = 60000) {
+        pollingTimeoutMs = ringTimeoutMs;
+        return Promise.resolve(false);
+    };
+
+    try {
+        const res = await FaceTimeInterface.call({
+            addresses: ["+15551230002"],
+            video: false,
+            isTelephony: false
+        });
+        assert.equal(res.session.status_id, FaceTimeSessionStatus.OUTGOING);
+        assert.equal(pollingTimeoutMs, 60000, "audio-only outgoing call must start 60s answer polling");
+    } finally {
+        FaceTimeSession.prototype.ensureOutgoingAnswerPolling = origPolling;
+        mgr.clearSessions();
+    }
+});
+
+test("FaceTimeSession notifies FaceTimeAudioBridge.onCallAnswered on OUTGOING -> ANSWERED and guards no-answer timeout race", async () => {
+    const mgr = FaceTimeSessionManager();
+    mgr.clearSessions();
+    privateApiCalls.length = 0;
+
+    try {
+        const s1 = new FaceTimeSession({
+            callUuid: "call-race-answer-1",
+            status: FaceTimeSessionStatus.OUTGOING,
+            isOutgoing: true,
+            isVideo: true,
+            addToManager: true
+        });
+        const pollPromise = s1.ensureOutgoingAnswerPolling(60);
+        // Late answer before timeout fires
+        s1.setStatus(FaceTimeSessionStatus.ANSWERED);
+        s1.emit("answered", true);
+        const answered = await pollPromise;
+        assert.equal(answered, true);
+        assert.ok(
+            privateApiCalls.some(c => c.method === "bridgeOnCallAnswered" && c.args[0] === "call-race-answer-1"),
+            "OUTGOING -> ANSWERED must notify FaceTimeAudioBridge.onCallAnswered"
+        );
+        // Wait past timeout window to ensure no late no_answer invalidation occurs
+        await new Promise(r => setTimeout(r, 80));
+        assert.equal(s1.status, FaceTimeSessionStatus.ANSWERED);
+        assert.equal(s1.endedReason, null);
+        assert.equal(privateApiCalls.some(c => c.method === "leaveCall"), false);
+
+        // Non-OUTGOING transitions (CONNECTING, UNKNOWN, INCOMING -> ANSWERED) also notify bridge once
+        for (const [idx, initialStatus] of [
+            FaceTimeSessionStatus.CONNECTING,
+            FaceTimeSessionStatus.UNKNOWN,
+            FaceTimeSessionStatus.INCOMING
+        ].entries()) {
+            privateApiCalls.length = 0;
+            const id = `call-any-answer-${idx}`;
+            const s = new FaceTimeSession({
+                callUuid: id,
+                status: initialStatus,
+                isVideo: true,
+                addToManager: true
+            });
+            s.setStatus(FaceTimeSessionStatus.ANSWERED);
+            assert.equal(
+                privateApiCalls.filter(c => c.method === "bridgeOnCallAnswered" && c.args[0] === id).length,
+                1,
+                `transition from ${initialStatus} -> ANSWERED must notify FaceTimeAudioBridge.onCallAnswered`
+            );
+            // Re-setting ANSWERED -> ANSWERED does not refire
+            s.setStatus(FaceTimeSessionStatus.ANSWERED);
+            assert.equal(
+                privateApiCalls.filter(c => c.method === "bridgeOnCallAnswered" && c.args[0] === id).length,
+                1
+            );
+        }
+    } finally {
+        mgr.clearSessions();
+    }
+});
+
+test("Direct FaceTime calls/answers/handoffs avoid link generation even with mode='video' on call(), while create() generates links", async () => {
+    resetState();
+    const mgr = FaceTimeSessionManager();
+    let admitAndLeaveCalls = 0;
+    let admitSelfCalls = 0;
+    let pollingTimeoutMs: number | undefined;
+    const origAdmitAndLeave = FaceTimeSession.prototype.admitAndLeave;
+    const origAdmitSelf = FaceTimeSession.prototype.admitSelf;
+    const origPolling = FaceTimeSession.prototype.ensureOutgoingAnswerPolling;
+    const origAnswerCall = mockServerInstance.privateApi.facetime.answerCall;
+
+    FaceTimeSession.prototype.admitAndLeave = async function () {
+        admitAndLeaveCalls += 1;
+    };
+    FaceTimeSession.prototype.admitSelf = async function () {
+        admitSelfCalls += 1;
+    };
+    FaceTimeSession.prototype.ensureOutgoingAnswerPolling = function (ringTimeoutMs = 60000) {
+        pollingTimeoutMs = ringTimeoutMs;
+        return Promise.resolve(false);
+    };
+    mockServerInstance.privateApi.facetime.answerCall = async (uuid: string) => {
+        const res = await origAnswerCall(uuid);
+        const s = mgr.findSession(uuid);
+        if (s) {
+            s.conversationHasJoined = true;
+            s.setStatus(FaceTimeSessionStatus.ANSWERED);
+            s.emit("answered", true);
+            s.emit("updated");
+        }
+        return res;
+    };
+
+    try {
+        // 1. Direct 1:1 & group video calls (default & mode: "video_bridge") never generate links or admitAndLeave
+        const direct1v1 = await FaceTimeInterface.call({
+            addresses: ["+15551234001"],
+            video: true
+        });
+        assert.equal("link" in direct1v1, false);
+        assert.equal(direct1v1.session.link, null);
+        assert.equal(direct1v1.session.is_video, true);
+        assert.equal(pollingTimeoutMs, 60000);
+        assert.equal(privateApiCalls.some(c => c.method === "generateLink"), false);
+        assert.equal(admitAndLeaveCalls, 0);
+
+        mgr.clearSessions();
+        privateApiCalls.length = 0;
+        const directGroupBridge = await FaceTimeInterface.call({
+            addresses: ["+15551234002", "+15551234003"],
+            video: true,
+            mode: "video_bridge"
+        });
+        assert.equal("link" in directGroupBridge, false);
+        assert.equal(directGroupBridge.session.is_group, true);
+        assert.equal(directGroupBridge.session.is_video, true);
+        assert.equal(privateApiCalls.some(c => c.method === "generateLink"), false);
+        assert.equal(admitAndLeaveCalls, 0);
+
+        // 2. Even with mode: "video", direct call() with addresses must NEVER generate a link or admitAndLeave
+        mgr.clearSessions();
+        privateApiCalls.length = 0;
+        pollingTimeoutMs = undefined;
+        const modeVideoDirectCall = await FaceTimeInterface.call({
+            addresses: ["+15551234004"],
+            video: true,
+            mode: "video"
+        });
+        assert.equal("link" in modeVideoDirectCall, false);
+        assert.equal(modeVideoDirectCall.session.link, null);
+        assert.equal(pollingTimeoutMs, 60000);
+        assert.equal(privateApiCalls.some(c => c.method === "generateLink"), false);
+        assert.equal(admitAndLeaveCalls, 0);
+
+        // 3. Explicit create() keeps is_link_only: true and generates link + calls admitAndLeave
+        mgr.clearSessions();
+        privateApiCalls.length = 0;
+        admitAndLeaveCalls = 0;
+        const created = await FaceTimeInterface.create({ displayName: "Room" });
+        assert.ok(created.link.includes("https://facetime.apple.com/join"));
+        assert.equal(created.session.is_link_only, true);
+        assert.equal(privateApiCalls.some(c => c.method === "generateLink"), true);
+        assert.equal(admitAndLeaveCalls, 1);
+
+        // 4. Direct answer() (default & video_bridge & audio) calls answerCall directly without link/admit/mute
+        mgr.clearSessions();
+        privateApiCalls.length = 0;
+        admitAndLeaveCalls = 0;
+        new FaceTimeSession({
+            callUuid: "in-direct-vid",
+            status: FaceTimeSessionStatus.INCOMING,
+            isVideo: true,
+            isAudio: false
+        });
+        const ansVideo = await FaceTimeInterface.answer("in-direct-vid", false);
+        assert.equal(ansVideo.link, null);
+        assert.equal(ansVideo.audioOnly, false);
+        assert.equal(ansVideo.session.status_id, FaceTimeSessionStatus.ANSWERED);
+        assert.equal(ansVideo.session.is_video, true);
+        assert.equal(ansVideo.session.is_audio, false);
+        assert.equal(privateApiCalls.some(c => c.method === "answerCall" && c.args[0] === "in-direct-vid"), true);
+        assert.equal(privateApiCalls.some(c => c.method === "generateLink"), false);
+        assert.equal(privateApiCalls.some(c => c.method === "setMuted"), false);
+        assert.equal(admitAndLeaveCalls, 0);
+
+        privateApiCalls.length = 0;
+        new FaceTimeSession({
+            callUuid: "in-direct-aud",
+            status: FaceTimeSessionStatus.INCOMING,
+            isVideo: false,
+            isAudio: true
+        });
+        const ansPreservedAudio = await FaceTimeInterface.answer("in-direct-aud", false);
+        assert.equal(ansPreservedAudio.link, null);
+        assert.equal(ansPreservedAudio.session.is_audio, true);
+        assert.equal(ansPreservedAudio.session.is_video, false);
+
+        const ansModeAudio = await FaceTimeInterface.answer("in-direct-vid", false, { mode: "audio" });
+        assert.equal(ansModeAudio.audioOnly, true);
+        assert.equal(ansModeAudio.link, null);
+        assert.equal(ansModeAudio.session.is_audio, true);
+        assert.equal(ansModeAudio.session.is_video, false);
+
+        // 5. Explicit mode: "video" on answer() generates link and mutes Mac
+        privateApiCalls.length = 0;
+        admitAndLeaveCalls = 0;
+        new FaceTimeSession({
+            callUuid: "in-link-vid",
+            status: FaceTimeSessionStatus.INCOMING,
+            isVideo: true
+        });
+        const ansLink = await FaceTimeInterface.answer("in-link-vid", false, { mode: "video" });
+        assert.ok(ansLink.link?.includes("https://facetime.apple.com/join"));
+        assert.equal(privateApiCalls.some(c => c.method === "generateLink"), true);
+        assert.equal(privateApiCalls.some(c => c.method === "setMuted" && c.args[0] === "in-link-vid" && c.args[1] === true), true);
+        assert.equal(admitAndLeaveCalls, 1);
+
+        // 6. Default handoff() uses video_bridge for video calls (no generateLink / admitSelf) and audio for audio calls
+        privateApiCalls.length = 0;
+        admitSelfCalls = 0;
+        new FaceTimeSession({
+            callUuid: "handoff-vid-default",
+            status: FaceTimeSessionStatus.ANSWERED,
+            isVideo: true,
+            isAudio: false
+        });
+        const handoffDefaultVid = await FaceTimeInterface.handoff("handoff-vid-default", {
+            deviceId: "web-1",
+            deviceName: "Chrome"
+        });
+        assert.equal(handoffDefaultVid.link, null);
+        assert.equal(handoffDefaultVid.session.is_video, true);
+        assert.equal(privateApiCalls.some(c => c.method === "generateLink"), false);
+        assert.equal(admitSelfCalls, 0);
+
+        const handoffExplicitLink = await FaceTimeInterface.handoff("handoff-vid-default", {
+            deviceId: "web-2",
+            mode: "video"
+        });
+        assert.ok(handoffExplicitLink.link?.includes("https://facetime.apple.com/join"));
+        assert.equal(privateApiCalls.some(c => c.method === "generateLink"), true);
+        assert.equal(admitSelfCalls, 1);
+
+        // 7. FaceTimeRouter forwards mode and omits null link in answer()
+        mgr.clearSessions();
+        privateApiCalls.length = 0;
+        const routerCallCtx: any = {
+            request: { body: { addresses: ["+15551234005"], video: true, mode: "video_bridge" } },
+            status: 200,
+            body: null
+        };
+        await FaceTimeRouter.call(routerCallCtx, async () => {});
+        assert.equal("link" in routerCallCtx.body.data, false);
+        assert.equal(privateApiCalls.some(c => c.method === "generateLink"), false);
+
+        const routerAnswerDirectCtx: any = {
+            params: { call_uuid: "router-direct-ans" },
+            request: { body: { mode: "video_bridge" }, query: {} },
+            status: 200,
+            body: null
+        };
+        await FaceTimeRouter.answer(routerAnswerDirectCtx, async () => {});
+        assert.equal("link" in routerAnswerDirectCtx.body.data, false);
+        assert.equal(routerAnswerDirectCtx.body.data.audioOnly, false);
+        assert.equal(routerAnswerDirectCtx.body.data.callUuid, "router-direct-ans");
+        assert.equal(routerAnswerDirectCtx.body.data.session.status, "answered");
+
+        const routerAnswerLinkCtx: any = {
+            params: { call_uuid: "router-link-ans" },
+            request: { body: { mode: "video" }, query: {} },
+            status: 200,
+            body: null
+        };
+        await FaceTimeRouter.answer(routerAnswerLinkCtx, async () => {});
+        assert.ok(routerAnswerLinkCtx.body.data.link.includes("https://facetime.apple.com/join"));
+    } finally {
+        FaceTimeSession.prototype.admitAndLeave = origAdmitAndLeave;
+        FaceTimeSession.prototype.admitSelf = origAdmitSelf;
+        FaceTimeSession.prototype.ensureOutgoingAnswerPolling = origPolling;
+        mockServerInstance.privateApi.facetime.answerCall = origAnswerCall;
+        mgr.clearSessions();
+    }
+});
+
+test("FaceTimeSession.fromEvent keeps 1:1 outgoing TUDialRequest ANSWERED without conversation UUIDs", () => {
+    const oneToOne = FaceTimeSession.fromEvent({
+        call_uuid: "direct-1v1-1",
+        call_status: FaceTimeSessionStatus.ANSWERED,
+        is_outgoing: true,
+        is_conversation: true,
+        is_telephony: false,
+        active_non_lightweight_participants_count: 0
+    });
+    assert.equal(oneToOne.status, FaceTimeSessionStatus.ANSWERED);
+
+    const groupWithGroupUuid = FaceTimeSession.fromEvent({
+        call_uuid: "gft-1",
+        conversation_group_uuid: "grp-1",
+        call_status: FaceTimeSessionStatus.ANSWERED,
+        is_outgoing: true,
+        is_conversation: true,
+        is_telephony: false,
+        active_non_lightweight_participants_count: 0
+    });
+    assert.equal(groupWithGroupUuid.status, FaceTimeSessionStatus.OUTGOING);
+});
+
+test("cleanupLinks and PrivateApiFaceTime.removeLink reject missing or blank url", async () => {
+    resetState();
+
+    for (const badBody of [undefined, {}, { url: "" }, { url: "   " }, { url: null }, { url: 123 }]) {
+        const ctx: any = {
+            request: { body: badBody },
+            status: 200,
+            body: null
+        };
+        await assert.rejects(
+            () => FaceTimeRouter.cleanupLinks(ctx, async () => {}),
+            (err: any) => err?.name === "BadRequest" && err?.status === 400
+        );
+    }
+    assert.equal(privateApiCalls.length, 0, "rejected cleanupLinks requests must never invoke removeLink");
+
+    const okCtx: any = {
+        request: { body: { url: "  https://facetime.apple.com/join#v=1&p=clean123  " } },
+        status: 200,
+        body: null
+    };
+    await FaceTimeRouter.cleanupLinks(okCtx, async () => {});
+    assert.equal(privateApiCalls.length, 1);
+    assert.deepEqual(privateApiCalls[0], {
+        method: "removeLink",
+        args: ["https://facetime.apple.com/join#v=1&p=clean123"]
+    });
+
+    const sentApiMessages: Array<{ action: string; data: Record<string, any> }> = [];
+    const ftApi = new PrivateApiFaceTime({
+        hasClient: () => true,
+        server: {},
+        writeData: async (action: string, data: Record<string, any>, transaction?: any) => {
+            sentApiMessages.push({ action, data });
+            transaction?.resolve?.("ok", { removed: true });
+            return { data: { removed: true } } as any;
+        }
+    } as any);
+
+    for (const badUrl of [undefined, "", "   ", null as any]) {
+        await assert.rejects(
+            () => ftApi.removeLink(badUrl),
+            /url is required/
+        );
+    }
+    assert.equal(sentApiMessages.length, 0, "PrivateApiFaceTime.removeLink must not send IPC without a url");
+
+    await ftApi.removeLink("  https://facetime.apple.com/join#v=1&p=clean456  ");
+    assert.deepEqual(sentApiMessages, [
+        {
+            action: "remove-facetime-link",
+            data: { url: "https://facetime.apple.com/join#v=1&p=clean456" }
+        }
+    ]);
 });

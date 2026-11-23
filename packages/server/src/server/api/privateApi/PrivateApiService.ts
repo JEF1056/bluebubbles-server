@@ -430,9 +430,12 @@ export class PrivateApiService extends Loggable {
 
         try {
             if (this.server) {
-                this.server.removeAllListeners();
-                this.server.close();
+                const srv = this.server;
                 this.server = null;
+                srv.removeAllListeners();
+                await new Promise<void>(resolve => {
+                    srv.close(() => resolve());
+                });
             }
         } catch (error: any) {
             this.log.debug(`Failed to stop Private API Helper! Error: ${error.toString()}`);

@@ -20,6 +20,14 @@ export class PrivateApiTypingEventHandler implements PrivateApiEventHandler {
 
         // If the guid hasn't been seen before, we should emit the event
         const now = new Date().getTime();
+        if (!display) {
+            if (this.cache[guid]?.lastValue === true) {
+                delete this.cache[guid];
+                Server().emitMessage(TYPING_INDICATOR, { display: false, guid }, "normal", false);
+            }
+            return;
+        }
+
         if (!Object.keys(this.cache).includes(guid)) {
             shouldEmit = true;
         } else {

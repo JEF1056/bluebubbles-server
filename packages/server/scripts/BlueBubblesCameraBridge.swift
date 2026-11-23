@@ -1,3 +1,4 @@
+import AVFoundation
 import CoreMedia
 import CoreVideo
 import Darwin
@@ -6,15 +7,15 @@ import VideoToolbox
 
 // Build: ./scripts/build-video-bridge.sh
 
-private let defaultRingPath = "/private/tmp/FaceTime/bb-camera.ring"
-private let ringDirPath = "/private/tmp/FaceTime"
+private let defaultRingPath = "/private/var/tmp/AVConference/bb-camera.ring"
+private let ringDirPath = "/private/var/tmp/AVConference"
 private let ringMagic: UInt32 = 0x42424352 // 'BBCR'
 private let ringVersion: UInt32 = 1
 private let ringPixelFormat: UInt32 = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange // '420v' = 0x34323076
 private let ringSlots: UInt32 = 3
-private let maxRingWidth = 1280
-private let maxRingHeight = 720
-private let maxSlotBytes = maxRingWidth * maxRingHeight * 3 / 2 // 1,382,400 bytes
+private let maxRingDim = 1920
+private let maxRingPixels = 1920 * 1080
+private let maxSlotBytes = maxRingPixels * 3 / 2 // 3,110,400 bytes
 private let ringHeaderSize = 64
 private let ringTotalSize = ringHeaderSize + Int(ringSlots) * maxSlotBytes
 private let maxInputFrameBytes = 4 * 1024 * 1024
@@ -112,26 +113,7 @@ final class CameraRingWriter {
         }
 
         let uid = getuid()
-        // Reuse existing valid regular ring owned by us without ftruncate to avoid reader SIGBUS
-        let existingFd = open(path, O_RDWR | O_NOFOLLOW, 0)
-        if existingFd >= 0 {
-            var st = stat()
-            if fstat(existingFd, &st) == 0,
-               (st.st_mode & S_IFMT) == S_IFREG,
-               st.st_uid == uid,
-               st.st_size == off_t(ringTotalSize) {
-                fchmod(existingFd, 0o644)
-                let ptr = mmap(nil, ringTotalSize, PROT_READ | PROT_WRITE, MAP_SHARED, existingFd, 0)
-                if ptr != MAP_FAILED, let base = ptr {
-                    self.fd = existingFd
-                    self.mappedBase = base
-                    initializeHeaderIfNeeded()
-                    return
-                }
-            }
-            close(existingFd)
-        }
-
+        // Always recreate via temp+rename so stale rings are replaced without ftruncate SIGBUS on active readers
         let tmpPath = "\(path).tmp.\(getpid())"
         unlink(tmpPath)
         let opened = open(tmpPath, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0o644)
@@ -278,7 +260,7 @@ final class CameraRingWriter {
         let sourceBuffer = prepareFitBuffer(pixelBuffer)
         let width = CVPixelBufferGetWidth(sourceBuffer) & ~1
         let height = CVPixelBufferGetHeight(sourceBuffer) & ~1
-        guard width >= 2, height >= 2, width <= maxRingWidth, height <= maxRingHeight else { return }
+        guard width >= 2, height >= 2, width <= maxRingDim, height <= maxRingDim, width * height <= maxRingPixels else { return }
         guard CVPixelBufferGetPlaneCount(sourceBuffer) >= 2 else { return }
 
         let stride = width
@@ -349,11 +331,13 @@ final class CameraRingWriter {
         let srcW = CVPixelBufferGetWidth(pixelBuffer)
         let srcH = CVPixelBufferGetHeight(pixelBuffer)
         let fmt = CVPixelBufferGetPixelFormatType(pixelBuffer)
-        if srcW <= maxRingWidth && srcH <= maxRingHeight && fmt == ringPixelFormat {
+        if srcW <= maxRingDim && srcH <= maxRingDim && srcW * srcH <= maxRingPixels && fmt == ringPixelFormat {
             return pixelBuffer
         }
 
-        let scale = min(1.0, min(Double(maxRingWidth) / Double(max(1, srcW)), Double(maxRingHeight) / Double(max(1, srcH))))
+        let boxW = srcW >= srcH ? 1920 : 1080
+        let boxH = srcW >= srcH ? 1080 : 1920
+        let scale = min(1.0, min(Double(boxW) / Double(max(1, srcW)), Double(boxH) / Double(max(1, srcH))))
         let dstW = max(2, Int(Double(srcW) * scale) & ~1)
         let dstH = max(2, Int(Double(srcH) * scale) & ~1)
 
@@ -400,6 +384,7 @@ final class H264Decoder {
     private var latestPPS: Data?
     private var activeSPS: Data?
     private var activePPS: Data?
+    private var frameCounter: Int64 = 0
     private let onDecodedFrame: (CVPixelBuffer) -> Void
 
     init(onDecodedFrame: @escaping (CVPixelBuffer) -> Void) {
@@ -425,6 +410,7 @@ final class H264Decoder {
         formatDescription = nil
         activeSPS = nil
         activePPS = nil
+        frameCounter = 0
         lock.unlock()
         if let session = session {
             VTDecompressionSessionWaitForAsynchronousFrames(session)
@@ -512,9 +498,11 @@ final class H264Decoder {
 
         var sampleBuffer: CMSampleBuffer?
         var sampleSize = avccData.count
+        let pts = CMTime(value: frameCounter, timescale: targetFPS)
+        frameCounter &+= 1
         var timing = CMSampleTimingInfo(
             duration: CMTime(value: 1, timescale: targetFPS),
-            presentationTimeStamp: .zero,
+            presentationTimeStamp: pts,
             decodeTimeStamp: .invalid
         )
         let sbStatus = CMSampleBufferCreateReady(
@@ -965,7 +953,25 @@ intSource.setEventHandler {
 }
 intSource.resume()
 
+private func warnIfAllCamerasSuspended() {
+    var deviceTypes: [AVCaptureDevice.DeviceType] = [.builtInWideAngleCamera]
+    if #available(macOS 14.0, *) {
+        deviceTypes.append(.external)
+    } else {
+        deviceTypes.append(.externalUnknown)
+    }
+    let session = AVCaptureDevice.DiscoverySession(deviceTypes: deviceTypes, mediaType: .video, position: .unspecified)
+    let devices = session.devices
+    if devices.isEmpty {
+        log("Warning: no macOS video capture devices found; FaceTime camera uplink will be unavailable")
+    } else if devices.allSatisfy({ $0.isSuspended }) {
+        let names = devices.map { $0.localizedName }.joined(separator: ", ")
+        log("Note: all macOS cameras are suspended (clamshell mode): [\(names)]; using BlueBubblesCameraHook synthetic pump")
+    }
+}
+
 log("Starting FaceTime camera uplink bridge (ring=\(defaultRingPath))")
+warnIfAllCamerasSuspended()
 
 while true {
     let hdr = readExactFromStdin(4)
