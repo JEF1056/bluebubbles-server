@@ -240,8 +240,19 @@ final class AudioBridge {
     private let muteLock = NSLock()
     private var voiceIsolationEnabled = true
     private var running = true
-    private var tapMonoScratch = [Float](repeating: 0, count: 4096)
-    private var uplinkMonoScratch = [Float](repeating: 0, count: 4096)
+    private var isRunning: Bool {
+        tapLifecycleLock.lock()
+        defer { tapLifecycleLock.unlock() }
+        return running
+    }
+    private static let maxIoFrames = 16384
+    private let tapMonoScratch = UnsafeMutablePointer<Float>.allocate(capacity: maxIoFrames)
+    private let uplinkMonoScratch = UnsafeMutablePointer<Float>.allocate(capacity: maxIoFrames)
+
+    deinit {
+        tapMonoScratch.deallocate()
+        uplinkMonoScratch.deallocate()
+    }
 
     private let statsLock = NSLock()
     private var statsTimer: DispatchSourceTimer?
@@ -413,7 +424,7 @@ final class AudioBridge {
             var delay: TimeInterval = 0.5
             var elapsed: TimeInterval = 0
             var loggedSlowWait = false
-            while self.running {
+            while self.isRunning {
                 self.tapLifecycleLock.lock()
                 let hasTap = self.tapID != kAudioObjectUnknown
                 self.tapLifecycleLock.unlock()
@@ -485,31 +496,25 @@ final class AudioBridge {
             if abl.count == 1 {
                 guard let first = abl.first, let mData = first.mData, first.mDataByteSize > 0 else { return }
                 let ch = max(1, Int(first.mNumberChannels))
-                let frames = (Int(first.mDataByteSize) / MemoryLayout<Float>.size) / ch
+                let rawFrames = (Int(first.mDataByteSize) / MemoryLayout<Float>.size) / ch
+                let frames = min(rawFrames, AudioBridge.maxIoFrames)
                 guard frames > 0 else { return }
                 let ptr = mData.assumingMemoryBound(to: Float.self)
                 if ch == 1 {
                     self.downlinkRing.push(ptr, length: frames)
                     self.recordDownlinkIo(ptr, frames: frames)
                 } else {
-                    if self.tapMonoScratch.count < frames {
-                        self.tapMonoScratch = [Float](repeating: 0, count: frames)
-                    }
                     let invCh = 1.0 / Float(ch)
                     for i in 0..<frames {
                         var sum: Float = 0
                         for c in 0..<ch { sum += ptr[i * ch + c] }
                         self.tapMonoScratch[i] = sum * invCh
                     }
-                    self.tapMonoScratch.withUnsafeBufferPointer { bp in
-                        if let base = bp.baseAddress {
-                            self.downlinkRing.push(base, length: frames)
-                            self.recordDownlinkIo(base, frames: frames)
-                        }
-                    }
+                    self.downlinkRing.push(self.tapMonoScratch, length: frames)
+                    self.recordDownlinkIo(self.tapMonoScratch, frames: frames)
                 }
             } else {
-                var frames = Int.max
+                var frames = AudioBridge.maxIoFrames
                 var totalChannels = 0
                 for buf in abl {
                     guard buf.mData != nil, buf.mDataByteSize > 0 else { continue }
@@ -520,11 +525,8 @@ final class AudioBridge {
                         totalChannels += bCh
                     }
                 }
-                guard totalChannels > 0, frames > 0, frames < Int.max else { return }
-                if self.tapMonoScratch.count < frames {
-                    self.tapMonoScratch = [Float](repeating: 0, count: frames)
-                }
-                for i in 0..<frames { self.tapMonoScratch[i] = 0 }
+                guard totalChannels > 0, frames > 0 else { return }
+                memset(self.tapMonoScratch, 0, frames * MemoryLayout<Float>.size)
                 for buf in abl {
                     guard let mData = buf.mData, buf.mDataByteSize > 0 else { continue }
                     let bCh = max(1, Int(buf.mNumberChannels))
@@ -541,12 +543,8 @@ final class AudioBridge {
                 }
                 let invCh = 1.0 / Float(totalChannels)
                 for i in 0..<frames { self.tapMonoScratch[i] *= invCh }
-                self.tapMonoScratch.withUnsafeBufferPointer { bp in
-                    if let base = bp.baseAddress {
-                        self.downlinkRing.push(base, length: frames)
-                        self.recordDownlinkIo(base, frames: frames)
-                    }
-                }
+                self.downlinkRing.push(self.tapMonoScratch, length: frames)
+                self.recordDownlinkIo(self.tapMonoScratch, frames: frames)
             }
         }
         guard ioStatus == noErr, let validProc = procID else {
@@ -560,12 +558,23 @@ final class AudioBridge {
         }
         self.tapIOProcID = validProc
         self.tappedProcessObjectIDs = processObjectIDs.sorted()
-        AudioDeviceStart(newAggID, validProc)
+        let startStatus = AudioDeviceStart(newAggID, validProc)
+        if startStatus != noErr {
+            fputs("[BlueBubblesAudioBridge] AudioDeviceStart failed for aggregate device: \(startStatus)\n", stderr)
+            AudioDeviceDestroyIOProcID(newAggID, validProc)
+            AudioHardwareDestroyAggregateDevice(newAggID)
+            AudioHardwareDestroyProcessTap(newTapID)
+            self.aggregateDeviceID = kAudioObjectUnknown
+            self.tapID = kAudioObjectUnknown
+            self.tapIOProcID = nil
+            return false
+        }
         fputs("[BlueBubblesAudioBridge] CoreAudio Process Tap started for \(processObjectIDs.count) process(es): \(self.tappedProcessObjectIDs)\n", stderr)
         return true
     }
 
     private func setupUplinkBlackHole() {
+        guard isRunning else { return }
         guard let devID = findDevice(named: "BlackHole 2ch", scope: kAudioDevicePropertyScopeOutput) else {
             fputs("[BlueBubblesAudioBridge] Warning: BlackHole 2ch output device not found; uplink audio disabled\n", stderr)
             return
@@ -584,14 +593,14 @@ final class AudioBridge {
                 inputRestoreLock.unlock()
             }
         }
-        self.outDeviceID = devID
         var procID: AudioDeviceIOProcID?
         let status = AudioDeviceCreateIOProcIDWithBlock(&procID, devID, nil) { [weak self] _, _, _, outOutputData, _ in
             guard let self = self else { return }
             let abl = UnsafeMutableAudioBufferListPointer(outOutputData)
             guard let first = abl.first, first.mData != nil, first.mDataByteSize > 0 else { return }
             let firstCh = max(1, Int(first.mNumberChannels))
-            let frames = (Int(first.mDataByteSize) / MemoryLayout<Float>.size) / firstCh
+            let rawFrames = (Int(first.mDataByteSize) / MemoryLayout<Float>.size) / firstCh
+            let frames = min(rawFrames, AudioBridge.maxIoFrames)
             guard frames > 0 else { return }
 
             self.muteLock.lock()
@@ -607,15 +616,9 @@ final class AudioBridge {
                 return
             }
 
-            if self.uplinkMonoScratch.count < frames {
-                self.uplinkMonoScratch = [Float](repeating: 0, count: frames)
-            }
-            let popped = self.uplinkMonoScratch.withUnsafeMutableBufferPointer { bp -> Int in
-                guard let base = bp.baseAddress else { return 0 }
-                return self.uplinkRing.pop(into: base, length: frames)
-            }
+            let popped = self.uplinkRing.pop(into: self.uplinkMonoScratch, length: frames)
             if popped < frames {
-                for i in popped..<frames { self.uplinkMonoScratch[i] = 0 }
+                memset(self.uplinkMonoScratch.advanced(by: popped), 0, (frames - popped) * MemoryLayout<Float>.size)
             }
             self.recordUplinkIo(frames: frames)
 
@@ -626,11 +629,7 @@ final class AudioBridge {
                 guard bFrames > 0 else { continue }
                 let dst = mData.assumingMemoryBound(to: Float.self)
                 if bCh == 1 {
-                    self.uplinkMonoScratch.withUnsafeBufferPointer { bp in
-                        if let base = bp.baseAddress {
-                            memcpy(dst, base, bFrames * MemoryLayout<Float>.size)
-                        }
-                    }
+                    memcpy(dst, self.uplinkMonoScratch, bFrames * MemoryLayout<Float>.size)
                 } else {
                     for i in 0..<bFrames {
                         let s = self.uplinkMonoScratch[i]
@@ -640,8 +639,24 @@ final class AudioBridge {
             }
         }
         if status == noErr, let validProc = procID {
+            tapLifecycleLock.lock()
+            guard running else {
+                tapLifecycleLock.unlock()
+                AudioDeviceDestroyIOProcID(devID, validProc)
+                return
+            }
+            self.outDeviceID = devID
             self.outIOProcID = validProc
-            AudioDeviceStart(devID, validProc)
+            let startStatus = AudioDeviceStart(devID, validProc)
+            if startStatus != noErr {
+                fputs("[BlueBubblesAudioBridge] AudioDeviceStart failed for uplink output device: \(startStatus)\n", stderr)
+                AudioDeviceDestroyIOProcID(devID, validProc)
+                self.outIOProcID = nil
+                self.outDeviceID = kAudioObjectUnknown
+                tapLifecycleLock.unlock()
+                return
+            }
+            tapLifecycleLock.unlock()
             fputs("[BlueBubblesAudioBridge] BlackHole 2ch uplink output started\n", stderr)
         }
     }
@@ -748,10 +763,10 @@ final class AudioBridge {
             pcmBuf.frameLength = AVAudioFrameCount(frameSamples)
             let compBuf = AVAudioCompressedBuffer(format: self.opusFormat, packetCapacity: 1, maximumPacketSize: 1500)
 
-            while self.running {
+            while self.isRunning {
                 guard let chData = pcmBuf.floatChannelData?[0] else { break }
                 let popped = self.downlinkRing.popOrWait(into: chData, length: frameSamples, timeout: 0.5)
-                guard popped == frameSamples, self.running else { continue }
+                guard popped == frameSamples, self.isRunning else { continue }
                 var fed = false
                 var err: NSError?
                 let status = encoder.convert(to: compBuf, error: &err) { _, outStatus in
@@ -778,22 +793,51 @@ final class AudioBridge {
         }
     }
 
+    private func readExactStdin(_ count: Int) -> (data: Data, eof: Bool, error: Bool) {
+        var buffer = Data(count: count)
+        var totalRead = 0
+        let result: (eof: Bool, error: Bool) = buffer.withUnsafeMutableBytes { rawBuf in
+            guard let base = rawBuf.baseAddress else { return (false, true) }
+            while totalRead < count {
+                let n = Darwin.read(STDIN_FILENO, base.advanced(by: totalRead), count - totalRead)
+                if n > 0 {
+                    totalRead += n
+                } else if n == 0 {
+                    return (true, false)
+                } else {
+                    if errno == EINTR { continue }
+                    return (false, true)
+                }
+            }
+            return (false, false)
+        }
+        if result.eof || result.error {
+            return (Data(), result.eof, result.error)
+        }
+        return (buffer, false, false)
+    }
+
     private func readStdinLoop() {
-        let stdin = FileHandle.standardInput
-        while running {
-            let header = stdin.readData(ofLength: 5)
-            if header.count < 5 {
+        while isRunning {
+            let headerRes = readExactStdin(5)
+            if headerRes.error || headerRes.eof {
                 stop()
                 break
             }
+            let header = headerRes.data
             let frameType = header[0]
             let length = header.subdata(in: 1..<5).withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
-            if length == 0 || length > 65_536 { continue }
-            let payload = stdin.readData(ofLength: Int(length))
-            if payload.count < Int(length) {
+            if length == 0 || length > 65_536 {
+                fputs("[BlueBubblesAudioBridge] Invalid stdin frame length: \(length); exiting\n", stderr)
                 stop()
                 break
             }
+            let payloadRes = readExactStdin(Int(length))
+            if payloadRes.error || payloadRes.eof {
+                stop()
+                break
+            }
+            let payload = payloadRes.data
             if frameType == 0x02 {
                 muteLock.lock()
                 isMuted = payload[0] != 0

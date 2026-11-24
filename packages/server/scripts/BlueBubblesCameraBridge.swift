@@ -76,31 +76,56 @@ final class CameraRingWriter {
         var st = stat()
         if lstat(dir, &st) == 0 {
             let fileType = st.st_mode & S_IFMT
-            if fileType == S_IFLNK || fileType != S_IFDIR || st.st_uid != uid {
-                try? FileManager.default.removeItem(atPath: dir)
+            if fileType == S_IFLNK || fileType != S_IFDIR {
+                log("Ring directory \(dir) is not a directory or is a symlink")
+                return false
+            }
+            if st.st_uid != uid {
+                log("Ring directory \(dir) UID mismatch: expected \(uid), got \(st.st_uid)")
+                return false
+            }
+        } else {
+            do {
+                try FileManager.default.createDirectory(
+                    atPath: dir,
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o755]
+                )
+                chmod(dir, 0o755)
+            } catch {
+                log("Failed to create ring directory \(dir): \(error.localizedDescription)")
+                return false
+            }
+            if lstat(dir, &st) != 0 {
+                log("lstat failed for ring directory \(dir): errno=\(errno)")
+                return false
+            }
+            let fileType = st.st_mode & S_IFMT
+            guard fileType == S_IFDIR, st.st_uid == uid else {
+                log("Unsafe ring directory \(dir)")
+                return false
             }
         }
-        do {
-            try FileManager.default.createDirectory(
-                atPath: dir,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o755]
-            )
-            chmod(dir, 0o755)
-        } catch {
-            log("Failed to create ring directory \(dir): \(error.localizedDescription)")
-            return false
-        }
-        if lstat(dir, &st) != 0 {
-            log("lstat failed for ring directory \(dir): errno=\(errno)")
-            return false
-        }
-        let fileType = st.st_mode & S_IFMT
-        guard fileType == S_IFDIR, st.st_uid == uid else {
-            log("Unsafe ring directory \(dir)")
-            return false
-        }
         return true
+    }
+
+    private static func sweepStaleTempFiles(in dir: String, prefix: String) {
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return }
+        let uid = getuid()
+        for file in files where file.hasPrefix(prefix) {
+            let fullPath = (dir as NSString).appendingPathComponent(file)
+            var st = stat()
+            guard lstat(fullPath, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG, st.st_uid == uid else { continue }
+            let suffix = String(file.dropFirst(prefix.count))
+            if let pid = pid_t(suffix) {
+                // If process is dead, reap orphaned temp ring
+                if kill(pid, 0) != 0 && errno == ESRCH {
+                    unlink(fullPath)
+                }
+            } else {
+                unlink(fullPath)
+            }
+        }
     }
 
     init?(path: String = defaultRingPath) {
@@ -111,6 +136,8 @@ final class CameraRingWriter {
         guard Self.ensureSafeRingDir(dir) else {
             return nil
         }
+        let filePrefix = (path as NSString).lastPathComponent + ".tmp."
+        Self.sweepStaleTempFiles(in: dir, prefix: filePrefix)
 
         let uid = getuid()
         // Always recreate via temp+rename so stale rings are replaced without ftruncate SIGBUS on active readers

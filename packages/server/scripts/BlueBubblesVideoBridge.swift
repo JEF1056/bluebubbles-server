@@ -340,6 +340,8 @@ final class VideoBridge: NSObject {
     private var ringMap: UnsafeMutableRawPointer?
     private var ringMapSize: Int = 0
     private var ringLastSeq: UInt64 = 0
+    private var ringIno: UInt64 = 0
+    private var ringLastStatCheckNs: UInt64 = 0
     private var ringPool: CVPixelBufferPool?
     private var ringPoolDims: (width: Int, height: Int) = (0, 0)
     private var rotatedPool: CVPixelBufferPool?
@@ -377,6 +379,10 @@ final class VideoBridge: NSObject {
                     return
                 }
                 lineBuf.append(contentsOf: buf[0..<n])
+                if lineBuf.count > 65_536 {
+                    log("Stdin lineBuf exceeded 64KB; resetting buffer")
+                    lineBuf.removeAll(keepingCapacity: false)
+                }
                 while let nlIdx = lineBuf.firstIndex(of: 0x0A) {
                     let lineData = lineBuf.subdata(in: lineBuf.startIndex..<nlIdx)
                     lineBuf.removeSubrange(lineBuf.startIndex...nlIdx)
@@ -406,7 +412,10 @@ final class VideoBridge: NSObject {
                 guard let self = self else { return }
                 if let w = maxW { self.ringMaxW = max(160, min(maxWidth, w)) }
                 if let h = maxH { self.ringMaxH = max(160, min(maxHeight, h)) }
-                if let f = fps { self.ringFPS = max(5, min(30, f)) }
+                if let f = fps {
+                    self.ringFPS = max(5, min(30, f))
+                    self.encoder?.updateFrameRate(self.ringFPS)
+                }
                 if let b = bitrate {
                     self.ringBitrate = max(100_000, min(maxBitrate, b))
                     self.encoder?.updateBitrate(self.ringBitrate)
@@ -426,11 +435,15 @@ final class VideoBridge: NSObject {
         }
     }
 
-    private static func nowNanoseconds() -> UInt64 {
+    private static let timebase: (numer: UInt64, denom: UInt64) = {
         var tb = mach_timebase_info_data_t(numer: 0, denom: 0)
         mach_timebase_info(&tb)
+        return (UInt64(tb.numer), UInt64(max(1, tb.denom)))
+    }()
+
+    private static func nowNanoseconds() -> UInt64 {
         let t = mach_continuous_time()
-        return UInt64((UInt64(t) * UInt64(tb.numer)) / UInt64(tb.denom))
+        return (UInt64(t) * timebase.numer) / timebase.denom
     }
 
     private func unmapDownlinkRing() {
@@ -444,6 +457,7 @@ final class VideoBridge: NSObject {
             ringFd = -1
         }
         ringLastSeq = 0
+        ringIno = 0
     }
 
     private func startDownlinkRingReader() {
@@ -475,9 +489,12 @@ final class VideoBridge: NSObject {
             ringMap = ptr
             ringMapSize = size
             ringLastSeq = 0
+            ringIno = UInt64(st.st_ino)
+            ringLastStatCheckNs = Self.nowNanoseconds()
         }
         guard let base = ringMap else { return }
 
+        let seq = base.load(fromByteOffset: 24, as: UInt64.self)
         OSMemoryBarrier()
         let magic = base.load(fromByteOffset: 0, as: UInt32.self)
         let version = base.load(fromByteOffset: 4, as: UInt32.self)
@@ -485,7 +502,6 @@ final class VideoBridge: NSObject {
         let height = Int(base.load(fromByteOffset: 12, as: UInt32.self))
         let stride = Int(base.load(fromByteOffset: 16, as: UInt32.self))
         let format = base.load(fromByteOffset: 20, as: UInt32.self)
-        let seq = base.load(fromByteOffset: 24, as: UInt64.self)
         let tsNs = base.load(fromByteOffset: 32, as: UInt64.self)
         let slots = Int(base.load(fromByteOffset: 40, as: UInt32.self))
         let slotBytes = Int(base.load(fromByteOffset: 44, as: UInt32.self))
@@ -493,26 +509,50 @@ final class VideoBridge: NSObject {
         let flags = base.load(fromByteOffset: 52, as: UInt32.self)
         let hasOrientation = (flags & 1) != 0
 
+        let nowNs = Self.nowNanoseconds()
+        if seq == 0 || (seq & 1) != 0 || seq == ringLastSeq {
+            if nowNs >= ringLastStatCheckNs + 1_000_000_000 {
+                ringLastStatCheckNs = nowNs
+                var diskSt = stat()
+                if stat(downlinkRingPath, &diskSt) == 0 && UInt64(diskSt.st_ino) != ringIno {
+                    unmapDownlinkRing()
+                }
+            }
+            return
+        }
+
         guard magic == 0x42424352, version == 1,
               format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
               slots >= 1, slotBytes > 0,
               width >= 2, height >= 2, width <= 1920, height <= 1920,
-              stride >= width,
-              seq > 0, seq != ringLastSeq else {
+              stride >= width else {
             return
         }
-        let needed = width * height + width * (height / 2)
-        guard needed <= slotBytes else { return }
+
+        let (totalRows, ovRows) = height.addingReportingOverflow(height / 2)
+        guard !ovRows else { return }
+        let (needed, ovNeeded) = stride.multipliedReportingOverflow(by: totalRows)
+        guard !ovNeeded, needed <= slotBytes else { return }
+
         let slotIdx = Int(seq % UInt64(slots))
-        let slotOffset = 64 + slotIdx * slotBytes
-        guard slotOffset + needed <= ringMapSize else {
+        let (slotOffsetBytes, ovSlotBytes) = slotIdx.multipliedReportingOverflow(by: slotBytes)
+        guard !ovSlotBytes else { return }
+        let (slotOffset, ovOffset) = 64.addingReportingOverflow(slotOffsetBytes)
+        guard !ovOffset else { return }
+        let (endOffset, ovEnd) = slotOffset.addingReportingOverflow(needed)
+        guard !ovEnd, endOffset <= ringMapSize else {
             unmapDownlinkRing()
             return
         }
 
-        let nowNs = Self.nowNanoseconds()
         let ageNs = nowNs >= tsNs ? (nowNs - tsNs) : 0
-        if ageNs > 1_500_000_000 { return }
+        if ageNs > 1_500_000_000 {
+            var diskSt = stat()
+            if stat(downlinkRingPath, &diskSt) == 0 && UInt64(diskSt.st_ino) != ringIno {
+                unmapDownlinkRing()
+            }
+            return
+        }
 
         if ringPool == nil || ringPoolDims != (width, height) {
             ringPool = nil
@@ -554,10 +594,11 @@ final class VideoBridge: NSObject {
 
         OSMemoryBarrier()
         let seqAfter = base.load(fromByteOffset: 24, as: UInt64.self)
-        if seqAfter >= seq + UInt64(slots) {
+        if seqAfter != seq {
             return
         }
         ringLastSeq = seq
+        ringLastStatCheckNs = nowNs
         if !ringLoggedActive {
             ringLoggedActive = true
             log("Using direct decoded FaceTime stream (\(width)x\(height)) instead of screen capture")

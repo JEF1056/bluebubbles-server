@@ -48,12 +48,16 @@ function loadBridgeWithMocks(
         existsSync?: (p: string) => boolean;
         spawn?: (bin: string) => any;
         findSession?: (id: string) => { status: number } | null;
+        listActiveSessions?: () => Array<{ isVideo: boolean }>;
+        setCameraHookActiveFlag?: (active: boolean) => void;
     } = {}
 ) {
     const origLoad = (Module as any)._load;
     const noopLog = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
     const bridgePath = path.join(srcRoot, "server/api/lib/facetime/FaceTimeAudioBridge.ts");
+    const routesPath = path.join(srcRoot, "server/api/http/api/v1/socketForkRoutes.ts");
     delete require.cache[bridgePath];
+    delete require.cache[routesPath];
 
     (Module as any)._load = function (request: string) {
         if (request === "child_process") {
@@ -68,6 +72,12 @@ function loadBridgeWithMocks(
         if (request === "@server") {
             return { Server: () => null };
         }
+        if (request === "@server/env") {
+            return new Proxy({}, { get: () => () => true });
+        }
+        if (request === "./FaceTimeCameraHook") {
+            return { setCameraHookActiveFlag: options.setCameraHookActiveFlag ?? (() => {}) };
+        }
         if (request === "@server/fileSystem") {
             return { FileSystem: { resources: "/tmp/bb-resources" } };
         }
@@ -78,10 +88,14 @@ function loadBridgeWithMocks(
                 }
             };
         }
-        if (request === "./FacetimeSessionManager" && options.findSession) {
+        if (request === "@server/api/lib/facetime/FaceTimeAudioBridge") {
+            return require(bridgePath);
+        }
+        if (request === "./FacetimeSessionManager" || request === "@server/api/lib/facetime/FacetimeSessionManager") {
             return {
                 FaceTimeSessionManager: () => ({
-                    findSession: options.findSession
+                    findSession: options.findSession ?? (() => ({ status: 1 })),
+                    listActiveSessions: options.listActiveSessions ?? (() => [])
                 })
             };
         }
@@ -89,7 +103,10 @@ function loadBridgeWithMocks(
     };
 
     try {
-        return require(bridgePath);
+        return {
+            ...require(bridgePath),
+            ...require(routesPath)
+        };
     } finally {
         (Module as any)._load = origLoad;
     }
@@ -289,6 +306,135 @@ test("FaceTimeAudioBridge respawns exited audio/video/camera helpers with 1s/2s/
     } finally {
         globalThis.setTimeout = origSetTimeout;
         globalThis.clearTimeout = origClearTimeout;
+        bridge.cleanupAllSessions();
+        await clientPc.close().catch(() => {});
+    }
+});
+
+test("FaceTimeAudioBridge enforces single active bridge, valid session, case-insensitive cleanup, camera hook guard, and orphan/rebind/respawn fixes", async () => {
+    const cameraHookCalls: boolean[] = [];
+    let activeVideoSessions: Array<{ isVideo: boolean }> = [];
+    let sessionLookup: (id: string) => { status: number } | null = () => ({ status: 1 });
+    const spawned: any[] = [];
+
+    const { FaceTimeAudioBridge, registerForkSocketRoutes } = loadBridgeWithMocks({
+        existsSync: p => p.endsWith("BlueBubblesAudioBridge"),
+        spawn: (bin: string) => {
+            const proc = createMockProcess(bin);
+            spawned.push(proc);
+            return proc;
+        },
+        findSession: id => sessionLookup(id),
+        listActiveSessions: () => activeVideoSessions,
+        setCameraHookActiveFlag: active => cameraHookCalls.push(active)
+    });
+
+    const bridge = FaceTimeAudioBridge.getInstance();
+    bridge.cleanupAllSessions();
+
+    const clientPc = new RTCPeerConnection({ codecs: { audio: [useOPUS()] } });
+    clientPc.addTransceiver("audio", { direction: "sendrecv" });
+
+    try {
+        const offer = await clientPc.createOffer();
+
+        // P1 #7: refuse unknown or disconnected session
+        const rejected: Array<{ ev: string; data: any }> = [];
+        sessionLookup = () => null;
+        await bridge.handleOffer(
+            { id: "sock-1", emit: (ev: string, data: any) => rejected.push({ ev, data }) } as any,
+            { callUuid: "unknown-call", sdp: offer.sdp, type: "offer" }
+        );
+        assert.equal(rejected.some(e => e.ev === "ft-bridge-error"), true);
+        assert.equal(bridge.sessions.size, 0);
+
+        sessionLookup = () => ({ status: 6 }); // DISCONNECTED
+        await bridge.handleOffer(
+            { id: "sock-1", emit: (ev: string, data: any) => rejected.push({ ev, data }) } as any,
+            { callUuid: "ended-call", sdp: offer.sdp, type: "offer" }
+        );
+        assert.equal(rejected.filter(e => e.ev === "ft-bridge-error").length, 2);
+        assert.equal(bridge.sessions.size, 0);
+
+        // Start 1st active bridge
+        sessionLookup = () => ({ status: 1 });
+        await bridge.handleOffer(
+            { id: "sock-1", emit: () => {} } as any,
+            { callUuid: "Call-One-ABC", sdp: offer.sdp, type: "offer" }
+        );
+        assert.equal(bridge.sessions.size, 1);
+
+        // P0 #1: refuse 2nd bridge offer while one is active
+        const secondErrors: Array<{ ev: string; data: any }> = [];
+        await bridge.handleOffer(
+            { id: "sock-2", emit: (ev: string, data: any) => secondErrors.push({ ev, data }) } as any,
+            { callUuid: "Call-Two-DEF", sdp: offer.sdp, type: "offer" }
+        );
+        assert.equal(secondErrors.some(e => e.ev === "ft-bridge-error"), true);
+        assert.equal(bridge.sessions.has("Call-Two-DEF"), false);
+
+        // P0 #2: orphan timer skips cleanup when pc.connectionState === "connected", and rebindSocket clears timer
+        const session = bridge.sessions.get("Call-One-ABC")!;
+        Object.defineProperty(session.pc, "connectionState", { get: () => "connected", configurable: true });
+        bridge.orphanTimeoutMs = 10;
+        bridge.handleSocketDisconnect("sock-1");
+        await new Promise(r => setTimeout(r, 30));
+        assert.equal(bridge.sessions.has("Call-One-ABC"), true, "connected session must not be cleaned up by orphan timer");
+
+        // Rebind via socketForkRoutes ft-bridge-keyframe & check P1 #8 non-string guard
+        const handlers: Record<string, (...args: any[]) => any> = {};
+        const sock2 = {
+            id: "sock-2",
+            on: (ev: string, fn: (...args: any[]) => any) => {
+                handlers[ev] = fn;
+            },
+            emit: () => {}
+        };
+        registerForkSocketRoutes(sock2 as any, { debug: () => {} });
+        assert.doesNotThrow(() => handlers["ft-bridge-keyframe"]({ callUuid: 12345 }));
+        handlers["ft-bridge-keyframe"]({ callUuid: "call-one-abc" });
+        assert.equal(session.socketId, "sock-2");
+        assert.equal(session.orphanTimer, undefined);
+
+        // P1 #10: allow respawn during brief "disconnected" and reset attempt counter after >=30s healthy run
+        Object.defineProperty(session.pc, "connectionState", { get: () => "disconnected", configurable: true });
+        bridge.respawnBaseDelayMs = 10;
+        session.audioRestartAttempts = 2;
+        const origNow = Date.now;
+        let fakeNow = 1_000_000;
+        Date.now = () => fakeNow;
+        try {
+            const countBefore = spawned.length;
+            const prevProc = spawned.at(-1);
+            prevProc.emit("exit", 1);
+            assert.equal(session.audioRestartAttempts, 3);
+            await new Promise(r => setTimeout(r, 80));
+            assert.equal(spawned.length, countBefore + 1, "must respawn during brief disconnected");
+            fakeNow += 35_000;
+            spawned.at(-1).emit("exit", 1);
+            assert.equal(session.audioRestartAttempts, 1, "must reset attempts after >=30s healthy run");
+            await new Promise(r => setTimeout(r, 80));
+        } finally {
+            Date.now = origNow;
+        }
+
+        // P1 #6: do not clear camera hook while another active video session exists; P1 #5: case-insensitive cleanup
+        cameraHookCalls.length = 0;
+        activeVideoSessions = [{ isVideo: true }];
+        bridge.cleanupSession("call-one-abc");
+        assert.equal(bridge.sessions.size, 0);
+        assert.equal(cameraHookCalls.includes(false), false);
+
+        // Clears when no active video sessions remain
+        bridge.orphanTimeoutMs = 120_000;
+        await bridge.handleOffer(
+            { id: "sock-3", emit: () => {} } as any,
+            { callUuid: "Call-Three", sdp: offer.sdp, type: "offer" }
+        );
+        activeVideoSessions = [];
+        bridge.cleanupSession("call-three");
+        assert.equal(cameraHookCalls.includes(false), true);
+    } finally {
         bridge.cleanupAllSessions();
         await clientPc.close().catch(() => {});
     }

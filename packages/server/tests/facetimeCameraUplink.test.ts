@@ -88,7 +88,8 @@ function loadBridgeWithMocks(
         if (request === "./FacetimeSessionManager" || request === "@server/api/lib/facetime/FacetimeSessionManager") {
             return {
                 FaceTimeSessionManager: () => ({
-                    findSession: options.findSession ?? (() => null)
+                    findSession: options.findSession ?? (() => ({ status: 1 })),
+                    listActiveSessions: () => []
                 })
             };
         }
@@ -504,7 +505,8 @@ test("socketForkRoutes handles ft-bridge-camera and exposes videoUplinkSupported
         if (request === "./FacetimeSessionManager" || request === "@server/api/lib/facetime/FacetimeSessionManager") {
             return {
                 FaceTimeSessionManager: () => ({
-                    findSession: options.findSession ?? (() => null)
+                    findSession: options.findSession ?? (() => ({ status: 1 })),
+                    listActiveSessions: () => []
                 })
             };
         }

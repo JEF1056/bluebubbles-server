@@ -82,12 +82,22 @@ export class FaceTimeInterface {
         if (video && !isTelephony) {
             setCameraHookActiveFlag(true);
         }
-        const result = await Server().privateApi.facetime.startCall(addresses, video, isTelephony);
-        const uniqueProxyIdentifier: string | null =
-            result?.data?.unique_proxy_identifier ?? result?.data?.uniqueProxyIdentifier ?? null;
-        const rawCallUuid = result?.data?.call_uuid ?? result?.data?.callUUID ?? uniqueProxyIdentifier;
-        if (!rawCallUuid) {
-            throw new Error(result?.data?.error ?? "Failed to start FaceTime call: helper did not return call_uuid!");
+        let result: any;
+        let uniqueProxyIdentifier: string | null = null;
+        let rawCallUuid: string | null = null;
+        try {
+            result = await Server().privateApi.facetime.startCall(addresses, video, isTelephony);
+            uniqueProxyIdentifier =
+                result?.data?.unique_proxy_identifier ?? result?.data?.uniqueProxyIdentifier ?? null;
+            rawCallUuid = result?.data?.call_uuid ?? result?.data?.callUUID ?? uniqueProxyIdentifier;
+            if (!rawCallUuid) {
+                throw new Error(result?.data?.error ?? "Failed to start FaceTime call: helper did not return call_uuid!");
+            }
+        } catch (err) {
+            if (video && !isTelephony && !FaceTimeSessionManager().listActiveSessions().some(s => s.isVideo)) {
+                setCameraHookActiveFlag(false);
+            }
+            throw err;
         }
 
         const pregeneratedUrl: string | null = result?.data?.url ?? null;
@@ -401,6 +411,9 @@ export class FaceTimeInterface {
             const transient = new FaceTimeSession({ callUuid, addToManager: false });
             transient.invalidate(endedReason);
             FaceTimeSessionManager().broadcastUpdate(transient, true);
+        }
+        if (!FaceTimeSessionManager().listActiveSessions().some(s => s.isVideo)) {
+            setCameraHookActiveFlag(false);
         }
     }
 

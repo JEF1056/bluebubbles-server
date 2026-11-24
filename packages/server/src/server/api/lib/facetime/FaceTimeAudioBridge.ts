@@ -11,6 +11,8 @@ import {
     RTCPeerConnection,
     RTCRtpCodecParameters,
     RTCRtpTransceiver,
+    ReceiverEstimatedMaxBitrate,
+    RtcpPayloadSpecificFeedback,
     RtpHeader,
     RtpPacket,
     useAbsSendTime,
@@ -32,6 +34,7 @@ import { setCameraHookActiveFlag } from "./FaceTimeCameraHook";
 import { FaceTimeAdaptiveController } from "./FaceTimeAdaptiveController";
 
 const FACETIME_STATUS_OUTGOING = 3;
+const FACETIME_STATUS_DISCONNECTED = 6;
 let sessionManagerModule: typeof import("./FacetimeSessionManager") | null = null;
 try {
     sessionManagerModule = require("./FacetimeSessionManager");
@@ -47,11 +50,23 @@ function getFaceTimeSessionStatus(callUuid: string): number | null {
         return null;
     }
 }
+function hasActiveVideoFaceTimeSession(): boolean {
+    try {
+        sessionManagerModule ??= require("./FacetimeSessionManager");
+        return sessionManagerModule
+            .FaceTimeSessionManager()
+            .listActiveSessions()
+            .some(s => s.isVideo);
+    } catch {
+        return false;
+    }
+}
 
 const DEFAULT_ORPHAN_TIMEOUT_MS = 120_000;
 const DEFAULT_DISCONNECT_TIMEOUT_MS = 15_000;
 const DEFAULT_RESPAWN_BASE_DELAY_MS = 1_000;
 const MAX_RESPAWN_RETRIES = 3;
+const HEALTHY_HELPER_RUN_MS = 30_000;
 const OPUS_PAYLOAD_TYPE = 111;
 const OPUS_SAMPLES_PER_FRAME = 960; // 20ms @ 48kHz
 const H264_PAYLOAD_TYPE = 96;
@@ -461,6 +476,7 @@ type BridgeSession = {
     videoRestartTimer?: NodeJS.Timeout;
     cameraRestartTimer?: NodeJS.Timeout;
     socketId?: string;
+    socket?: Socket;
     orphanTimer?: NodeJS.Timeout;
     muted: boolean;
     voiceIsolation: boolean;
@@ -496,6 +512,8 @@ export class FaceTimeAudioBridge extends Loggable {
     private static instance: FaceTimeAudioBridge | null = null;
 
     sessions: Map<string, BridgeSession> = new Map();
+
+    private rembTimers: Map<string, NodeJS.Timeout> = new Map();
 
     orphanTimeoutMs: number = DEFAULT_ORPHAN_TIMEOUT_MS;
 
@@ -567,6 +585,32 @@ export class FaceTimeAudioBridge extends Loggable {
         const callUuid = payload?.callUuid;
         if (!callUuid || !payload?.sdp) return;
 
+        const sessionStatus = getFaceTimeSessionStatus(callUuid);
+        if (sessionStatus === null || sessionStatus === FACETIME_STATUS_DISCONNECTED) {
+            this.log.warn(`Refusing FaceTime bridge offer for unknown or disconnected session ${callUuid}`);
+            socket.emit("ft-bridge-error", {
+                callUuid,
+                error: "FaceTime session not found or already disconnected"
+            });
+            return;
+        }
+
+        // shortcut: single active bridge until per-call audio isolation exists
+        const normalizedCallUuid = callUuid.trim().toLowerCase();
+        const activeOther = Array.from(this.sessions.values()).find(
+            s => !s.closed && s.callUuid.trim().toLowerCase() !== normalizedCallUuid
+        );
+        if (activeOther) {
+            this.log.warn(
+                `Refusing FaceTime bridge offer for ${callUuid}: bridge already active for ${activeOther.callUuid}`
+            );
+            socket.emit("ft-bridge-error", {
+                callUuid,
+                error: "Another FaceTime bridge session is already active"
+            });
+            return;
+        }
+
         this.cleanupSession(callUuid);
 
         const wantsVideo = Boolean(payload.video) || /^m=video\b/m.test(payload.sdp);
@@ -595,7 +639,7 @@ export class FaceTimeAudioBridge extends Loggable {
             ]
         };
         if (enableVideo) {
-            const videoFeedback = [{ type: "nack" }, usePLI(), useFIR(), useREMB(), useTWCC()];
+            const videoFeedback = [{ type: "nack" }, usePLI(), useFIR(), useREMB()];
             codecs.video = H264_PROFILE_LEVEL_PREFERENCE.map((profileLevelId, idx) =>
                 useH264({
                     payloadType: H264_PAYLOAD_TYPE + idx,
@@ -614,7 +658,7 @@ export class FaceTimeAudioBridge extends Loggable {
             ...(enableVideo
                 ? {
                       headerExtensions: {
-                          video: [useTransportWideCC(), useAbsSendTime()]
+                          video: [useAbsSendTime()]
                       }
                   }
                 : {})
@@ -642,6 +686,7 @@ export class FaceTimeAudioBridge extends Loggable {
             videoRestartAttempts: 0,
             cameraRestartAttempts: 0,
             socketId: socket.id,
+            socket,
             muted: false,
             voiceIsolation: payload.voiceIsolation ?? true,
             uplinkRtpPackets: 0,
@@ -667,7 +712,7 @@ export class FaceTimeAudioBridge extends Loggable {
         pc.onIceCandidate.subscribe(candidate => {
             if (!candidate) return;
             this.log.info(`FaceTime bridge local ICE (${callUuid}): ${summarizeIceCandidateSdp(candidate.candidate)}`);
-            socket.emit("ft-bridge-ice", {
+            (session.socket ?? socket).emit("ft-bridge-ice", {
                 callUuid,
                 candidate: candidate.candidate,
                 sdpMid: candidate.sdpMid ?? null,
@@ -821,6 +866,7 @@ export class FaceTimeAudioBridge extends Loggable {
             }
             this.spawnCameraProcess(session, cameraBin);
             this.startPliLoop(session);
+            this.startRembLoop(session);
         }
     }
 
@@ -997,6 +1043,18 @@ export class FaceTimeAudioBridge extends Loggable {
         return true;
     }
 
+    rebindSocket(callUuid: string, socket: Socket): void {
+        if (!callUuid || !socket?.id) return;
+        const session = this.findSessionCaseInsensitive(callUuid);
+        if (!session || session.closed) return;
+        if (session.socketId !== socket.id) {
+            this.log.debug(`Re-binding socket for ${session.callUuid}: ${session.socketId ?? "none"} -> ${socket.id}`);
+            session.socketId = socket.id;
+            session.socket = socket;
+        }
+        this.clearOrphanTimer(session);
+    }
+
     handleSocketDisconnect(socketId: string): void {
         for (const [callUuid, session] of this.sessions.entries()) {
             if (session.socketId === socketId) {
@@ -1022,12 +1080,13 @@ export class FaceTimeAudioBridge extends Loggable {
     }
 
     cleanupSession(callUuid: string): void {
-        const session = this.sessions.get(callUuid);
+        const session = this.findSessionCaseInsensitive(callUuid);
         if (!session) return;
 
         session.closed = true;
         this.clearOrphanTimer(session);
         this.clearPliTimer(session);
+        this.clearRembTimer(session);
         this.clearAdaptTimer(session);
         this.clearRestartTimers(session);
         if (session.audioStatsTimer) {
@@ -1036,7 +1095,7 @@ export class FaceTimeAudioBridge extends Loggable {
         }
         session.adaptiveController = undefined;
         session.depacketizer?.reset();
-        this.sessions.delete(callUuid);
+        this.sessions.delete(session.callUuid);
 
         if (session.process) {
             this.stoppedProcesses.add(session.process);
@@ -1074,7 +1133,9 @@ export class FaceTimeAudioBridge extends Loggable {
         }
         session.cameraProcess = undefined;
 
-        const hasRemainingCameraSession = Array.from(this.sessions.values()).some(s => !s.closed && s.cameraEnabled);
+        const hasRemainingCameraSession =
+            Array.from(this.sessions.values()).some(s => !s.closed && s.cameraEnabled) ||
+            hasActiveVideoFaceTimeSession();
         if (!hasRemainingCameraSession) {
             setCameraHookActiveFlag(false);
         }
@@ -1090,6 +1151,7 @@ export class FaceTimeAudioBridge extends Loggable {
         this.clearOrphanTimer(session);
         session.orphanTimer = setTimeout(() => {
             if (this.sessions.get(session.callUuid) !== session) return;
+            if (session.pc?.connectionState === "connected") return;
             this.log.info(`Cleaning up orphaned audio bridge session: ${session.callUuid}`);
             this.cleanupSession(session.callUuid);
         }, timeoutMs);
@@ -1127,7 +1189,8 @@ export class FaceTimeAudioBridge extends Loggable {
 
     private scheduleHelperRespawn(session: BridgeSession, kind: HelperKind, respawn: () => void): void {
         if (session.closed || this.sessions.get(session.callUuid) !== session) return;
-        if (session.pc?.connectionState !== "connected") return;
+        const connState = session.pc?.connectionState;
+        if (connState !== "connected" && connState !== "disconnected") return;
 
         const attemptsKey =
             kind === "audio"
@@ -1160,7 +1223,8 @@ export class FaceTimeAudioBridge extends Loggable {
         const timer = setTimeout(() => {
             session[timerKey] = undefined;
             if (session.closed || this.sessions.get(session.callUuid) !== session) return;
-            if (session.pc?.connectionState !== "connected") return;
+            const currentConnState = session.pc?.connectionState;
+            if (currentConnState !== "connected" && currentConnState !== "disconnected") return;
             respawn();
         }, delayMs);
         timer.unref?.();
@@ -1176,6 +1240,7 @@ export class FaceTimeAudioBridge extends Loggable {
 
         this.clearRestartTimer(session, "audio");
         session.stdoutBuffer = Buffer.alloc(0);
+        const startedAt = Date.now();
         const proc = spawn(bin, [], { stdio: ["pipe", "pipe", "pipe"] });
         session.process = proc;
 
@@ -1242,6 +1307,9 @@ export class FaceTimeAudioBridge extends Loggable {
             }
             this.log.debug(`BlueBubblesAudioBridge exited for ${session.callUuid} (code=${code})`);
             if (!this.stoppedProcesses.has(proc)) {
+                if (Date.now() - startedAt >= HEALTHY_HELPER_RUN_MS) {
+                    session.audioRestartAttempts = 0;
+                }
                 this.scheduleHelperRespawn(session, "audio", () => {
                     this.spawnAudioProcess(session, true);
                 });
@@ -1278,6 +1346,7 @@ export class FaceTimeAudioBridge extends Loggable {
     private spawnVideoProcess(session: BridgeSession, bin: string): void {
         this.clearRestartTimer(session, "video");
         session.videoStdoutBuffer = Buffer.alloc(0);
+        const startedAt = Date.now();
         const proc = spawn(bin, [], { stdio: ["pipe", "pipe", "pipe"] });
         session.videoProcess = proc;
 
@@ -1317,6 +1386,9 @@ export class FaceTimeAudioBridge extends Loggable {
             }
             this.log.debug(`BlueBubblesVideoBridge exited for ${session.callUuid} (code=${code})`);
             if (!this.stoppedProcesses.has(proc)) {
+                if (Date.now() - startedAt >= HEALTHY_HELPER_RUN_MS) {
+                    session.videoRestartAttempts = 0;
+                }
                 this.scheduleHelperRespawn(session, "video", () => {
                     this.spawnVideoProcess(session, bin);
                 });
@@ -1450,6 +1522,7 @@ export class FaceTimeAudioBridge extends Loggable {
             }
             session.cameraProcess = undefined;
         }
+        const startedAt = Date.now();
         const proc = spawn(bin, [], { stdio: ["pipe", "ignore", "pipe"] });
         session.cameraProcess = proc;
         session.cameraBackpressured = false;
@@ -1483,6 +1556,9 @@ export class FaceTimeAudioBridge extends Loggable {
             }
             this.log.debug(`BlueBubblesCameraBridge exited for ${session.callUuid} (code=${code})`);
             if (!this.stoppedProcesses.has(proc)) {
+                if (Date.now() - startedAt >= HEALTHY_HELPER_RUN_MS) {
+                    session.cameraRestartAttempts = 0;
+                }
                 this.scheduleHelperRespawn(session, "camera", () => {
                     this.spawnCameraProcess(session, bin, true);
                 });
@@ -1542,6 +1618,58 @@ export class FaceTimeAudioBridge extends Loggable {
         if (session.pliTimer) {
             clearInterval(session.pliTimer);
             session.pliTimer = undefined;
+        }
+    }
+
+    private sendRemb(session: BridgeSession, bitrateBps = 3_500_000): void {
+        const receiver = session.videoTransceiver?.receiver as any;
+        const dtls = receiver?.dtlsTransport;
+        if (!dtls?.sendRtcp) return;
+        const ssrc = session.uplinkVideoSsrc ?? receiver.track?.ssrc;
+        if (ssrc === undefined) return;
+        let mantissa = Math.max(1, Math.floor(bitrateBps));
+        let exp = 0;
+        while (mantissa > 0x3ffff) {
+            mantissa >>= 1;
+            exp += 1;
+        }
+        const packet = new RtcpPayloadSpecificFeedback({
+            feedback: new ReceiverEstimatedMaxBitrate({
+                senderSsrc: receiver.rtcpSsrc ?? 0,
+                mediaSsrc: 0,
+                ssrcNum: 1,
+                brExp: exp,
+                brMantissa: mantissa,
+                ssrcFeedbacks: [ssrc]
+            })
+        });
+        dtls.sendRtcp([packet]).catch(() => {});
+    }
+
+    private startRembLoop(session: BridgeSession): void {
+        this.clearRembTimer(session);
+        if (!session.videoTransceiver) return;
+        this.sendRemb(session);
+        const timer = setInterval(() => {
+            if (this.sessions.get(session.callUuid) !== session || session.closed) {
+                this.clearRembTimer(session);
+                return;
+            }
+            if (session.cameraEnabled) {
+                this.sendRemb(session);
+            }
+        }, 500);
+        if (typeof timer.unref === "function") {
+            timer.unref();
+        }
+        this.rembTimers.set(session.callUuid, timer);
+    }
+
+    private clearRembTimer(session: BridgeSession): void {
+        const timer = this.rembTimers.get(session.callUuid);
+        if (timer) {
+            clearInterval(timer);
+            this.rembTimers.delete(session.callUuid);
         }
     }
 }

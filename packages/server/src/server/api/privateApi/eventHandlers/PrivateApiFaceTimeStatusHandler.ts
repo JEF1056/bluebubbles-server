@@ -7,6 +7,7 @@ import { HandleSerializer } from "@server/api/serializers/HandleSerializer";
 import { FaceTimeSessionManager } from "@server/api/lib/facetime/FacetimeSessionManager";
 import { FaceTimeSession, FaceTimeSessionStatus } from "@server/api/lib/facetime/FaceTimeSession";
 import { FaceTimeAudioBridge } from "@server/api/lib/facetime/FaceTimeAudioBridge";
+import { setCameraHookActiveFlag } from "@server/api/lib/facetime/FaceTimeCameraHook";
 import { Loggable } from "@server/lib/logging/Loggable";
 
 export class PrivateApiFaceTimeStatusHandler extends Loggable implements PrivateApiEventHandler {
@@ -95,6 +96,9 @@ export class PrivateApiFaceTimeStatusHandler extends Loggable implements Private
                     existingSession.conversationGroupUuid,
                     callUuid
                 ]);
+                if (!FaceTimeSessionManager().listActiveSessions().some(s => s.isVideo)) {
+                    setCameraHookActiveFlag(false);
+                }
             }
             FaceTimeSessionManager().broadcastUpdate(existingSession);
             return;
@@ -233,6 +237,9 @@ export class PrivateApiFaceTimeStatusHandler extends Loggable implements Private
                 session.conversationGroupUuid,
                 callUuid
             ]);
+            if (!FaceTimeSessionManager().listActiveSessions().some(s => s.isVideo)) {
+                setCameraHookActiveFlag(false);
+            }
 
             if (isNew && !session.isOutgoing) {
                 if (!session.endedReason) {

@@ -85,8 +85,13 @@ function loadFaceTimeModules(options: { existsSync?: (p: string) => boolean; spa
         if (request === "@server/fileSystem") {
             return { FileSystem: { resources: "/tmp/bb-resources" } };
         }
-        if (request === "@server/api/lib/facetime/FacetimeSessionManager") {
-            return { FaceTimeSessionManager: class {} };
+        if (request === "@server/api/lib/facetime/FacetimeSessionManager" || request === "./FacetimeSessionManager") {
+            return {
+                FaceTimeSessionManager: () => ({
+                    findSession: () => ({ status: 1 }),
+                    listActiveSessions: () => []
+                })
+            };
         }
         if (request === "@server/lib/logging/Loggable") {
             return {
