@@ -464,6 +464,8 @@ export class FaceTimeSession extends Loggable {
             return rawEndedReason;
         }
         const hasErr = Boolean(endedError && String(endedError).trim().length > 0);
+        if (disconnectedReason === 17) return "answered_elsewhere";
+        if (disconnectedReason === 18) return "declined_elsewhere";
         if (isSilenced && !hasErr) return "missed";
         if (disconnectedReason === 2) return "declined";
         if (disconnectedReason === 3) return "busy";

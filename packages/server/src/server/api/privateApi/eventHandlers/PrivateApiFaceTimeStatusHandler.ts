@@ -125,12 +125,23 @@ export class PrivateApiFaceTimeStatusHandler extends Loggable implements Private
         }
 
         // First-seen non-outgoing status 6 (e.g. silenced by macOS DND/display-sharing):
-        // surface missed session + alert.
+        // surface missed session + alert unless it was answered/declined on another device.
         if (
             statusId === FaceTimeSessionStatus.DISCONNECTED &&
             !eventData.is_outgoing &&
             (eventData.is_incoming_silenced === true || Number(eventData.filtered_out_reason ?? 0) !== 0)
         ) {
+            const endedReason = FaceTimeSession.mapEndedReason(
+                eventData.disconnected_reason ?? null,
+                eventData.ended_reason ?? null,
+                eventData.ended_error ?? null,
+                false,
+                false,
+                true
+            );
+            if (endedReason === "answered_elsewhere" || endedReason === "declined_elsewhere") {
+                return;
+            }
             const session = FaceTimeSession.fromEvent(eventData, false);
             if (!session.endedReason) {
                 session.endedReason = "missed";
@@ -241,11 +252,37 @@ export class PrivateApiFaceTimeStatusHandler extends Loggable implements Private
                 setCameraHookActiveFlag(false);
             }
 
+            if (!session.isOutgoing && session.endedReason === "missed") {
+                const normalizeAddr = (raw: string | null | undefined) => {
+                    const slug = slugifyAddress(raw ?? "");
+                    if (!slug) return "";
+                    if (slug.includes("@")) return slug;
+                    const digits = slug.replace(/\D/g, "");
+                    return digits.length > 10 ? digits.slice(-10) : digits;
+                };
+                const callerNorm = normalizeAddr(rawAddress ?? session.address);
+                if (callerNorm) {
+                    const answeredElsewhere = FaceTimeSessionManager()
+                        .listActiveSessions()
+                        .some(
+                            s =>
+                                s !== session &&
+                                s.status === FaceTimeSessionStatus.ANSWERED &&
+                                normalizeAddr(s.address) === callerNorm
+                        );
+                    if (answeredElsewhere) {
+                        session.endedReason = "answered_elsewhere";
+                    }
+                }
+            }
+
             if (isNew && !session.isOutgoing) {
                 if (!session.endedReason) {
                     session.endedReason = "missed";
                 }
-                this.maybeRaiseSilencedAlert(eventData, session.silencedReason);
+                if (session.endedReason !== "answered_elsewhere" && session.endedReason !== "declined_elsewhere") {
+                    this.maybeRaiseSilencedAlert(eventData, session.silencedReason);
+                }
             }
 
             if (rawAddress) {

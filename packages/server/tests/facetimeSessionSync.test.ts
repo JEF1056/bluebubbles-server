@@ -180,6 +180,9 @@ const origLoad = (Module as any)._load;
         }
         return { Loggable, getLogger: () => ({ info: () => {}, debug: () => {}, warn: () => {}, error: () => {} }) };
     }
+    if (request === "@server/fileSystem") {
+        return { FileSystem: { resources: "/tmp" } };
+    }
     if (request.startsWith("@server/")) {
         const resolved = path.join(srcRoot, "server", request.slice("@server/".length));
         return origLoad.call(this, resolved, parent, isMain);
@@ -2050,4 +2053,142 @@ test("cleanupLinks and PrivateApiFaceTime.removeLink reject missing or blank url
             data: { url: "https://facetime.apple.com/join#v=1&p=clean456" }
         }
     ]);
+});
+
+test("incoming calls answered or declined elsewhere do not map to missed or raise silenced alerts", async () => {
+    resetState();
+    const handler = new PrivateApiFaceTimeStatusHandler();
+
+    // 1. Incoming -> disconnected_reason 17 => answered_elsewhere
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "call-answered-elsewhere-1",
+                call_status: FaceTimeSessionStatus.INCOMING,
+                is_outgoing: false,
+                handle: { value: "+15550003333" }
+            }
+        } as any,
+        null as any
+    );
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "call-answered-elsewhere-1",
+                call_status: FaceTimeSessionStatus.DISCONNECTED,
+                is_outgoing: false,
+                disconnected_reason: 17
+            }
+        } as any,
+        null as any
+    );
+    assert.equal(emittedMessages.at(-1)?.data.ended_reason, "answered_elsewhere");
+
+    // 2. First-seen DISCONNECTED with is_incoming_silenced=true and disconnected_reason=17 => answered_elsewhere, no silenced alert
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "call-silenced-elsewhere-1",
+                call_status: FaceTimeSessionStatus.DISCONNECTED,
+                is_outgoing: false,
+                is_incoming_silenced: true,
+                disconnected_reason: 17,
+                handle: { value: "+15550004444" }
+            }
+        } as any,
+        null as any
+    );
+    assert.equal(emittedMessages.at(-1)?.data.ended_reason, "answered_elsewhere");
+    assert.equal(loggedMessages.some(m => m.type === "warn" && m.message.includes("silenced")), false);
+
+    // 2b. handleStandard (facetime_calling: false) with is_incoming_silenced=true and disconnected_reason=17 => ignored
+    mockRepoConfig.facetime_calling = false;
+    const beforeCount = emittedMessages.length;
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "call-silenced-elsewhere-std",
+                call_status: FaceTimeSessionStatus.DISCONNECTED,
+                is_outgoing: false,
+                is_incoming_silenced: true,
+                disconnected_reason: 17,
+                handle: { value: "+15550004445" }
+            }
+        } as any,
+        null as any
+    );
+    assert.equal(emittedMessages.length, beforeCount);
+    assert.equal(loggedMessages.some(m => m.type === "warn" && m.message.includes("silenced")), false);
+    mockRepoConfig.facetime_calling = true;
+
+    // 3. disconnected_reason 18 => declined_elsewhere
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "call-declined-elsewhere-1",
+                call_status: FaceTimeSessionStatus.INCOMING,
+                is_outgoing: false,
+                handle: { value: "+15550005555" }
+            }
+        } as any,
+        null as any
+    );
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "call-declined-elsewhere-1",
+                call_status: FaceTimeSessionStatus.DISCONNECTED,
+                is_outgoing: false,
+                disconnected_reason: 18
+            }
+        } as any,
+        null as any
+    );
+    assert.equal(emittedMessages.at(-1)?.data.ended_reason, "declined_elsewhere");
+
+    // 4. Continuity: incoming call disconnects with reason 1 while another ANSWERED session for same caller is active
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "call-continuity-answered",
+                call_status: FaceTimeSessionStatus.ANSWERED,
+                is_outgoing: false,
+                is_endpoint_on_current_device: false,
+                handle: { value: "+15550006666" }
+            }
+        } as any,
+        null as any
+    );
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "call-continuity-ringing",
+                call_status: FaceTimeSessionStatus.INCOMING,
+                is_outgoing: false,
+                handle: { value: "5550006666" }
+            }
+        } as any,
+        null as any
+    );
+    await handler.handle(
+        {
+            event: "ft-call-status-changed",
+            data: {
+                call_uuid: "call-continuity-ringing",
+                call_status: FaceTimeSessionStatus.DISCONNECTED,
+                is_outgoing: false,
+                disconnected_reason: 1
+            }
+        } as any,
+        null as any
+    );
+    assert.equal(emittedMessages.at(-1)?.data.ended_reason, "answered_elsewhere");
 });

@@ -25,7 +25,9 @@ if [[ "$ACTUAL_CHECKSUM" != "$EXPECTED_CHECKSUM" ]]; then
     exit 1
 fi
 
-lipo "$DYLIB" -verify_arch x86_64 arm64 arm64e
+for arch in x86_64 arm64 arm64e; do
+    lipo "$DYLIB" -verify_arch "$arch"
+done
 
 INSTALL_NAME="$(otool -D "$DYLIB" | tail -n 1 | xargs)"
 EXPECTED_INSTALL_NAME="@rpath/BlueBubblesFindMyHelper.dylib"
